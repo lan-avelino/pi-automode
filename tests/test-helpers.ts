@@ -2,6 +2,13 @@ import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	DEFAULT_CLASSIFIER_BACKEND,
+	DEFAULT_JEV_API_KEY_ENV,
+	DEFAULT_JEV_BASE_URL,
+	DEFAULT_JEV_HARD_DENY_THRESHOLD,
+	DEFAULT_JEV_MODEL,
+	DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+	DEFAULT_JEV_TIMEOUT_MS,
 	DEFAULT_LOG_CONFIG,
 	DEFAULT_PROTECTED_PATHS,
 	analyzeBash,
@@ -98,6 +105,9 @@ export function createFakeCtx(entries: any[] = [], overrides: Record<string, unk
 			async getApiKeyAndHeaders() {
 				return { ok: true, apiKey: "test-key" };
 			},
+			async getApiKeyForProvider() {
+				return undefined;
+			},
 		},
 		sessionManager: {
 			getEntries: () => entries,
@@ -144,6 +154,13 @@ export function createFakeCtx(entries: any[] = [], overrides: Record<string, unk
 export function baseConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveConfig {
 	return {
 		enabled: true,
+		classifierBackend: DEFAULT_CLASSIFIER_BACKEND,
+		jevModel: DEFAULT_JEV_MODEL,
+		jevBaseUrl: DEFAULT_JEV_BASE_URL,
+		jevApiKeyEnv: DEFAULT_JEV_API_KEY_ENV,
+		jevTimeoutMs: DEFAULT_JEV_TIMEOUT_MS,
+		jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
+		jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
 		classifyReadOnlyTools: false,
 		allowInsideWorkingDirectory: false,
 		deniedPaths: [],

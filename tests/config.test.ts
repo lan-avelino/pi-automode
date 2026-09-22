@@ -20,6 +20,10 @@ import {
 	DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
 	DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
 	DEFAULT_HARD_DENY,
+	DEFAULT_JEV_HARD_DENY_THRESHOLD,
+	DEFAULT_JEV_MODEL,
+	DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+	DEFAULT_JEV_TIMEOUT_MS,
 	DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
 	DEFAULT_SOFT_DENY,
 	PI_GLOBAL_SETTINGS,
@@ -30,6 +34,7 @@ import {
 	modelVisibleConfigDiagnostics,
 	prepareGlobalConfig,
 	validateSettingsFile,
+	writeGlobalAutoModeSetting,
 	writeGlobalClassifierModel,
 } from "../extensions/auto-mode.ts";
 import {
@@ -1244,4 +1249,97 @@ test("validateSettingsFile accepts a valid classifierTimeoutMs", () => {
 		"inline",
 	);
 	assert.equal(diagnostics.length, 0);
+});
+
+// --- Jev classifier backend ------------------------------------------------
+
+test("Jev backend defaults are seeded without configuration", () => {
+	const config = buildEffectiveConfigFromSources();
+	assert.equal(config.classifierBackend, "llm");
+	assert.equal(config.jevModel, DEFAULT_JEV_MODEL);
+	assert.equal(config.jevTimeoutMs, DEFAULT_JEV_TIMEOUT_MS);
+	assert.equal(config.jevHardDenyThreshold, DEFAULT_JEV_HARD_DENY_THRESHOLD);
+	assert.equal(config.jevSoftDenyThreshold, DEFAULT_JEV_SOFT_DENY_THRESHOLD);
+});
+
+test("validateSettingsFile accepts the Jev classifier keys", () => {
+	const diagnostics = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "jev",
+				jevModel: "~typesafe/jev-latest",
+				jevBaseUrl: "https://openrouter.ai/api/v1",
+				jevApiKeyEnv: "OPENROUTER_API_KEY",
+				jevTimeoutMs: 12_000,
+				jevHardDenyThreshold: 0.5,
+				jevSoftDenyThreshold: 0.35,
+			},
+		},
+		"inline",
+	);
+	assert.deepEqual(diagnostics, []);
+});
+
+test("validateSettingsFile rejects invalid Jev classifier settings", () => {
+	const diagnostics = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "openai",
+				jevModel: "not-a-model",
+				jevBaseUrl: "  ",
+				jevApiKeyEnv: "",
+				jevTimeoutMs: 10,
+				jevHardDenyThreshold: 1.5,
+				jevSoftDenyThreshold: -0.1,
+			},
+		},
+		"inline",
+	);
+	for (const expected of [
+		/autoMode\.classifierBackend must be "llm" or "jev"/,
+		/autoMode\.jevModel must be a provider\/model string/,
+		/autoMode\.jevBaseUrl must be a non-empty string/,
+		/autoMode\.jevApiKeyEnv must be a non-empty string/,
+		/autoMode\.jevTimeoutMs must be an integer from 1000 through 2147483647/,
+		/autoMode\.jevHardDenyThreshold must be a number from 0 through 1/,
+		/autoMode\.jevSoftDenyThreshold must be a number from 0 through 1/,
+	]) {
+		assert.ok(diagnostics.some((d) => expected.test(d)), String(expected));
+	}
+});
+
+test("invalid Jev settings do not override valid base values", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{
+			autoMode: { classifierBackend: "openai", jevTimeoutMs: 1 },
+		}],
+	});
+	assert.equal(config.classifierBackend, "llm");
+	assert.equal(config.jevTimeoutMs, DEFAULT_JEV_TIMEOUT_MS);
+});
+
+test("project-local Jev settings override global settings, shared project config cannot", () => {
+	const merged = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevModel: "global/jev", classifierBackend: "llm" } }],
+		projectLocalSettings: [{ autoMode: { jevModel: "local/jev", classifierBackend: "jev" } }],
+		projectSharedSettings: [{ autoMode: { jevModel: "shared/jev", classifierBackend: "llm" } }],
+	});
+	assert.equal(merged.jevModel, "local/jev");
+	assert.equal(merged.classifierBackend, "jev");
+});
+
+test("writeGlobalAutoModeSetting persists one Jev key without dropping others", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-setting-"));
+	try {
+		const path = join(dir, "config.json");
+		writeGlobalClassifierModel("test/classifier", path);
+		writeGlobalAutoModeSetting("jevModel", "test/jev", path);
+		writeGlobalAutoModeSetting("classifierBackend", "jev", path);
+		const settings = JSON.parse(readFileSync(path, "utf8"));
+		assert.equal(settings.autoMode.classifierModel, "test/classifier");
+		assert.equal(settings.autoMode.jevModel, "test/jev");
+		assert.equal(settings.autoMode.classifierBackend, "jev");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

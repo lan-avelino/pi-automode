@@ -40,6 +40,25 @@ Higher levels can use all 512 or 1200 stage tokens before they produce visible o
 
 If a request stalls or exceeds its budget, pi-automode aborts it. Then auto mode fails closed and blocks the action.
 
+## Jev classifier backend
+
+`classifierBackend` selects the classifier stage: `"llm"` (default) or `"jev"`. The Jev backend replaces only the classifier stage and leaves every deterministic layer unchanged. Any Jev error fails closed.
+
+The following keys apply only when `classifierBackend` is `"jev"`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `jevModel` | `"~typesafe/jev-latest"` | Jev model id sent to the decisions endpoint |
+| `jevBaseUrl` | `"https://openrouter.ai/api/v1"` | Chat-compatible base URL; pi-automode derives `/api/alpha/decisions` |
+| `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth |
+| `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
+| `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
+| `jevSoftDenyThreshold` | `0.35` | Highest soft-side probability at or above which the action is blocked |
+
+`classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
+
+`/automode backend <llm|jev>` writes `classifierBackend` to the global config. When the Jev backend is active, `/automode model` writes `jevModel` and does not require the model to be present in the Pi registry.
+
 `allowInsideWorkingDirectory` adds a deterministic allow tier for the file tools. The default value is `false`. The file tools are `read`, `write`, `edit`, `grep`, `find`, and `ls`.
 
 The value `allowInsideWorkingDirectory: true` allows access to paths inside the working directory without classifier review. Pi-automode sends access to outside paths to the classifier. This rule also applies to read calls.
@@ -67,6 +86,7 @@ Example:
 ```json
 {
   "autoMode": {
+    "classifierBackend": "llm",
     "classifierModel": "provider/model-id",
     "classifierReasoningLevel": "low",
     "classifyReadOnlyTools": false,

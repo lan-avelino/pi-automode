@@ -18,11 +18,13 @@ For each Pi `tool_call` event, the extension does this:
 10. Run path-deny checks, including recursive search scopes and symlink aliases.
 11. If an ask rule was accepted, skip all deterministic allow tiers.
 12. Otherwise, apply the inside-working-directory, `permissions.allow`, and read-only tiers in that order.
-13. Send every remaining action through a one-token conservative filter.
+13. Send every remaining action through a one-token conservative filter (LLM backend) or a single Jev decisions request (Jev backend).
 14. If the filter requests review, run structured classifier review.
 15. Persist state and update the UI status and denial history.
 
 The default posture is fail-closed. If model resolution, authentication, a classifier call, or response parsing fails, pi-automode blocks the action.
+
+Step 13/14 select the classifier backend from `classifierBackend`. The `llm` backend runs the staged filter and structured review described below. The `jev` backend replaces that stage with one Jev / SystemOne request and maps its `noul` probabilities onto the same tiers. Every preceding deterministic step is shared by both backends and is never delegated to Jev.
 
 ## Diagram
 

@@ -29,9 +29,10 @@ import {
   type GlobalConfigPreparation,
   loadEffectiveConfigWithDiagnostics,
   prepareGlobalConfig,
-  writeGlobalClassifierModel,
+  writeGlobalAutoModeSetting,
 } from "./config.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
+import { defaultJevClassifyAction } from "./jev.ts";
 import {
   createLogger,
   newDecisionId,
@@ -120,8 +121,12 @@ export type PiAutomodeOptions = {
   loadConfig?: (cwd: string, projectTrusted: boolean) => EffectiveConfig;
   /** Override classifier calls in tests so unit tests never need a real LLM/API key. */
   classifyAction?: ClassifyAction;
+  /** Override the Jev classifier in tests. */
+  jevClassifyAction?: ClassifyAction;
   /** Override classifier-model persistence in tests. Runtime code writes the active global config. */
   saveClassifierModel?: (classifierModel: string) => void;
+  /** Override one autoMode setting's global persistence in tests. */
+  saveAutoModeSetting?: (key: PersistableSettingKey, value: string) => void;
   /** Override global config migration and path selection in tests. */
   prepareGlobalConfig?: () => GlobalConfigPreparation;
   /** Override the application-owned observability log root in tests. */
@@ -131,6 +136,11 @@ export type PiAutomodeOptions = {
   /** Override Bash analysis in tests. Runtime code uses unbash. */
   analyzeBash?: typeof analyzeBash;
 };
+
+type PersistableSettingKey =
+  | "classifierModel"
+  | "jevModel"
+  | "classifierBackend";
 
 type LogCtx = {
   logger: Logger;
@@ -179,7 +189,10 @@ function logClassifierIo(decision: ClassifyResult, log: LogCtx): void {
 
 /** Create a Pi extension instance. Default export uses production dependencies. */
 export function createPiAutomode(options: PiAutomodeOptions = {}) {
-  const classify = options.classifyAction ?? defaultClassifyAction;
+  const classifyLlm = options.classifyAction ?? defaultClassifyAction;
+  const classifyJev = options.jevClassifyAction ?? defaultJevClassifyAction;
+  const selectClassify = (cfg: EffectiveConfig) =>
+    cfg.classifierBackend === "jev" ? classifyJev : classifyLlm;
   const now = options.now ?? (() => new Date());
 
   return function piAutomode(pi: ExtensionAPI) {
@@ -208,12 +221,21 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         }
         : result;
     };
+    const writeBlockedReason = globalConfig.writeBlockedReason;
+    const persistAutoModeSetting = options.saveAutoModeSetting ??
+      ((key: PersistableSettingKey, value: string) =>
+        writeGlobalAutoModeSetting(key, value, globalConfig.activePath));
+    const saveAutoModeSetting = writeBlockedReason
+      ? (_key: PersistableSettingKey, _value: string): void => {
+        throw new Error(writeBlockedReason);
+      }
+      : persistAutoModeSetting;
     const persistClassifierModel = options.saveClassifierModel ??
       ((classifierModel: string) =>
-        writeGlobalClassifierModel(classifierModel, globalConfig.activePath));
-    const saveClassifierModel = globalConfig.writeBlockedReason
-      ? (_classifierModel: string) => {
-        throw new Error(globalConfig.writeBlockedReason);
+        persistAutoModeSetting("classifierModel", classifierModel));
+    const saveClassifierModel = writeBlockedReason
+      ? (_classifierModel: string): void => {
+        throw new Error(writeBlockedReason);
       }
       : persistClassifierModel;
     let loadResult = loadConfigWithDiagnostics(process.cwd(), false);
@@ -267,8 +289,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       if (action === "status") {
         const status = [
           `enabled: ${cfg.enabled ? "yes" : "no"}`,
-          `classifier: ${cfg.classifierModel ?? "current session model"}`,
-          `classifier reasoning: ${cfg.classifierReasoningLevel ?? "server default"}`,
+          `classifier: ${
+            cfg.classifierBackend === "jev"
+              ? `jev (${cfg.jevModel})`
+              : `llm (${cfg.classifierModel ?? "current session model"})`
+          }`,
+          `classifier reasoning: ${
+            cfg.classifierBackend === "jev"
+              ? "not used by the Jev backend"
+              : cfg.classifierReasoningLevel ?? "server default"
+          }`,
           `checked actions: ${state.checkedActions}`,
           `blocked actions: ${state.blockedActions}`,
           `classifier allowed: ${state.classifierAllowed}`,
@@ -462,8 +492,12 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           now: now(),
         }),
         decisionId: newDecisionId(),
-        classifierModel: cfg.classifierModel,
-        reasoning: classifierReasoningForConfig(cfg.classifierReasoningLevel),
+        classifierModel: cfg.classifierBackend === "jev"
+          ? cfg.jevModel
+          : cfg.classifierModel,
+        reasoning: cfg.classifierBackend === "jev"
+          ? { mode: "backend", backend: "jev", model: cfg.jevModel }
+          : classifierReasoningForConfig(cfg.classifierReasoningLevel),
       };
 
       if (ctx.signal?.aborted) {
@@ -746,7 +780,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
-      const decision = await classify(
+      const decision = await selectClassify(cfg)(
         ctx,
         cfg,
         serializeClassifierAction(event.toolName, input),
@@ -899,13 +933,78 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
         return;
       }
+      if (command === "backend") {
+        if (remainder !== "llm" && remainder !== "jev") {
+          ctx.ui.notify("Usage: /automode backend <llm|jev>", "error");
+          return;
+        }
+        try {
+          saveAutoModeSetting("classifierBackend", remainder);
+        } catch (error) {
+          ctx.ui.notify(
+            `Failed to save classifier backend: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            "error",
+          );
+          return;
+        }
+        loadResult = loadConfigWithDiagnostics(
+          ctx.cwd,
+          projectIsTrusted(ctx),
+        );
+        config = loadResult.config;
+        configDiagnostics = loadResult.diagnostics;
+        persist();
+        updateUi(ctx);
+        ctx.ui.notify(
+          `pi-automode classifier backend set to ${remainder}`,
+          "info",
+        );
+        return;
+      }
       if (command === "model") {
+        const cfg = effectiveConfig();
+        const jevBackend = cfg.classifierBackend === "jev";
         const selected = remainder || await promptForClassifierModel(
           ctx,
-          effectiveConfig().classifierModel,
+          jevBackend ? cfg.jevModel : cfg.classifierModel,
         );
         if (!selected) {
           ctx.ui.notify("Classifier model unchanged", "info");
+          return;
+        }
+        if (jevBackend) {
+          if (!parseModelSpec(selected)) {
+            ctx.ui.notify(
+              `Invalid Jev model spec (expected provider/model): ${selected}`,
+              "error",
+            );
+            return;
+          }
+          try {
+            saveAutoModeSetting("jevModel", selected);
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to save Jev classifier model: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              "error",
+            );
+            return;
+          }
+          loadResult = loadConfigWithDiagnostics(
+            ctx.cwd,
+            projectIsTrusted(ctx),
+          );
+          config = loadResult.config;
+          configDiagnostics = loadResult.diagnostics;
+          persist();
+          updateUi(ctx);
+          ctx.ui.notify(
+            `pi-automode Jev classifier saved globally: ${selected}`,
+            "info",
+          );
           return;
         }
         const parsed = parseModelSpec(selected);
@@ -953,14 +1052,14 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
 
       ctx.ui.notify(
-        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|model [provider/id]]",
+        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|backend <llm|jev>|model [provider/id]]",
         "error",
       );
     }
 
     pi.registerCommand("automode", {
       description:
-        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, model",
+        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, backend, model",
       handler: handleAutomodeCommand,
     });
 

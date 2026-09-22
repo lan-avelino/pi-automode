@@ -97,6 +97,15 @@ export const DEFAULT_SOFT_DENY = [
   "Outbound messages, purchases, bookings, subscriptions, or real-world transactions.",
 ];
 
+/** Default classifier backend: the LLM classifier. Jev is opt-in. */
+export const DEFAULT_CLASSIFIER_BACKEND = "llm" as const;
+export const DEFAULT_JEV_MODEL = "~typesafe/jev-latest";
+export const DEFAULT_JEV_BASE_URL = "https://openrouter.ai/api/v1";
+export const DEFAULT_JEV_API_KEY_ENV = "OPENROUTER_API_KEY";
+export const DEFAULT_JEV_TIMEOUT_MS = 12_000;
+export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
+export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.35;
+
 /** Built-in classifier hard-deny rules. These are unconditional. */
 export const DEFAULT_HARD_DENY = [
   "Weakening TLS, certificate validation, authentication, authorization, audit logging, or security controls.",

@@ -19,7 +19,8 @@ export type ClassifierReasoning =
     mode: "explicit";
     requestedLevel: ClassifierReasoningLevel;
     effectiveLevel: EffectiveClassifierReasoningLevel;
-  };
+  }
+  | { mode: "backend"; backend: "jev"; model: string };
 
 export type ClassifierReasoningLog =
   | ClassifierReasoning
@@ -36,9 +37,25 @@ export type LogConfig = {
   classifierIo: boolean;
 };
 
+export type ClassifierBackend = "llm" | "jev";
+
 export type AutoModeSettings = {
   enabled?: boolean;
+  /** Classifier backend: the LLM classifier (default) or the Jev / SystemOne classifier. */
+  classifierBackend?: ClassifierBackend;
   classifierModel?: string;
+  /** Jev classifier model id (default "~typesafe/jev-latest"). */
+  jevModel?: string;
+  /** OpenRouter-compatible base URL for the Jev classifier (default "https://openrouter.ai/api/v1"). */
+  jevBaseUrl?: string;
+  /** Environment variable that holds the Jev API key (default "OPENROUTER_API_KEY"). */
+  jevApiKeyEnv?: string;
+  /** Per-request timeout for Jev classifier calls in milliseconds (default 12000). */
+  jevTimeoutMs?: number;
+  /** Jev hard_deny probability at or above which the action is blocked (default 0.5). */
+  jevHardDenyThreshold?: number;
+  /** Jev soft-deny probability at or above which the action is blocked (default 0.35). */
+  jevSoftDenyThreshold?: number;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */
   classifyReadOnlyTools?: boolean;
@@ -89,8 +106,15 @@ export type ToolPattern = {
 
 export type EffectiveConfig = {
   enabled: boolean;
+  classifierBackend: ClassifierBackend;
   classifierModel?: string;
   classifierReasoningLevel?: ClassifierReasoningLevel;
+  jevModel: string;
+  jevBaseUrl: string;
+  jevApiKeyEnv: string;
+  jevTimeoutMs: number;
+  jevHardDenyThreshold: number;
+  jevSoftDenyThreshold: number;
   classifyReadOnlyTools: boolean;
   fastClassifierMaxTokens: number;
   classifierTimeoutMs: number;

@@ -11,12 +11,19 @@ import { dirname, resolve } from "node:path";
 import {
   DEFAULT_ALLOW,
   DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
+  DEFAULT_CLASSIFIER_BACKEND,
   DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
   DEFAULT_DENIED_PATHS,
   DEFAULT_ENVIRONMENT,
   DEFAULT_FAST_CLASSIFIER_MAX_TOKENS,
   DEFAULT_HARD_DENY,
+  DEFAULT_JEV_API_KEY_ENV,
+  DEFAULT_JEV_BASE_URL,
+  DEFAULT_JEV_HARD_DENY_THRESHOLD,
+  DEFAULT_JEV_MODEL,
+  DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+  DEFAULT_JEV_TIMEOUT_MS,
   DEFAULT_LOG_CONFIG,
   DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
   DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
@@ -36,6 +43,7 @@ import {
 } from "./permissions.ts";
 import type {
   AutoModeSettings,
+  ClassifierBackend,
   ClassifierReasoningLevel,
   ConfigLoadResult,
   EffectiveConfig,
@@ -280,6 +288,7 @@ export function validateSettingsFile(
       const autoMode = settings.autoMode as Record<string, unknown>;
       const knownAutoMode = new Set([
         "enabled",
+        "classifierBackend",
         "classifierModel",
         "classifierReasoningLevel",
         "classifierTimeoutMs",
@@ -296,6 +305,12 @@ export function validateSettingsFile(
         "softDeny",
         "hard_deny",
         "hardDeny",
+        "jevModel",
+        "jevBaseUrl",
+        "jevApiKeyEnv",
+        "jevTimeoutMs",
+        "jevHardDenyThreshold",
+        "jevSoftDenyThreshold",
         "log",
       ]);
       for (const key of Object.keys(autoMode)) {
@@ -309,12 +324,60 @@ export function validateSettingsFile(
         diagnostics.push(`${source}: autoMode.enabled must be a boolean`);
       }
       if (
+        hasOwn(autoMode, "classifierBackend") &&
+        !isClassifierBackend(autoMode.classifierBackend)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.classifierBackend must be "llm" or "jev"`,
+        );
+      }
+      if (
         hasOwn(autoMode, "classifierModel") &&
         !isValidClassifierModel(autoMode.classifierModel)
       ) {
         diagnostics.push(
           `${source}: autoMode.classifierModel must be a provider/model string`,
         );
+      }
+      if (
+        hasOwn(autoMode, "jevModel") &&
+        !isValidClassifierModel(autoMode.jevModel)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevModel must be a provider/model string`,
+        );
+      }
+      for (const key of ["jevBaseUrl", "jevApiKeyEnv"] as const) {
+        const value = autoMode[key];
+        if (hasOwn(autoMode, key) && (typeof value !== "string" || value.trim() === "")) {
+          diagnostics.push(
+            `${source}: autoMode.${key} must be a non-empty string`,
+          );
+        }
+      }
+      if (
+        hasOwn(autoMode, "jevTimeoutMs") &&
+        !validClassifierTimeout(autoMode.jevTimeoutMs)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevTimeoutMs must be an integer from 1000 through ${MAX_CLASSIFIER_TIMEOUT_MS}`,
+        );
+      }
+      for (
+        const key of [
+          "jevHardDenyThreshold",
+          "jevSoftDenyThreshold",
+        ] as const
+      ) {
+        const value = autoMode[key];
+        if (
+          hasOwn(autoMode, key) &&
+          (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)
+        ) {
+          diagnostics.push(
+            `${source}: autoMode.${key} must be a number from 0 through 1`,
+          );
+        }
       }
       if (
         hasOwn(autoMode, "classifierReasoningLevel") &&
@@ -591,6 +654,17 @@ export function isClassifierReasoningLevel(
     CLASSIFIER_REASONING_LEVELS.has(value as ClassifierReasoningLevel);
 }
 
+export function isClassifierBackend(
+  value: unknown,
+): value is ClassifierBackend {
+  return value === "llm" || value === "jev";
+}
+
+function validProbability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
+    value <= 1;
+}
+
 function isValidClassifierModel(value: unknown): value is string {
   return typeof value === "string" && parseModelSpec(value) !== undefined;
 }
@@ -617,9 +691,32 @@ function applyAutoModeScalars(
   return {
     ...base,
     enabled: typeof settings.enabled === "boolean" ? settings.enabled : base.enabled,
+    classifierBackend: isClassifierBackend(settings.classifierBackend)
+      ? settings.classifierBackend
+      : base.classifierBackend,
     classifierModel: isValidClassifierModel(settings.classifierModel)
       ? settings.classifierModel
       : base.classifierModel,
+    jevModel: isValidClassifierModel(settings.jevModel)
+      ? settings.jevModel
+      : base.jevModel,
+    jevBaseUrl: typeof settings.jevBaseUrl === "string" &&
+        settings.jevBaseUrl.trim() !== ""
+      ? settings.jevBaseUrl.trim().replace(/\/+$/, "")
+      : base.jevBaseUrl,
+    jevApiKeyEnv: typeof settings.jevApiKeyEnv === "string" &&
+        settings.jevApiKeyEnv.trim() !== ""
+      ? settings.jevApiKeyEnv.trim()
+      : base.jevApiKeyEnv,
+    jevTimeoutMs: validClassifierTimeout(settings.jevTimeoutMs)
+      ? settings.jevTimeoutMs
+      : base.jevTimeoutMs,
+    jevHardDenyThreshold: validProbability(settings.jevHardDenyThreshold)
+      ? settings.jevHardDenyThreshold
+      : base.jevHardDenyThreshold,
+    jevSoftDenyThreshold: validProbability(settings.jevSoftDenyThreshold)
+      ? settings.jevSoftDenyThreshold
+      : base.jevSoftDenyThreshold,
     classifierReasoningLevel: isClassifierReasoningLevel(
         settings.classifierReasoningLevel,
       )
@@ -683,6 +780,13 @@ export function buildEffectiveConfigFromSources(
 ): EffectiveConfig {
   let config: EffectiveConfig = {
     enabled: true,
+    classifierBackend: DEFAULT_CLASSIFIER_BACKEND,
+    jevModel: DEFAULT_JEV_MODEL,
+    jevBaseUrl: DEFAULT_JEV_BASE_URL,
+    jevApiKeyEnv: DEFAULT_JEV_API_KEY_ENV,
+    jevTimeoutMs: DEFAULT_JEV_TIMEOUT_MS,
+    jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
+    jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
@@ -899,9 +1003,10 @@ function readWritableSettingsFile(path: string): SettingsFile {
   return settings;
 }
 
-/** Persist the global default classifier model while preserving other settings. */
-export function writeGlobalClassifierModel(
-  classifierModel: string,
+/** Persist one global autoMode scalar while preserving other settings. */
+export function writeGlobalAutoModeSetting(
+  key: "classifierModel" | "jevModel" | "classifierBackend",
+  value: string,
   path = PI_GLOBAL_SETTINGS[0],
 ): void {
   const settings = readWritableSettingsFile(path);
@@ -909,9 +1014,17 @@ export function writeGlobalClassifierModel(
     ...settings,
     autoMode: {
       ...settings.autoMode,
-      classifierModel,
+      [key]: value,
     },
   };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
+/** Persist the global default classifier model while preserving other settings. */
+export function writeGlobalClassifierModel(
+  classifierModel: string,
+  path = PI_GLOBAL_SETTINGS[0],
+): void {
+  writeGlobalAutoModeSetting("classifierModel", classifierModel, path);
 }

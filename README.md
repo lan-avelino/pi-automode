@@ -43,8 +43,9 @@ pi -e ./extensions/auto-mode.ts
 /automode defaults  # print the built-in rule lists
 /automode config    # effective config, resolved log file path, + diagnostics
 /automode denials   # denial history for this session
+/automode backend llm|jev # select the classifier backend and save it globally
 /automode model     # open classifier model selector and save to ~/.pi/agent/extensions/pi-automode/config.json
-/automode model provider/model-id # save classifier model to ~/.pi/agent/extensions/pi-automode/config.json
+/automode model provider/model-id # save the active backend's classifier model to ~/.pi/agent/extensions/pi-automode/config.json
 ```
 
 `/auto-mode` is an alias.
@@ -122,6 +123,38 @@ Pi-automode blocks a `deniedPaths` match before classifier review or an allow ti
 The list does not govern `bash`. The classifier and deterministic hard-deny checks govern shell access to these paths.
 
 The value `allowInsideWorkingDirectory: true` allows file access inside the working directory locally. Pi-automode sends all outside file access to the classifier, including reads.
+
+## Classifier backends
+
+The classifier stage supports two backends. The default is the LLM classifier (`"classifierBackend": "llm"`).
+
+The opt-in Jev backend (`"classifierBackend": "jev"`) replaces only the classifier stage. It calls the Jev / SystemOne classifier through OpenRouter decisions API (`POST {model, state, questions}`). Every layer above the classifier stays authoritative and unchanged, including permission rules, deterministic hard-deny, `deniedPaths`, and the allow tiers.
+
+Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev.
+
+Jev fails closed. A missing key, network failure, timeout, or unparseable response blocks the action, matching the LLM classifier's posture. Jev's hard-deny answer is advisory; the deterministic layer remains the unconditional floor.
+
+Configure it in a user-owned config source:
+
+```json
+{
+  "autoMode": {
+    "classifierBackend": "jev",
+    "jevModel": "~typesafe/jev-latest",
+    "jevBaseUrl": "https://openrouter.ai/api/v1",
+    "jevApiKeyEnv": "OPENROUTER_API_KEY",
+    "jevTimeoutMs": 12000,
+    "jevHardDenyThreshold": 0.5,
+    "jevSoftDenyThreshold": 0.35
+  }
+}
+```
+
+Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend.
+
+Switch backends with `/automode backend llm` or `/automode backend jev`. This writes the global config, like `/automode model`. In Jev mode, `/automode model` writes `jevModel` instead of `classifierModel`.
+
+The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
 
 Classification starts with a conservative one-token filter. If the filter requests review, pi-automode requests one internal `classifier_decision` tool call.
 
