@@ -56,6 +56,7 @@ export type AutoModeSettings = {
   jevHardDenyThreshold?: number;
   /** Jev soft-deny probability at or above which the action is blocked (default 0.5). */
   jevSoftDenyThreshold?: number;
+  /** Jev scope-escape probability at or above which the action is blocked on its own (default 0.5). */
   jevScopeEscapeThreshold?: number;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */

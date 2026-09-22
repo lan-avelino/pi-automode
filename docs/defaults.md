@@ -123,7 +123,7 @@ Classifier evidence has separate approximate-token budgets for user messages and
 
 The selector keeps the first and latest user messages as intent anchors. It fills the remaining space from the newest eligible entries.
 
-The selector limits individual entries. It marks omitted or truncated evidence in the classifier transcript. It excludes assistant prose and tool results.
+The selector limits individual entries. It keeps at most the 12 most recent tool calls, caps each at 400 approximate tokens, and caps each tool-call input string at 375 characters. The tool budget therefore does not bind at its 4000 default, and raising it above roughly 4800 adds no tool evidence. It marks omitted or truncated evidence in the classifier transcript. It excludes assistant prose and tool results. The user-message budget is separate, so no tool limit can evict a user message.
 
 These limits use approximate character counts. They do not guarantee the same result as a provider tokenizer.
 

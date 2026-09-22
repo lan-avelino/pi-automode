@@ -320,6 +320,8 @@ Pi-automode excludes assistant prose, hidden reasoning, and tool results. User e
 
 The selector keeps the first and latest user messages. It fills the remaining budget from the newest eligible entries. It renders retained evidence in chronological order. It also marks omitted or truncated evidence.
 
+The tool-call side is bounded by three independent limits: the 12 most recent tool calls, 400 approximate tokens per entry, and a per-input string cap of 375 characters. The tool budget therefore does not bind at its 4000 default, and raising it above roughly 4800 adds no tool evidence. These limits apply to both the LLM and Jev backends, which share the transcript builder. The user-message budget is separate, so no tool limit can evict a user message.
+
 Transcript truncation does not change the dedicated current-action message.
 
 ## Classifier model resolution

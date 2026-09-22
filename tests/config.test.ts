@@ -727,10 +727,14 @@ test("shared project permissions.allow is ignored with a diagnostic", () => {
 			}),
 		);
 
-		const { config, diagnostics } = loadEffectiveConfigWithDiagnostics(project, true);
+		// Point the global source at a non-existent path so the merged list cannot
+		// pick up the developer's real global config and make this non-hermetic.
+		const { config, diagnostics } = loadEffectiveConfigWithDiagnostics(
+			project,
+			true,
+			join(project, "no-global-config.json"),
+		);
 
-		// A distinctive pattern: the merged list also contains the developer's real
-		// global config, so a common pattern would make this assertion meaningless.
 		assert.equal(
 			config.permissionAllow.some((pattern) =>
 				pattern.raw === "bash(shared-project-only*)"

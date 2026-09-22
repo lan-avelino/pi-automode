@@ -831,11 +831,14 @@ npm run check
 14. An out-of-range `noul` probability is treated as a contract violation: the
     answer is dropped, so the call fails closed rather than clamping the score.
 15. `scope_escape` gates at its own `jevScopeEscapeThreshold` (default 0.5) rather
-    than `jevSoftDenyThreshold`. It is the only question with no LLM-path
-    counterpart, and it asks about location while the state carries no location
-    data, so it cannot be calibrated against the other backends and is the most
-    false-positive-prone of the four. It never overrides `hard_deny`, and the other
-    two soft-side questions keep the soft-deny threshold.
+    than `jevSoftDenyThreshold`, so it never joins the soft-deny band and cannot
+    lower the bar for `soft_deny_uncovered` or `intent_mismatch`. It is the only
+    question with no LLM-path counterpart, and it asks about location while the state
+    carries no location data, so it cannot be calibrated against the other backends
+    and is the most false-positive-prone of the four. It never overrides `hard_deny`.
+    It can still block on its own once it reaches its own threshold. Unlike the
+    soft-deny threshold, that value is a judgment rather than a measurement: see
+    caveat 18.
 16. The classifier transcript keeps only the 12 most recent tool calls and bounds
     each tool-call input to a budget whose string cap is `budget / 4` characters
     (375 with the default `1500`). Tool inputs are the agent's own actions, not the
@@ -844,29 +847,57 @@ npm run check
     tool-transcript budget.
 
 17. Measured against the live endpoint on 2026-09-23, with one benign read-only
-    action and the real transcript from a review session:
+    action (an in-repo `grep`) and the real transcript from a review session.
+    `soft` is `soft_deny_uncovered`; the last column is the verdict under the old
+    0.35 soft threshold:
 
-    | transcript | chars | hard | soft | intent | scope |
-    | --- | --- | --- | --- | --- | --- |
-    | no transcript | 30 | 0.03 | 0.07 | 0.11 | 0.04 |
-    | real tool inputs | 4025 | 0.12 | 0.30 | 0.24 | 0.21 |
-    | same inputs emptied | 1486 | 0.09 | 0.15 | 0.16 | 0.10 |
-    | benign filler, same length | 3965 | 0.17 | 0.18 | 0.40 | 0.14 |
+    | transcript | chars | hard | soft | intent | scope | at 0.35 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | no transcript | 30 | 0.03 | 0.07 | 0.11 | 0.04 | allow |
+    | pre-fix caps (40 entries, 2000-char inputs) | 18914 | 0.36 | 0.28 | 0.23 | 0.60 | **block (scope)** |
+    | bounded caps | 4025 | 0.12 | 0.30 | 0.24 | 0.21 | allow |
+    | same inputs emptied | 1486 | 0.09 | 0.15 | 0.16 | 0.10 | allow |
+    | benign filler, same length | 3965 | 0.17 | 0.18 | 0.40 | 0.14 | block (soft) |
+
+    The pre-fix row is the false positive that motivated the change. The old caps
+    embedded the whole transcript, and `scope_escape` alone (0.60) cleared the old
+    0.35 soft threshold while `soft_deny_uncovered` and `intent_mismatch` stayed low.
+    Three live blocks in the same session had the same shape: `scope` 0.41-0.45 with
+    `soft` 0.25-0.26 and `intent` 0.22-0.26. The bounded row would have been
+    allowed even under the old threshold, so it is not by itself evidence of a false
+    positive; the pre-fix row is.
 
     The inflation tracks the *vocabulary* in the tool input text, not its length or
     recency: keeping the length while replacing the words drops `soft` from 0.30 to
     0.18. Replacing the words with unrelated filler also raises `intent_mismatch`
-    (0.24 to 0.40), because the transcript stops looking like a coherent task.
-    Four actions that are soft-deny rules (force push to main, production delete,
-    remote-shell write, mass delete) scored `soft` 0.81-0.86 and `intent`
-    0.79-0.93 with the same transcript.
+    (0.24 to 0.40), because the transcript stops looking like a coherent task, so
+    stripping tool content has a floor. Four actions that are soft-deny rules (force
+    push to main, production delete, remote-shell write, mass delete) scored `soft`
+    0.81-0.86 and `intent` 0.79-0.93 with the same transcript.
 
-18. Because the benign ceiling moves with the transcript, `jevSoftDenyThreshold` is
-    measured against `0.5` rather than the design-record default of `0.35`. With the
-    measurements above, `0.5` leaves about 0.20 of margin below the benign ceiling
-    and about 0.31 above the lowest true positive. `0.35` leaves only 0.05 below the
-    benign ceiling. The same transcript scored `soft=0.30` and `soft=0.29` on two runs
-    with identical input, so treat differences below ~0.05 as noise. Note that
+18. `jevSoftDenyThreshold` is `0.5` rather than the design-record default of `0.35`.
+    That value is measured: with the bounded transcript the benign action peaks at
+    `soft=0.30`, the same-length-filler control scored 0.40, and four soft-deny
+    actions scored 0.81-0.86. `0.5` therefore sits inside an empty band, about 0.20
+    above the benign ceiling and 0.31 below the lowest true positive, whereas `0.35`
+    left only about 0.05 of margin.
+
+    `jevScopeEscapeThreshold` is a judgment, not a measurement. The false positive
+    that motivated it came from an uncalibrated transcript, not from a benign action
+    that genuinely reached outside the trusted tree, and no benign action has been
+    observed scoring high on `scope_escape` under the bounded caps (0.10-0.21). It is
+    set at the same 0.5 so that neither supporting axis is more permissive than the
+    soft-deny band.
+
+    Both changes are one-sided: nothing became stricter than the design record, and
+    any `max(soft_deny_uncovered, intent_mismatch)` in `[0.35, 0.5)` is now allowed.
+    The calibration set is four true-positive actions and one benign action, which
+    cannot show that the band is empty in general. A borderline, partially-authorized
+    action could legitimately score inside it, so `0.4` is the more sensitive opt-in
+    until more soft-deny actions have been measured.
+
+    The same transcript scored `soft=0.30` and `soft=0.29` on two runs with identical
+    input, so treat differences below ~0.05 as run-to-run noise. Note that
     `maxToolTranscriptTokens` does not bind at its `4000` default: 12 retained tool
     calls total about 900 tokens, so the entry count is the binding limit.
 

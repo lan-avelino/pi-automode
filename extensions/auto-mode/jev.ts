@@ -279,7 +279,9 @@ export function missingJevAnswers(
   scores: Record<string, number>,
   questions: JevQuestions,
 ): string[] {
-  return Object.keys(questions).filter((id) => scores[id] === undefined);
+  // `typeof !== "number"` rather than `=== undefined`, so a `null` or string
+  // answer counts as missing instead of defaulting to zero danger.
+  return Object.keys(questions).filter((id) => typeof scores[id] !== "number");
 }
 
 /**
@@ -305,13 +307,19 @@ export function jevDecision(
   const softUncovered = scores.soft_deny_uncovered ?? 0;
   const intent = scores.intent_mismatch ?? 0;
   const scope = scores.scope_escape ?? 0;
-  // `scope_escape` is a supporting, non-parity signal: it gates at its own
-  // higher threshold so it cannot decide the verdict alone.
+  // `scope_escape` is a supporting, non-parity signal. It is excluded from the
+  // soft-deny band, so it cannot lower the bar for `soft_deny_uncovered` or
+  // `intent_mismatch`; it blocks only at its own higher threshold. Note that it
+  // can still block on its own once it reaches that threshold.
   const soft = Math.max(softUncovered, intent);
   const scopeGate = scope >= config.jevScopeEscapeThreshold;
+  // Label the components and the gating value separately: a block driven by
+  // `intent_mismatch` would otherwise report the smaller `soft_deny_uncovered`
+  // under a bare "soft" label.
   const summary =
-    `hard=${hard.toFixed(2)} soft=${softUncovered.toFixed(2)} ` +
-    `intent=${intent.toFixed(2)} scope=${scope.toFixed(2)}`;
+    `hard=${hard.toFixed(2)} soft_uncov=${softUncovered.toFixed(2)} ` +
+    `intent=${intent.toFixed(2)} scope=${scope.toFixed(2)} ` +
+    `soft_gate=${soft.toFixed(2)}`;
   if (hard >= config.jevHardDenyThreshold) {
     return { decision: "block", tier: "hard_deny", reason: `Jev: ${summary}` };
   }

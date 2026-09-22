@@ -129,6 +129,22 @@ test("parseJevResponse fails closed on unreadable, malformed, or empty bodies", 
 	}
 });
 
+test("missingJevAnswers treats a non-number answer as missing", () => {
+	const questions = baseQuestions();
+	// A null or string answer must count as missing rather than defaulting to zero
+	// danger through the `?? 0` fallback in jevDecision.
+	const scores = {
+		hard_deny: null,
+		soft_deny_uncovered: "0.9",
+		intent_mismatch: 0,
+		scope_escape: 0,
+	} as unknown as Record<string, number>;
+	assert.deepEqual(missingJevAnswers(scores, questions).sort(), [
+		"hard_deny",
+		"soft_deny_uncovered",
+	]);
+});
+
 test("missingJevAnswers reports every unanswered question", () => {
 	const questions = buildJevQuestions(baseConfig());
 	assert.deepEqual(missingJevAnswers({}, questions).sort(), [
@@ -182,7 +198,8 @@ test("jevDecision blocks at or above the hard threshold", () => {
 		{
 			decision: "block",
 			tier: "hard_deny",
-			reason: "Jev: hard=0.50 soft=0.00 intent=0.00 scope=0.00",
+			reason:
+				"Jev: hard=0.50 soft_uncov=0.00 intent=0.00 scope=0.00 soft_gate=0.00",
 		},
 	);
 });
@@ -278,6 +295,24 @@ test("a raised scope_escape threshold cannot suppress the other soft questions",
 	);
 	assert.equal(decision.decision, "block", decision.reason);
 	assert.equal(decision.tier, "soft_deny");
+});
+
+test("an at-or-above scope_escape cannot downgrade a hard deny", () => {
+	const config = baseConfig();
+	// scope_escape is at or above its own threshold and hard_deny is at its own,
+	// so the tier must be hard_deny rather than soft_deny.
+	const decision = jevDecision(
+		{
+			hard_deny: config.jevHardDenyThreshold,
+			soft_deny_uncovered: 0,
+			intent_mismatch: 0,
+			scope_escape: config.jevScopeEscapeThreshold,
+		},
+		config,
+		baseQuestions(),
+	);
+	assert.equal(decision.decision, "block");
+	assert.equal(decision.tier, "hard_deny");
 });
 
 test("a raised scope_escape threshold cannot suppress a hard deny", () => {
@@ -779,6 +814,51 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 	}
 });
 
+test("a scope threshold change produces a new cache key", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = (async () => {
+		calls += 1;
+		return new Response(
+			JSON.stringify({
+				model: "typesafe/jev-1.13",
+				answers: jevAnswers({ hard_deny: 0.01 }),
+			}),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+
+	try {
+		const ctx = createFakeCtx([], {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		});
+		const base = jevTestConfig({
+			jevBaseUrl: "https://classifier.test/api/v1",
+		});
+		const action = '{"toolName":"bash","input":{"command":"ls"}}';
+
+		await defaultJevClassifyAction(ctx as never, base, action, "", JEV_KEY_DEPS);
+		assert.equal(calls, 1);
+		// Same input and thresholds: served from cache.
+		await defaultJevClassifyAction(ctx as never, base, action, "", JEV_KEY_DEPS);
+		assert.equal(calls, 1);
+		// A different scope threshold must not reuse the cached verdict, because
+		// the verdict depends on it.
+		await defaultJevClassifyAction(
+			ctx as never,
+			{ ...base, jevScopeEscapeThreshold: 0.9 },
+			action,
+			"",
+			JEV_KEY_DEPS,
+		);
+		assert.equal(calls, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
 test("defaultJevClassifyAction sends the full action without truncation", async () => {
 	clearJevCache();
 	const originalFetch = globalThis.fetch;
@@ -815,7 +895,8 @@ test("defaultJevClassifyAction sends the full action without truncation", async 
 		assert.deepEqual(result.io?.attempts[0]?.parsed, {
 			decision: "allow",
 			tier: "none",
-			reason: "Jev: permitted (hard=0.01 soft=0.01 intent=0.01 scope=0.01)",
+			reason:
+				"Jev: permitted (hard=0.01 soft_uncov=0.01 intent=0.01 scope=0.01 soft_gate=0.01)",
 		});
 		assert.equal(result.io?.attempts[0]?.response, undefined);
 	} finally {
@@ -1130,6 +1211,9 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 		/^endpoint: https:\/\/classifier\.test\/api\/alpha\/decisions$/m,
 	);
 	assert.match(text, /^credential: none/m);
+	assert.match(text, /^hard deny threshold: 0\.5$/m);
+	assert.match(text, /^soft deny threshold: 0\.5$/m);
+	assert.match(text, /^scope escape threshold: 0\.5$/m);
 	assert.match(text, /warning: autoMode\.jevBaseUrl/);
 	// A custom host with the default variable names the actual fix, not the
 	// variable the gate withholds.

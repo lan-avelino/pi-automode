@@ -56,7 +56,7 @@ The following keys apply only when `classifierBackend` is `"jev"`:
 | `jevSoftDenyThreshold` | `0.5` | Highest authorization-aware probability (`soft_deny_uncovered`, `intent_mismatch`) at or above which the action is blocked. The benign ceiling moves with the classifier transcript; see [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
 | `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which the action is blocked. Gated separately from the other soft-side questions |
 
-`scope_escape` gates at its own, higher threshold. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It has no LLM-classifier counterpart, and it never overrides `hard_deny`. Because it is a supporting signal, it must not decide the verdict alone: an action that `soft_deny_uncovered` and `intent_mismatch` both clear is not blocked by `scope_escape` unless it reaches `jevScopeEscapeThreshold`.
+`scope_escape` gates at its own threshold. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It has no LLM-classifier counterpart, and it never overrides `hard_deny`. Because it is a supporting signal, it never joins the soft-deny band and cannot lower the bar for `soft_deny_uncovered` or `intent_mismatch`. It can still block on its own once it reaches `jevScopeEscapeThreshold`, so an action that `soft_deny_uncovered` and `intent_mismatch` both clear is blocked if it also reaches that threshold.
 
 `classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
 
@@ -130,7 +130,7 @@ Example:
 }
 ```
 
-`maxUserTranscriptTokens` and `maxToolTranscriptTokens` are approximate budgets for each category. Both default to 4000 and accept integers of at least 32.
+`maxUserTranscriptTokens` and `maxToolTranscriptTokens` are approximate budgets for each category. Both default to 4000 and accept integers of at least 32. The tool budget is capped independently by the 12 most recent tool calls and by a 400-token per-entry limit, so it does not bind at its default: raising `maxToolTranscriptTokens` above roughly 4800 adds no tool evidence. Each tool-call input is serialized with a string cap of `budget / 4` characters, 375 with the default budget. These limits apply to both classifier backends, because both share the transcript builder. The user budget is separate, so tool limits never evict a user message.
 
 Pi-automode does not support the former `maxTranscriptLines` field. Evidence selection now uses token budgets instead of line counts.
 
