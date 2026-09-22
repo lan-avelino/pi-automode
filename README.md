@@ -44,7 +44,9 @@ pi -e ./extensions/auto-mode.ts
 /automode config    # effective config, resolved log file path, + diagnostics
 /automode denials   # denial history for this session
 /automode backend llm|jev # select the classifier backend and save it globally
-/automode model     # open classifier model selector and save to ~/.pi/agent/extensions/pi-automode/config.json
+/automode jev       # report the Jev backend endpoint, credential source, and thresholds
+/automode jev test  # probe the live Jev endpoint in both directions
+/automode model     # open the LLM classifier model selector (LLM backend only)
 /automode model provider/model-id # save the active backend's classifier model to ~/.pi/agent/extensions/pi-automode/config.json
 ```
 
@@ -94,6 +96,7 @@ AM ● a:12 d:2 ca:5 cd:1
 - [Permission recipes](docs/permission-recipes.md)
 - [Defaults and rule-list behavior](docs/defaults.md)
 - [Auto-mode classifier flow](docs/automode-classifier-flow.md)
+- [Jev classifier backend](docs/jev-classifier-backend.md)
 - [Observability logging](docs/observability-logging.md)
 - [Architecture decisions](docs/adr/INDEX.md)
 
@@ -128,11 +131,13 @@ The value `allowInsideWorkingDirectory: true` allows file access inside the work
 
 The classifier stage supports two backends. The default is the LLM classifier (`"classifierBackend": "llm"`).
 
-The opt-in Jev backend (`"classifierBackend": "jev"`) replaces only the classifier stage. It calls the Jev / SystemOne classifier through OpenRouter decisions API (`POST {model, state, questions}`). Every layer above the classifier stays authoritative and unchanged, including permission rules, deterministic hard-deny, `deniedPaths`, and the allow tiers.
+The opt-in Jev backend (`"classifierBackend": "jev"`) replaces the classifier stage. It calls the Jev / SystemOne classifier through OpenRouter decisions API (`POST {model, state, questions}`). Every layer above the classifier stays authoritative and unchanged, including permission rules, deterministic hard-deny, `deniedPaths`, and the allow tiers.
 
-Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev.
+Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev. Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers; its allow tier is always `none`, so only the optional `classifier` I/O log distinguishes an authorization override, and only through the score summary.
 
 Jev fails closed. A missing key, network failure, timeout, or unparseable response blocks the action, matching the LLM classifier's posture. Jev's hard-deny answer is advisory; the deterministic layer remains the unconditional floor.
+
+Jev is opt-in and its answers are an unverified third-party contract. The backend assumes each `noul` answer is a danger-side-up probability (higher means more dangerous). Run `/automode jev test` once against the live endpoint before relying on it; the probe sends one clearly safe and one clearly dangerous action and reports both verdicts.
 
 Configure it in a user-owned config source:
 
@@ -150,13 +155,15 @@ Configure it in a user-owned config source:
 }
 ```
 
-Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. The OpenRouter registry and stored credentials are only sent when `jevBaseUrl` points at OpenRouter itself; a custom base URL must supply its own key through `jevApiKeyEnv`. A response that omits any requested question fails closed. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend.
+Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. The OpenRouter registry and stored credentials are only sent when `jevBaseUrl` points at OpenRouter itself. A custom base URL must name its own key variable in `jevApiKeyEnv`; the default `OPENROUTER_API_KEY` is withheld from custom hosts so the OpenRouter key never reaches a third party. A response that omits any requested question fails closed. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend. Redirect responses are rejected rather than followed, so the key is never forwarded to another host.
 
-Switch backends with `/automode backend llm` or `/automode backend jev`. This writes the global config, like `/automode model`. In Jev mode, `/automode model` writes `jevModel` instead of `classifierModel`.
+Switch backends with `/automode backend llm` or `/automode backend jev`. This writes the global config, like `/automode model`. In Jev mode, `/automode model` writes `jevModel` instead of `classifierModel`; the Pi model picker is LLM-only, so pass the Jev model id explicitly. `/automode jev` reports the effective endpoint, credential source, and thresholds. `/automode jev test` probes the live endpoint.
 
 The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
 
-Long rule lists are clipped before they reach the Jev classifier. When a rule list exceeds the classifier's per-list budget, pi-automode flags the truncation in `autoMode.<list>` diagnostics and in the question text; the deterministic layers still see the full list.
+Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action, and it does not re-bound the transcript or the rule lists for Jev. A payload the endpoint rejects fails closed. If the endpoint instead accepts and silently truncates an oversized payload, Jev can classify a partial action and pi-automode cannot detect that; only the deterministic layers are unaffected by payload size.
+
+The rest of this section describes the LLM backend.
 
 Classification starts with a conservative one-token filter. If the filter requests review, pi-automode requests one internal `classifier_decision` tool call.
 

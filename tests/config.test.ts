@@ -1311,7 +1311,10 @@ test("validateSettingsFile rejects invalid Jev classifier settings", () => {
 test("invalid Jev settings do not override valid base values", () => {
 	const config = buildEffectiveConfigFromSources({
 		globalSettings: [{
-			autoMode: { classifierBackend: "openai", jevTimeoutMs: 1 },
+			autoMode: {
+				classifierBackend: "openai",
+				jevTimeoutMs: 1,
+			},
 		}],
 	});
 	assert.equal(config.classifierBackend, "llm");
@@ -1344,8 +1347,8 @@ test("writeGlobalAutoModeSetting persists one Jev key without dropping others", 
 	}
 });
 
-test("config diagnostics warn when a Jev rule list is truncated", () => {
-	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-budget-"));
+test("config diagnostics warn when a custom Jev endpoint uses the default key env", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-keyenv-"));
 	const previousInlineSettings = process.env.PI_AUTOMODE_SETTINGS_JSON;
 	delete process.env.PI_AUTOMODE_SETTINGS_JSON;
 	try {
@@ -1355,27 +1358,30 @@ test("config diagnostics warn when a Jev rule list is truncated", () => {
 			JSON.stringify({
 				autoMode: {
 					classifierBackend: "jev",
-					softDeny: ["z".repeat(2000)],
+					jevBaseUrl: "https://classifier.test/api/v1",
 				},
 			}),
 		);
 		const loaded = loadEffectiveConfigWithDiagnostics(dir, false, path);
-		assert.equal(loaded.config.classifierBackend, "jev");
 		assert.ok(
-			loaded.diagnostics.some((d) => /autoMode\.softDeny exceeds/.test(d)),
+			loaded.diagnostics.some((d) => /jevApiKeyEnv/.test(d)),
 			JSON.stringify(loaded.diagnostics),
 		);
 
-		// The same long list is silent when the LLM backend is active.
+		// Naming a custom key variable clears the warning.
 		writeFileSync(
 			path,
 			JSON.stringify({
-				autoMode: { classifierBackend: "llm", softDeny: ["z".repeat(2000)] },
+				autoMode: {
+					classifierBackend: "jev",
+					jevBaseUrl: "https://classifier.test/api/v1",
+					jevApiKeyEnv: "CLASSIFIER_API_KEY",
+				},
 			}),
 		);
-		const llm = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		const clean = loadEffectiveConfigWithDiagnostics(dir, false, path);
 		assert.equal(
-			llm.diagnostics.some((d) => /autoMode\.softDeny exceeds/.test(d)),
+			clean.diagnostics.some((d) => /jevApiKeyEnv/.test(d)),
 			false,
 		);
 	} finally {

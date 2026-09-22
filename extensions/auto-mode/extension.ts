@@ -26,13 +26,20 @@ import {
   READ_ONLY_TOOLS,
 } from "./constants.ts";
 import {
+  type GlobalAutoModeSettingKey,
   type GlobalConfigPreparation,
   loadEffectiveConfigWithDiagnostics,
   prepareGlobalConfig,
   writeGlobalAutoModeSetting,
 } from "./config.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
-import { defaultJevClassifyAction } from "./jev.ts";
+import {
+  defaultJevClassifyAction,
+  jevCredentialDiagnostics,
+  jevStatusText,
+  probeJevClassifier,
+  resolveJevKey,
+} from "./jev.ts";
 import {
   createLogger,
   newDecisionId,
@@ -137,10 +144,7 @@ export type PiAutomodeOptions = {
   analyzeBash?: typeof analyzeBash;
 };
 
-type PersistableSettingKey =
-  | "classifierModel"
-  | "jevModel"
-  | "classifierBackend";
+type PersistableSettingKey = GlobalAutoModeSettingKey;
 
 type LogCtx = {
   logger: Logger;
@@ -179,6 +183,7 @@ function logClassifierIo(decision: ClassifyResult, log: LogCtx): void {
     prompt: decision.io.prompt,
     attempts: decision.io.attempts,
     durationMs: decision.io.durationMs,
+    ...(decision.io.cached ? { cached: true } : {}),
     parsed: {
       decision: decision.decision,
       tier: decision.tier,
@@ -963,12 +968,62 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
         return;
       }
+      if (command === "jev") {
+        const cfg = effectiveConfig();
+        if (remainder === "test") {
+          const probe = await probeJevClassifier(ctx, cfg);
+          if (!probe.ok) {
+            ctx.ui.notify(`Jev probe failed: ${probe.reason}`, "error");
+            return;
+          }
+          const lines = [`Jev probe (${probe.model}):`];
+          let unexpected = false;
+          for (const result of probe.probes) {
+            lines.push(
+              `${result.label}: ${result.decision.decision} (${result.decision.reason})`,
+            );
+            if (result.label === "safe" && result.decision.decision !== "allow") {
+              unexpected = true;
+            }
+            if (
+              result.label === "dangerous" &&
+              result.decision.decision !== "block"
+            ) {
+              unexpected = true;
+            }
+          }
+          if (unexpected) {
+            lines.push(
+              "Unexpected probe result. Check the thresholds and that the endpoint returns danger-side-up noul probabilities.",
+            );
+          }
+          ctx.ui.notify(lines.join("\n"), unexpected ? "warning" : "info");
+          return;
+        }
+        if (remainder !== "") {
+          ctx.ui.notify("Usage: /automode jev [test]", "error");
+          return;
+        }
+        const { source } = await resolveJevKey(ctx, cfg);
+        ctx.ui.notify(
+          jevStatusText(cfg, source, jevCredentialDiagnostics(cfg)),
+          "info",
+        );
+        return;
+      }
       if (command === "model") {
         const cfg = effectiveConfig();
         const jevBackend = cfg.classifierBackend === "jev";
+        if (jevBackend && !remainder) {
+          ctx.ui.notify(
+            `Jev classifier model: ${cfg.jevModel}. Set it with /automode model <provider/model-id>; the Pi model picker lists LLM providers and does not apply to the Jev backend.`,
+            "info",
+          );
+          return;
+        }
         const selected = remainder || await promptForClassifierModel(
           ctx,
-          jevBackend ? cfg.jevModel : cfg.classifierModel,
+          cfg.classifierModel,
         );
         if (!selected) {
           ctx.ui.notify("Classifier model unchanged", "info");
@@ -1001,8 +1056,11 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           configDiagnostics = loadResult.diagnostics;
           persist();
           updateUi(ctx);
+          const active = effectiveConfig().jevModel;
           ctx.ui.notify(
-            `pi-automode Jev classifier saved globally: ${selected}`,
+            active === selected
+              ? `pi-automode Jev classifier saved globally: ${selected}`
+              : `pi-automode Jev classifier saved globally: ${selected}; current config uses ${active}`,
             "info",
           );
           return;
@@ -1052,14 +1110,14 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
 
       ctx.ui.notify(
-        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|backend <llm|jev>|model [provider/id]]",
+        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|backend <llm|jev>|jev [test]|model [provider/id]]",
         "error",
       );
     }
 
     pi.registerCommand("automode", {
       description:
-        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, backend, model",
+        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, backend, jev, model",
       handler: handleAutomodeCommand,
     });
 

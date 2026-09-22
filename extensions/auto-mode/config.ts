@@ -54,7 +54,7 @@ import type {
   ToolPattern,
 } from "./types.ts";
 import { hasOwn, stringArray } from "./utils.ts";
-import { jevRuleBudgetDiagnostics } from "./jev.ts";
+import { jevCredentialDiagnostics } from "./jev.ts";
 
 export type GlobalConfigPreparation = {
   status: "current" | "migrated" | "conflict" | "failed";
@@ -971,7 +971,7 @@ export function loadEffectiveConfigWithDiagnostics(
     inlineSettings,
   });
   if (config.classifierBackend === "jev") {
-    loadedDiagnostics.push(...jevRuleBudgetDiagnostics(config));
+    loadedDiagnostics.push(...jevCredentialDiagnostics(config));
   }
 
   return { config, diagnostics: loadedDiagnostics };
@@ -1008,9 +1008,19 @@ function readWritableSettingsFile(path: string): SettingsFile {
   return settings;
 }
 
+/** Global autoMode scalars that `/automode` can persist. */
+export const GLOBAL_AUTOMODE_SETTING_KEYS = [
+  "classifierModel",
+  "jevModel",
+  "classifierBackend",
+] as const;
+
+export type GlobalAutoModeSettingKey =
+  typeof GLOBAL_AUTOMODE_SETTING_KEYS[number];
+
 /** Persist one global autoMode scalar while preserving other settings. */
 export function writeGlobalAutoModeSetting(
-  key: "classifierModel" | "jevModel" | "classifierBackend",
+  key: GlobalAutoModeSettingKey,
   value: string,
   path = PI_GLOBAL_SETTINGS[0],
 ): void {

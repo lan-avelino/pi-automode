@@ -205,6 +205,8 @@ export type ClassifierIo = {
   };
   attempts: ClassifierIoAttempt[];
   durationMs: number;
+  /** True when the decision came from the session verdict cache and no request was made. */
+  cached?: boolean;
 };
 
 /** Classification decision plus resolved reasoning and the I/O that produced it (when available). */

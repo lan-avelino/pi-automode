@@ -36,6 +36,8 @@ export type ClassifierLogEntry = {
   prompt: ClassifierIo["prompt"];
   attempts: ClassifierIoAttempt[];
   durationMs: number;
+  /** True when the verdict came from the session cache and no request was made. */
+  cached?: boolean;
   parsed: ClassificationDecision;
 };
 

@@ -4,4 +4,5 @@ node_modules/
 .pi/automode.local.json
 .pi-subagents/
 .pi/tasks/
+.memory/
 

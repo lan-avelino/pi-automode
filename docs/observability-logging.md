@@ -89,6 +89,12 @@ or an explicit request after model-level clamping:
 {"mode":"explicit","requestedLevel":"max","effectiveLevel":"xhigh"}
 ```
 
+or the backend mode used by the Jev classifier:
+
+```json
+{"mode":"backend","backend":"jev","model":"~typesafe/jev-latest"}
+```
+
 Classifier-routed decisions contain the effective level after model resolution. If `classifierIo` is off or authentication fails later, this field still exists.
 
 If pi-automode cannot resolve the model, the entry contains `requestedLevel` without `effectiveLevel`. In this case, no model-supported level exists.
@@ -110,6 +116,8 @@ When logging is enabled, pi-automode writes this entry before the matching `deci
 
 For persisted sessions, `ccusage` reports this sidecar as a separate `-pi-automode` session. This entry contains no prompt or response text. When `classifierIo` is off, pi-automode still writes it.
 
+The Jev backend reports no token usage, so it writes no `message` entry. Its `classifier` entry records the parsed decision without a synthetic provider response.
+
 ### `classifier`
 
 If `classifierIo: true`, pi-automode writes a `classifier` entry. It writes this entry only for classifier-routed actions.
@@ -121,7 +129,7 @@ The entry follows all related classifier-usage `message` entries. It precedes th
 | `ts` | ISO timestamp |
 | `decisionId` | matches the `decision` entry for the same call |
 | `model` | classifier model, for example `anthropic/claude-haiku-4` |
-| `reasoning` | `server-default`, or the explicit requested and effective model-supported level |
+| `reasoning` | `server-default`, the explicit requested and effective model-supported level, or `{"mode":"backend","backend":"jev","model":"..."}` for the Jev backend |
 | `prompt.system` | the full system policy with `environment`/`allow`/`soft_deny`/`hard_deny` rules interpolated |
 | `prompt.context` | the shared context message: loaded project instructions + classifier transcript |
 | `prompt.action` | the complete, untruncated current tool action JSON |
@@ -129,7 +137,10 @@ The entry follows all related classifier-usage `message` entries. It precedes th
 | `prompt.detailedInstruction` | the exact structured-review instruction |
 | `attempts` | one entry per classifier model call (see below) |
 | `durationMs` | total classifier time |
+| `cached` | `true` when the verdict came from the session cache and no request was made; then `attempts` is empty and `durationMs` is `0` |
 | `parsed` | the final decision that was acted on (`{ decision, tier, reason }`) |
+
+The Jev backend reuses these fields with different content: `prompt.system` is the questions JSON, `prompt.context` is the state JSON, and both instruction fields are `"(not used by the Jev backend)"`. Its `attempts[]` entries carry either the parsed decision or, on a transport, HTTP, parse, or incomplete-answer failure, an `error`; neither carries a `response`, so no `message` entry is written. A missing key writes no `classifier` entry, matching the LLM path. Jev model labels carry an `openrouter/` prefix only when `jevBaseUrl` targets OpenRouter itself.
 
 Each `attempts[]` entry is `{ stage, attempt, response?, parsed?, error?, durationMs }`:
 

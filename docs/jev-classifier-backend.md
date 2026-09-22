@@ -739,7 +739,8 @@ error-prone.
   arbitrary base.
 - `parseJevResponse`: happy path, HTTP error with `message`, unreadable JSON,
   missing `answers`, empty `answers`, an array `answers`, missing `noul`, and
-  clamping of out-of-range values.
+  rejection of out-of-range values (the answer is dropped, so the call
+  fails closed).
 - `missingJevAnswers` / end-to-end fail-closed: a response that omits any
   requested question id (including one that only returns an unrecognized id)
   blocks instead of defaulting to zero danger.
@@ -782,16 +783,52 @@ npm run check
    drop `scope_escape` (it overlaps the deterministic path checks) or collapse
    to two questions and branch on `danger = max`.
 5. `noul` is assumed 0..1 danger-side-up, matching `specpi-jev-guard`'s parsed
-   behavior. Validate with one live call before enabling enforcement. Confirm
-   the `state` field names (`action`, `user_request`) still read as intended.
+   behavior. `/automode jev test` sends one clearly safe and one clearly dangerous
+   action and reports both verdicts, so the direction can be checked against the live
+   endpoint. Confirm the `state` field names (`action`, `user_request`) still read as
+   intended.
 6. The cache is keyed on
    `(session, model, baseUrl, state, questions, thresholds)` and is
    session-scoped, with least-recently-used eviction. Identical retried tool
-   calls become free.
+   calls become free. A cache hit is logged as a `classifier` entry with
+   `cached: true` and no attempts.
 7. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the
    Jev backend; they are reported as ignored when `classifierBackend === "jev"`.
-8. Rule lists are clipped to a bounded size before they reach Jev; a truncated
-   list emits a config diagnostic and a `[TRUNCATED]` marker in the question.
+8. Jev receives the same bounded context the LLM classifier sees: the
+   token-bounded transcript, the per-file-bounded project instructions, and the
+   full rule lists. Jev redacts secret shapes from the rule lists first, while the
+   LLM path interpolates them raw; this is deliberate, because the configured
+   LLM provider already holds the rules and the Jev endpoint is a third party. Pi-automode does not truncate the current action and
+   does not re-bound the transcript or the rule lists for Jev; a payload the
+   endpoint rejects fails closed. The earlier 600-character and 1500-character
+   clips were removed because they silently dropped the authorization and policy the
+   classifier reasons about. Residual risk: if the endpoint accepts and silently
+   truncates an oversized payload instead of rejecting it, Jev can answer on a
+   partial action and pi-automode cannot detect that. Only the deterministic
+   layers are unaffected by payload size.
+9. The default `jevApiKeyEnv` (`OPENROUTER_API_KEY`) is withheld when
+   `jevBaseUrl` targets a non-OpenRouter host, and a config diagnostic flags the
+   mismatch. A custom endpoint must name its own key variable.
+10. The two backends share their policy clauses through
+    `CLASSIFIER_POLICY_CLAUSES`, and a parity test asserts every clause reaches
+    both the LLM system prompt and the Jev questions. Before that, the Jev questions
+    were a paraphrase and had dropped the HARD_DENY no-override rule, the
+    pre-existing-file authorization bounds, the authorization-revocation rule, the
+    untrusted-data instruction, and the security-not-quality and allow-by-default
+    rules.
+11. Jev cannot emit the LLM classifier's `allow` or `explicit_intent` tiers, so
+    its allow tier is always `none`. This affects only the optional `classifier` I/O
+    log: denial history, the `decision` log line, and the agent-facing message
+    never carried a tier. The score summary still shows that a Jev allow overrode a
+    soft-deny rule.
+12. Jev does not retry a malformed or transport-failed response. The LLM path
+    retries only an invalid decision response (not a transport failure); a thrown
+    transport error blocks immediately for both backends. This is fail-closed, so it
+    costs availability, not safety.
+13. `jevTimeoutMs` defaults to 12000, below the LLM path's 20000, so Jev blocks
+    more often on slow endpoints. Raise it if that matters.
+14. An out-of-range `noul` probability is treated as a contract violation: the
+    answer is dropped, so the call fails closed rather than clamping the score.
 
 ## 8. Configuration example
 
@@ -812,5 +849,7 @@ npm run check
 ```
 
 Key resolution order: pi's registry (`/login openrouter`) → env
-(`OPENROUTER_API_KEY` by default) → stored `auth.json`. Missing key fails
-closed.
+(`OPENROUTER_API_KEY` by default) → stored `auth.json`. The env step and the
+registry/stored steps only apply on the OpenRouter host; a custom `jevBaseUrl`
+withholds the default `OPENROUTER_API_KEY` and requires a custom variable.
+Missing key fails closed.

@@ -50,18 +50,20 @@ The following keys apply only when `classifierBackend` is `"jev"`:
 | --- | --- | --- |
 | `jevModel` | `"~typesafe/jev-latest"` | Jev model id sent to the decisions endpoint |
 | `jevBaseUrl` | `"https://openrouter.ai/api/v1"` | Chat-compatible base URL; pi-automode derives `/api/alpha/decisions` |
-| `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth |
+| `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth. On a custom `jevBaseUrl`, the default variable is withheld and a custom variable must be named |
 | `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
 | `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
 | `jevSoftDenyThreshold` | `0.35` | Highest soft-side probability at or above which the action is blocked |
 
 `classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
 
-Jev key resolution is the Pi registry (`/login openrouter`), then `jevApiKeyEnv`, then stored `auth.json`. The registry and stored credentials are only used when `jevBaseUrl` targets OpenRouter; a custom base URL must provide its own key via `jevApiKeyEnv`, so the OpenRouter key is never sent to a third party. A response that omits any requested question id fails closed.
+Jev key resolution is the Pi registry (`/login openrouter`), then `jevApiKeyEnv`, then stored `auth.json`. The registry and stored credentials are only used when `jevBaseUrl` targets OpenRouter. A custom base URL must name its own key variable in `jevApiKeyEnv`; the default `OPENROUTER_API_KEY` is withheld from custom hosts so the OpenRouter key is never sent to a third party. A response that omits any requested question id fails closed.
 
-Rule lists are clipped to a bounded size before they are sent to the Jev classifier. When a list exceeds that budget, `autoMode.<list>` emits a diagnostic and the question text carries a `[TRUNCATED]` marker; the deterministic layers still evaluate the full list.
+Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action and does not re-bound the transcript or the rule lists for Jev; a payload the endpoint rejects fails closed.
 
-`/automode backend <llm|jev>` writes `classifierBackend` to the global config. When the Jev backend is active, `/automode model` writes `jevModel` and does not require the model to be present in the Pi registry.
+Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers, so its allow tier is always `none`. Only the optional `classifier` I/O log records that a Jev allow overrode a soft-deny rule, through the score summary.
+
+`/automode backend <llm|jev>` writes `classifierBackend` to the global config. When the Jev backend is active, `/automode model` writes `jevModel` and does not require the model to be present in the Pi registry; the Pi model picker is LLM-only, so pass the Jev model id explicitly. `/automode jev` reports the effective endpoint, credential source, and thresholds. `/automode jev test` sends one clearly safe and one clearly dangerous probe to the live endpoint and reports both verdicts, which validates that `noul` answers are danger-side-up.
 
 `allowInsideWorkingDirectory` adds a deterministic allow tier for the file tools. The default value is `false`. The file tools are `read`, `write`, `edit`, `grep`, `find`, and `ls`.
 

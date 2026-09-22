@@ -548,6 +548,127 @@ test("tool_call logs ccusage-compatible usage, classifier I/O, and decision", as
 	}
 });
 
+test("tool_call logs a cached classifier verdict without usage entries", async () => {
+	const t = await setupLogTest({
+		config: baseConfig({ log: { enabled: true, classifierIo: true } }),
+		classifier: async () => ({
+			decision: "block",
+			tier: "hard_deny",
+			reason: "Jev: hard=0.90 soft=0.10 intent=0.10 scope=0.10 (cached)",
+			io: {
+				model: "openrouter/typesafe/jev-1.13",
+				reasoning: {
+					mode: "backend",
+					backend: "jev",
+					model: "~typesafe/jev-latest",
+				},
+				prompt: {
+					system: "s",
+					context: "c",
+					action: "a",
+					fastInstruction: "x",
+					detailedInstruction: "y",
+				},
+				attempts: [],
+				durationMs: 0,
+				cached: true,
+			},
+		}),
+	});
+	try {
+		await t.fake.emit(
+			"tool_call",
+			{ toolName: "bash", input: { command: "deploy" } },
+			t.ctx,
+		);
+		const lines = readFileSync(t.logPath, "utf8").trim().split("\n").map(JSON.parse);
+		// A cache hit writes no ccusage usage entry.
+		assert.equal(lines.length, 2);
+		const classifierEntry = lines[0];
+		const decisionEntry = lines[1];
+		assert.equal(classifierEntry.type, "classifier");
+		assert.equal(classifierEntry.cached, true);
+		assert.deepEqual(classifierEntry.attempts, []);
+		assert.equal(classifierEntry.durationMs, 0);
+		assert.deepEqual(classifierEntry.reasoning, {
+			mode: "backend",
+			backend: "jev",
+			model: "~typesafe/jev-latest",
+		});
+		assert.equal(decisionEntry.type, "decision");
+		assert.equal(decisionEntry.outcome, "block");
+		assert.equal(decisionEntry.kind, "classifier");
+	} finally {
+		rmSync(t.dir, { recursive: true, force: true });
+	}
+});
+
+test("tool_call logs a non-cached Jev verdict without a synthetic usage entry", async () => {
+	const t = await setupLogTest({
+		config: baseConfig({ log: { enabled: true, classifierIo: true } }),
+		classifier: async () => ({
+			decision: "allow",
+			tier: "none",
+			reason: "Jev: permitted (hard=0.01 soft=0.01 intent=0.01 scope=0.01)",
+			io: {
+				model: "openrouter/typesafe/jev-1.13",
+				reasoning: {
+					mode: "backend",
+					backend: "jev",
+					model: "~typesafe/jev-latest",
+				},
+				prompt: {
+					system: "s",
+					context: "c",
+					action: "a",
+					fastInstruction: "x",
+					detailedInstruction: "y",
+				},
+				// Jev reports no token usage, so the attempt carries the parsed
+				// decision and no provider response.
+				attempts: [
+					{
+						stage: "detailed",
+						attempt: 1,
+						parsed: {
+							decision: "allow",
+							tier: "none",
+							reason: "Jev: permitted (hard=0.01 soft=0.01 intent=0.01 scope=0.01)",
+						},
+						durationMs: 42,
+					},
+				],
+				durationMs: 42,
+			},
+		}),
+	});
+	try {
+		await t.fake.emit(
+			"tool_call",
+			{ toolName: "bash", input: { command: "ls" } },
+			t.ctx,
+		);
+		const lines = readFileSync(t.logPath, "utf8").trim().split("\n").map(JSON.parse);
+		// A response-less attempt writes no ccusage usage entry.
+		assert.equal(lines.length, 2);
+		const classifierEntry = lines[0];
+		const decisionEntry = lines[1];
+		assert.equal(classifierEntry.type, "classifier");
+		assert.equal(classifierEntry.cached, undefined);
+		assert.equal(classifierEntry.attempts.length, 1);
+		assert.equal(classifierEntry.attempts[0].response, undefined);
+		assert.deepEqual(classifierEntry.attempts[0].parsed, {
+			decision: "allow",
+			tier: "none",
+			reason: "Jev: permitted (hard=0.01 soft=0.01 intent=0.01 scope=0.01)",
+		});
+		assert.equal(decisionEntry.type, "decision");
+		assert.equal(decisionEntry.outcome, "allow");
+	} finally {
+		rmSync(t.dir, { recursive: true, force: true });
+	}
+});
+
 test("/automode config reports the resolved permissions.allow rules", async () => {
 	const patterns = ["bash(git status*)", "example-extension-tool"].map((raw) =>
 		parseToolPattern(raw)!

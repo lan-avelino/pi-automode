@@ -7,18 +7,24 @@ import {
 	buildJevQuestions,
 	buildJevState,
 	clearJevCache,
+	CLASSIFIER_POLICY_CLAUSES,
+	CLASSIFIER_SYSTEM_PROMPT,
 	credentialKey,
 	defaultJevClassifyAction,
+	DEFAULT_JEV_API_KEY_ENV,
 	isOpenRouterBaseUrl,
+	jevCredentialDiagnostics,
 	jevDecision,
-	jevRuleBudgetDiagnostics,
+	jevStatusText,
 	missingJevAnswers,
 	openRouterDecisionsUrl,
 	parseJevResponse,
+	probeJevClassifier,
 	redactSecrets,
 	resolveJevKey,
 	statusText,
 } from "../extensions/auto-mode.ts";
+import { createPiAutomode } from "../extensions/auto-mode.ts";
 import type { EffectiveConfig } from "../extensions/auto-mode.ts";
 import {
 	baseConfig,
@@ -26,7 +32,6 @@ import {
 	createFakeCtx,
 	createFakePi,
 } from "./test-helpers.ts";
-import { createPiAutomode } from "../extensions/auto-mode.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -63,7 +68,7 @@ test("openRouterDecisionsUrl appends /decisions to an arbitrary base", () => {
 
 // --- response parsing ------------------------------------------------------
 
-test("parseJevResponse reads the answers map and clamps out-of-range values", () => {
+test("parseJevResponse reads in-range answers and rejects out-of-range values", () => {
 	const parsed = parseJevResponse(
 		200,
 		JSON.stringify({
@@ -78,11 +83,18 @@ test("parseJevResponse reads the answers map and clamps out-of-range values", ()
 	assert.equal(parsed.ok, true);
 	if (!parsed.ok) return;
 	assert.equal(parsed.model, "typesafe/jev-1.13");
-	assert.deepEqual(parsed.scores, {
-		hard_deny: 1,
-		soft_deny_uncovered: 0,
-		intent_mismatch: 0.4,
-	});
+	// Out-of-range probabilities are a contract violation, so they are dropped
+	// rather than clamped into a usable score.
+	assert.deepEqual(parsed.scores, { intent_mismatch: 0.4 });
+
+	// A response whose every score is out of range has no usable answer.
+	const allBad = parseJevResponse(
+		200,
+		JSON.stringify({
+			answers: { hard_deny: { type: "noul", noul: 1.5 } },
+		}),
+	);
+	assert.equal(allBad.ok, false);
 });
 
 test("parseJevResponse surfaces HTTP errors with the server message", () => {
@@ -103,6 +115,13 @@ test("parseJevResponse fails closed on unreadable, malformed, or empty bodies", 
 			[200, JSON.stringify({ answers: {} })],
 			[200, JSON.stringify({ answers: { hard_deny: { type: "noul" } } })],
 			[200, JSON.stringify({ answers: [{ type: "noul", noul: 0.9 }] })],
+			// A numeric score of the wrong question type is not a usable answer.
+			[
+				200,
+				JSON.stringify({
+					answers: { hard_deny: { type: "other", noul: 0.9 } },
+				}),
+			],
 		] as Array<[number, string]>
 	) {
 		const parsed = parseJevResponse(status, body);
@@ -144,25 +163,55 @@ test("missingJevAnswers reports every unanswered question", () => {
 
 // --- decision mapping ------------------------------------------------------
 
+/** The default question set; required scores are derived from it. */
+const baseQuestions = () => buildJevQuestions(baseConfig());
+
 test("jevDecision blocks at or above the hard threshold", () => {
 	const config = baseConfig();
-	assert.deepEqual(jevDecision({ hard_deny: 0.5 }, config), {
-		decision: "block",
-		tier: "hard_deny",
-		reason: "Jev: hard=0.50 soft=0.00 intent=0.00 scope=0.00",
-	});
+	assert.deepEqual(
+		jevDecision(
+			{
+				hard_deny: 0.5,
+				soft_deny_uncovered: 0,
+				intent_mismatch: 0,
+				scope_escape: 0,
+			},
+			config,
+			baseQuestions(),
+		),
+		{
+			decision: "block",
+			tier: "hard_deny",
+			reason: "Jev: hard=0.50 soft=0.00 intent=0.00 scope=0.00",
+		},
+	);
 });
 
 test("jevDecision blocks the soft band from any danger-side question", () => {
 	const config = baseConfig();
 	for (
 		const scores of [
-			{ hard_deny: 0.49, soft_deny_uncovered: 0.35 },
-			{ hard_deny: 0.0, intent_mismatch: 0.35 },
-			{ hard_deny: 0.0, scope_escape: 0.36 },
+			{
+				hard_deny: 0.49,
+				soft_deny_uncovered: 0.35,
+				intent_mismatch: 0,
+				scope_escape: 0,
+			},
+			{
+				hard_deny: 0.0,
+				soft_deny_uncovered: 0,
+				intent_mismatch: 0.35,
+				scope_escape: 0,
+			},
+			{
+				hard_deny: 0.0,
+				soft_deny_uncovered: 0,
+				intent_mismatch: 0,
+				scope_escape: 0.36,
+			},
 		]
 	) {
-		const decision = jevDecision(scores, config);
+		const decision = jevDecision(scores, config, baseQuestions());
 		assert.equal(decision.decision, "block", JSON.stringify(scores));
 		assert.equal(decision.tier, "soft_deny");
 	}
@@ -170,11 +219,29 @@ test("jevDecision blocks the soft band from any danger-side question", () => {
 
 test("jevDecision allows below both thresholds", () => {
 	const decision = jevDecision(
-		{ hard_deny: 0.49, soft_deny_uncovered: 0.34 },
+		{
+			hard_deny: 0.49,
+			soft_deny_uncovered: 0.34,
+			intent_mismatch: 0.1,
+			scope_escape: 0.1,
+		},
 		baseConfig(),
+		baseQuestions(),
 	);
 	assert.equal(decision.decision, "allow");
 	assert.equal(decision.tier, "none");
+});
+
+test("jevDecision fails closed when a required score is missing", () => {
+	// Guards a future caller that skips the explicit missing-answer check.
+	const decision = jevDecision(
+		{ hard_deny: 0.0, intent_mismatch: 0.0 },
+		baseConfig(),
+		baseQuestions(),
+	);
+	assert.equal(decision.decision, "block");
+	assert.equal(decision.tier, "none");
+	assert.match(decision.reason, /incomplete scores/);
 });
 
 test("jevDecision honors configured thresholds", () => {
@@ -183,19 +250,43 @@ test("jevDecision honors configured thresholds", () => {
 		jevSoftDenyThreshold: 0.8,
 	});
 	assert.equal(
-		jevDecision({ hard_deny: 0.7, intent_mismatch: 0.5 }, config).decision,
+		jevDecision(
+			{
+				hard_deny: 0.7,
+				soft_deny_uncovered: 0.1,
+				intent_mismatch: 0.5,
+				scope_escape: 0.1,
+			},
+			config,
+			baseQuestions(),
+		).decision,
 		"allow",
 	);
 	assert.equal(
-		jevDecision({ hard_deny: 0.9 }, config).tier,
+		jevDecision(
+			{
+				hard_deny: 0.9,
+				soft_deny_uncovered: 0,
+				intent_mismatch: 0,
+				scope_escape: 0,
+			},
+			config,
+			baseQuestions(),
+		).tier,
 		"hard_deny",
 	);
 });
 
 test("jevDecision prefers the hard tier when both bands are cleared", () => {
 	const decision = jevDecision(
-		{ hard_deny: 0.9, intent_mismatch: 0.9 },
+		{
+			hard_deny: 0.9,
+			soft_deny_uncovered: 0,
+			intent_mismatch: 0.9,
+			scope_escape: 0,
+		},
 		baseConfig(),
+		baseQuestions(),
 	);
 	assert.equal(decision.decision, "block");
 	assert.equal(decision.tier, "hard_deny");
@@ -212,7 +303,7 @@ test("buildJevQuestions phrases every question danger-side up with policy text",
 	assert.match(questions.scope_escape!.instructions, /Trusted repo: acme/);
 });
 
-test("buildJevQuestions redacts rule text and flags truncated rule lists", () => {
+test("buildJevQuestions redacts secrets and sends the full rule text", () => {
 	const longRule = "x".repeat(2000);
 	const questions = buildJevQuestions(
 		baseConfig({
@@ -221,28 +312,80 @@ test("buildJevQuestions redacts rule text and flags truncated rule lists", () =>
 	);
 	const hard = questions.hard_deny!.instructions;
 	assert.doesNotMatch(hard, /sk-or-v1-abcdefghijklmnop/);
-	assert.match(hard, /TRUNCATED/);
-
-	const clean = buildJevQuestions(baseConfig());
-	assert.doesNotMatch(clean.hard_deny!.instructions, /TRUNCATED/);
+	// Rule lists are user-owned policy and reach Jev in full, like the LLM path.
+	assert.ok(hard.includes(longRule));
+	assert.doesNotMatch(hard, /TRUNCATED/);
 });
 
-test("jevRuleBudgetDiagnostics names only the truncated rule lists", () => {
-	assert.deepEqual(jevRuleBudgetDiagnostics(baseConfig()), []);
-	const diagnostics = jevRuleBudgetDiagnostics(
-		baseConfig({ softDeny: ["y".repeat(2000)] }),
-	);
-	assert.equal(diagnostics.length, 1);
-	assert.match(diagnostics[0]!, /autoMode\.softDeny exceeds 1500 characters/);
+test("the Jev questions encode every shared classifier policy clause", () => {
+	// Distinctive rule text so a clause cannot be satisfied by rule prose.
+	const config = baseConfig({
+		environment: ["ENV_MARKER"],
+		allow: ["ALLOW_MARKER"],
+		softDeny: ["SOFT_MARKER"],
+		hardDeny: ["HARD_MARKER"],
+	});
+	const questions = buildJevQuestions(config);
+	const expected: Record<string, Array<keyof typeof CLASSIFIER_POLICY_CLAUSES>> = {
+		hard_deny: [
+			"hardDenyNoOverride",
+			"allowNeverOverridesHardDeny",
+			"untrustedData",
+			"securityNotQuality",
+			"allowByDefault",
+		],
+		soft_deny_uncovered: [
+			"softDenyAuthorization",
+			"fileAuthorizationBounds",
+			"otherSoftDenyAuthorization",
+			"authorizationRevocation",
+			"allowNeverOverridesHardDeny",
+			"untrustedData",
+			"securityNotQuality",
+			"allowByDefault",
+		],
+		intent_mismatch: [
+			"generalRequestsNotIntent",
+			"untrustedData",
+			"securityNotQuality",
+			"allowByDefault",
+		],
+		scope_escape: ["untrustedData", "securityNotQuality", "allowByDefault"],
+	};
+	// Each clause must reach the question that carries its semantics, not just
+	// any question, so a clause moved to the wrong question fails.
+	for (const [id, clauseIds] of Object.entries(expected)) {
+		const instructions = questions[id]!.instructions;
+		for (const clauseId of clauseIds) {
+			assert.ok(
+				instructions.includes(CLASSIFIER_POLICY_CLAUSES[clauseId]),
+				`${id} is missing policy clause ${clauseId}`,
+			);
+		}
+	}
+	// Every clause must reach at least one question.
+	const uncovered = new Set(Object.keys(CLASSIFIER_POLICY_CLAUSES));
+	for (const clauseIds of Object.values(expected)) {
+		for (const clauseId of clauseIds) uncovered.delete(clauseId);
+	}
+	assert.deepEqual([...uncovered], []);
+
+	// The system prompt is built from the same clauses.
+	for (const [id, clause] of Object.entries(CLASSIFIER_POLICY_CLAUSES)) {
+		assert.ok(
+			CLASSIFIER_SYSTEM_PROMPT.includes(clause),
+			`system prompt is missing policy clause ${id}`,
+		);
+	}
 });
 
 // --- state redaction -------------------------------------------------------
 
-test("buildJevState redacts secrets and bounds intent", () => {
+test("buildJevState redacts every field and does not re-bound the transcript", () => {
 	clearJevCache();
+	const longIntent = "deploy the release ".repeat(500);
 	const state = buildJevState(
 		"bash {\"command\":\"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\"}",
-		"/tmp/project",
 		"deploy with sk-or-v1-abcdefghijklmnop",
 		"",
 	);
@@ -250,6 +393,14 @@ test("buildJevState redacts secrets and bounds intent", () => {
 	assert.match(state.action!, /REDACTED/);
 	assert.doesNotMatch(state.user_request!, /sk-or-v1-abcdefghijklmnop/);
 	assert.equal(state.project_instructions, "(none)");
+	// The transcript is token-bounded upstream, so it is not clipped again.
+	assert.equal(buildJevState("bash", longIntent, "").user_request, longIntent);
+	// The working directory is not part of the state payload.
+	assert.deepEqual(Object.keys(state).sort(), [
+		"action",
+		"project_instructions",
+		"user_request",
+	]);
 });
 
 test("redactSecrets removes private key blocks and bearer tokens", () => {
@@ -323,6 +474,11 @@ test("isOpenRouterBaseUrl only matches OpenRouter endpoints", () => {
 	assert.equal(isOpenRouterBaseUrl("https://classifier.test/v1"), false);
 	assert.equal(isOpenRouterBaseUrl("https://openrouter.ai.evil.test/v1"), false);
 	assert.equal(isOpenRouterBaseUrl("not a url"), false);
+	// A non-default port is a different endpoint, even on the OpenRouter host.
+	assert.equal(isOpenRouterBaseUrl("https://openrouter.ai:8443/api/v1"), false);
+	assert.equal(isOpenRouterBaseUrl("https://openrouter.ai:443/api/v1"), true);
+	// Cleartext http is not the OpenRouter service, so the key stays withheld.
+	assert.equal(isOpenRouterBaseUrl("http://openrouter.ai/api/v1"), false);
 });
 
 test("resolveJevKey never sends OpenRouter credentials to a custom base URL", async () => {
@@ -349,6 +505,77 @@ test("resolveJevKey never sends OpenRouter credentials to a custom base URL", as
 			readStoredCredential: () => ({ type: "api_key", key: "stored-key" }),
 		}),
 		{ key: "env-key", source: "env" },
+	);
+});
+
+test("resolveJevKey withholds the default OpenRouter env var from a custom base URL", async () => {
+	const customBase = baseConfig({
+		jevBaseUrl: "https://classifier.test/api/v1",
+		// jevApiKeyEnv stays at the OpenRouter default.
+	});
+	const ctx = createFakeCtx([], {
+		modelRegistry: { getApiKeyForProvider: async () => undefined },
+	}) as never;
+
+	assert.deepEqual(
+		await resolveJevKey(ctx, customBase, {
+			env: { [DEFAULT_JEV_API_KEY_ENV]: "openrouter-key" },
+			readStoredCredential: () => ({ type: "api_key", key: "stored-key" }),
+		}),
+		{ source: "none" },
+	);
+});
+
+test("resolveJevKey uses the default OpenRouter env var on the OpenRouter endpoint", async () => {
+	const ctx = createFakeCtx([], {
+		modelRegistry: { getApiKeyForProvider: async () => undefined },
+	}) as never;
+	assert.deepEqual(
+		await resolveJevKey(ctx, baseConfig(), {
+			env: { [DEFAULT_JEV_API_KEY_ENV]: "openrouter-key" },
+			readStoredCredential: () => undefined,
+		}),
+		{ key: "openrouter-key", source: "env" },
+	);
+});
+
+test("resolveJevKey withholds a case-variant default env name from a custom host", async () => {
+	const customBase = baseConfig({
+		jevBaseUrl: "https://classifier.test/api/v1",
+		// Windows env names are case-insensitive, so this is the OpenRouter var.
+		jevApiKeyEnv: "openrouter_api_key",
+	});
+	const ctx = createFakeCtx([], {
+		modelRegistry: { getApiKeyForProvider: async () => undefined },
+	}) as never;
+
+	assert.deepEqual(
+		await resolveJevKey(ctx, customBase, {
+			env: { OPENROUTER_API_KEY: "openrouter-key" },
+			readStoredCredential: () => undefined,
+		}),
+		{ source: "none" },
+	);
+	assert.equal(jevCredentialDiagnostics(customBase).length, 1);
+});
+
+test("jevCredentialDiagnostics flags a custom base URL with the default key env", () => {
+	const mismatch = baseConfig({
+		jevBaseUrl: "https://classifier.test/api/v1",
+	});
+	const diagnostics = jevCredentialDiagnostics(mismatch);
+	assert.equal(diagnostics.length, 1);
+	assert.match(diagnostics[0]!, /jevApiKeyEnv/);
+	assert.deepEqual(jevCredentialDiagnostics(baseConfig()), []);
+
+	assert.deepEqual(
+		jevCredentialDiagnostics(
+			baseConfig({
+				jevBaseUrl: "https://classifier.test/api/v1",
+				jevApiKeyEnv: "CLASSIFIER_API_KEY",
+			}),
+		),
+		[],
 	);
 });
 
@@ -393,6 +620,8 @@ test("defaultJevClassifyAction fails closed when no key is available", async () 
 	assert.equal(result.decision, "block");
 	assert.equal(result.tier, "none");
 	assert.match(result.reason, /key missing/);
+	// A missing key has no attempt to log, matching the LLM path.
+	assert.equal(result.io, undefined);
 	assert.deepEqual(result.reasoning, {
 		mode: "backend",
 		backend: "jev",
@@ -435,6 +664,8 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 		assert.equal(first.tier, "hard_deny");
 		assert.equal(calls.length, 1);
 		assert.equal(calls[0]!.url, "https://classifier.test/api/alpha/decisions");
+		// Redirects are rejected so the key is never forwarded to another host.
+		assert.equal(calls[0]!.init.redirect, "error");
 		const headers = calls[0]!.init.headers as Record<string, string>;
 		assert.equal(headers.Authorization, "Bearer test-key");
 		const payload = JSON.parse(String(calls[0]!.init.body)) as {
@@ -445,7 +676,8 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 		assert.equal(payload.model, "~typesafe/jev-latest");
 		assert.match(payload.state.action, /deploy/);
 		assert.equal(payload.questions.hard_deny!.type, "noul");
-		assert.equal(first.io?.model, "openrouter/typesafe/jev-1.13");
+		// A custom endpoint is not an OpenRouter provider.
+		assert.equal(first.io?.model, "typesafe/jev-1.13");
 
 		const second = await defaultJevClassifyAction(
 			ctx as never,
@@ -456,6 +688,54 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 		);
 		assert.equal(calls.length, 1);
 		assert.match(second.reason, /\(cached\)$/);
+		// A cache hit is still logged, but as a cached verdict with no request.
+		assert.equal(second.io?.cached, true);
+		assert.deepEqual(second.io?.attempts, []);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("defaultJevClassifyAction sends the full action without truncation", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	let sent: { state: { action: string } } | undefined;
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		sent = JSON.parse(String(init?.body));
+		return new Response(
+			JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+	try {
+		const action = JSON.stringify({
+			toolName: "write",
+			input: { path: "/tmp/x", content: "y".repeat(5000) },
+		});
+		const result = await defaultJevClassifyAction(
+			createFakeCtx([], {
+				modelRegistry: { getApiKeyForProvider: async () => undefined },
+			}) as never,
+			jevTestConfig(),
+			action,
+			"",
+			JEV_KEY_DEPS,
+		);
+		assert.equal(result.decision, "allow");
+		assert.equal(sent?.state.action, action);
+		// The default base URL is OpenRouter, so the log labels it as such.
+		assert.equal(result.io?.model, "openrouter/typesafe/jev-1.13");
+		// Jev reports no token usage, so no provider response is fabricated:
+		// one attempt with the parsed decision and no response.
+		assert.equal(result.io?.attempts.length, 1);
+		assert.equal(result.io?.attempts[0]?.stage, "detailed");
+		assert.deepEqual(result.io?.attempts[0]?.parsed, {
+			decision: "allow",
+			tier: "none",
+			reason: "Jev: permitted (hard=0.01 soft=0.01 intent=0.01 scope=0.01)",
+		});
+		assert.equal(result.io?.attempts[0]?.response, undefined);
 	} finally {
 		globalThis.fetch = originalFetch;
 		clearJevCache();
@@ -482,6 +762,12 @@ test("defaultJevClassifyAction fails closed on transport and parse errors", asyn
 		);
 		assert.equal(transport.decision, "block");
 		assert.match(transport.reason, /fails closed/);
+		// Transport failures log one error attempt, like the LLM path.
+		assert.equal(transport.io?.attempts.length, 1);
+		assert.equal(transport.io?.attempts[0]?.stage, "detailed");
+		assert.match(String(transport.io?.attempts[0]?.error), /connection refused/);
+		assert.equal(transport.io?.attempts[0]?.parsed, undefined);
+		assert.equal(transport.io?.attempts[0]?.response, undefined);
 
 		globalThis.fetch = (async () =>
 			new Response("not json", { status: 200 })) as typeof fetch;
@@ -743,4 +1029,155 @@ test("/automode model writes jevModel when the Jev backend is active", async () 
 		ctx.notifications.at(-1)?.message ?? "",
 		/Jev classifier saved globally/,
 	);
+});
+
+// --- /automode jev --------------------------------------------------------
+
+test("jevStatusText reports the endpoint, credential source, and warnings", () => {
+	const text = jevStatusText(
+		baseConfig({
+			classifierBackend: "jev",
+			jevBaseUrl: "https://classifier.test/api/v1",
+		}),
+		"none",
+		["autoMode.jevBaseUrl targets a custom endpoint"],
+	);
+	assert.match(text, /^backend: jev$/m);
+	assert.match(
+		text,
+		/^endpoint: https:\/\/classifier\.test\/api\/alpha\/decisions$/m,
+	);
+	assert.match(text, /^credential: none/m);
+	assert.match(text, /warning: autoMode\.jevBaseUrl/);
+	// A custom host with the default variable names the actual fix, not the
+	// variable the gate withholds.
+	assert.match(
+		text,
+		/^credential: none; the classifier fails closed \(set a custom key variable, not OPENROUTER_API_KEY\)$/m,
+	);
+
+	// The status reports the effective backend, not a hardcoded one.
+	const llm = jevStatusText(baseConfig(), "none");
+	assert.match(llm, /^backend: llm$/m);
+});
+
+test("/automode jev reports the backend status", async () => {
+	const fake = createFakePi();
+	createPiAutomode({
+		loadConfig: () =>
+			baseConfig({
+				classifierBackend: "jev",
+				jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY",
+			}),
+	})(fake.pi);
+	const ctx = createFakeCtx(fake.entries);
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+
+	const previous = process.env.PI_AUTOMODE_TEST_JEV_KEY;
+	process.env.PI_AUTOMODE_TEST_JEV_KEY = "test-key";
+	try {
+		await fake.commands.get("automode")?.handler("jev", ctx);
+		const message = ctx.notifications.at(-1)?.message ?? "";
+		assert.match(message, /backend: jev/);
+		assert.match(message, /endpoint: https:\/\/openrouter\.ai\/api\/alpha\/decisions/);
+		assert.match(message, /credential: environment variable PI_AUTOMODE_TEST_JEV_KEY/);
+	} finally {
+		if (previous === undefined) delete process.env.PI_AUTOMODE_TEST_JEV_KEY;
+		else process.env.PI_AUTOMODE_TEST_JEV_KEY = previous;
+	}
+});
+
+test("/automode jev test probes the endpoint in both directions", async () => {
+	const originalFetch = globalThis.fetch;
+	clearJevCache();
+	const answers = (danger: number) => ({
+		model: "typesafe/jev-1.13",
+		answers: {
+			hard_deny: { type: "noul", noul: danger },
+			soft_deny_uncovered: { type: "noul", noul: danger },
+			intent_mismatch: { type: "noul", noul: danger },
+			scope_escape: { type: "noul", noul: danger },
+		},
+	});
+	let calls = 0;
+	const bodies: Array<{ state: { action: string } }> = [];
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		calls += 1;
+		bodies.push(JSON.parse(String(init?.body)));
+		return new Response(
+			JSON.stringify(answers(calls === 1 ? 0.01 : 0.99)),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+
+	const previous = process.env.PI_AUTOMODE_TEST_JEV_KEY;
+	process.env.PI_AUTOMODE_TEST_JEV_KEY = "test-key";
+	try {
+		const fake = createFakePi();
+		createPiAutomode({
+			loadConfig: () =>
+				baseConfig({ jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY" }),
+		})(fake.pi);
+		const ctx = createFakeCtx(fake.entries);
+		await fake.emit("session_start", { type: "session_start" }, ctx);
+
+		await fake.commands.get("automode")?.handler("jev test", ctx);
+		const last = ctx.notifications.at(-1);
+		assert.equal(last?.type, "info");
+		assert.match(last?.message ?? "", /safe: allow/);
+		assert.match(last?.message ?? "", /dangerous: block/);
+		assert.equal(calls, 2);
+		// The first probe must be the safe action and the second the dangerous
+		// one, or the direction check is vacuous.
+		assert.match(bodies[0]!.state.action, /README\.md/);
+		assert.match(bodies[1]!.state.action, /rm/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (previous === undefined) delete process.env.PI_AUTOMODE_TEST_JEV_KEY;
+		else process.env.PI_AUTOMODE_TEST_JEV_KEY = previous;
+		clearJevCache();
+	}
+});
+
+test("probeJevClassifier fails closed when the endpoint errors", async () => {
+	const originalFetch = globalThis.fetch;
+	clearJevCache();
+	globalThis.fetch = (async () =>
+		new Response(JSON.stringify({ message: "boom" }), {
+			status: 500,
+		})) as typeof fetch;
+	const previous = process.env.PI_AUTOMODE_TEST_JEV_KEY;
+	process.env.PI_AUTOMODE_TEST_JEV_KEY = "test-key";
+	try {
+		const ctx = createFakeCtx([], {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		}) as never;
+		const result = await probeJevClassifier(
+			ctx,
+			baseConfig({ jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY" }),
+		);
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.match(result.reason, /HTTP 500: boom/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (previous === undefined) delete process.env.PI_AUTOMODE_TEST_JEV_KEY;
+		else process.env.PI_AUTOMODE_TEST_JEV_KEY = previous;
+		clearJevCache();
+	}
+});
+
+test("/automode model without an argument does not open the LLM picker in Jev mode", async () => {
+	const fake = createFakePi();
+	createPiAutomode({
+		loadConfig: () => baseConfig({ classifierBackend: "jev" }),
+	})(fake.pi);
+	const ctx = createFakeCtx(fake.entries);
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+
+	await fake.commands.get("automode")?.handler("model", ctx);
+	const last = ctx.notifications.at(-1);
+	assert.equal(last?.type, "info");
+	assert.match(last?.message ?? "", /Jev classifier model: ~typesafe\/jev-latest/);
+	assert.match(last?.message ?? "", /does not apply to the Jev backend/);
 });
