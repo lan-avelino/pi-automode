@@ -74,8 +74,8 @@ Pi-automode writes one `decision` entry for each tool-call decision. Each allowe
 | `kind` | enforcement path: `permissions.deny`, `permissions.ask`, `deterministic-hard-deny`, `deterministic-path-deny`, `permissions.allow`, `inside-working-directory`, `classifier`, `read-only`, or `setup` |
 | `outcome` | `allow` or `block` |
 | `reason` | the reason string (classifier reason, or the deterministic/permission reason) |
-| `classifierModel` | the configured classifier model for a classifier-routed decision |
-| `reasoning` | classifier reasoning mode and requested or effective level. See the examples below. |
+| `classifierModel` | the configured classifier model. Present only for a classifier-routed decision; absent for local decisions, which never call the classifier |
+| `reasoning` | classifier reasoning mode and requested or effective level. Present only for a classifier-routed decision; absent for local decisions. See the examples below. |
 
 The reasoning field records either server-default mode:
 

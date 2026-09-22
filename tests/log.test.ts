@@ -377,6 +377,10 @@ test("tool_call logs read-only allows with kind read-only", async () => {
 		assert.equal(entry.outcome, "allow");
 		assert.equal(entry.kind, "read-only");
 		assert.equal(entry.tool, "read");
+		// A local decision never calls the classifier, so it carries no classifier
+		// provenance; recording one would imply a verdict that was never requested.
+		assert.equal("classifierModel" in entry, false);
+		assert.equal("reasoning" in entry, false);
 	} finally {
 		rmSync(t.dir, { recursive: true, force: true });
 	}
@@ -409,6 +413,33 @@ test("tool_call logs deterministic hard-deny blocks", async () => {
 		assert.equal(entry.type, "decision");
 		assert.equal(entry.outcome, "block");
 		assert.equal(entry.kind, "deterministic-hard-deny");
+		// The deterministic layer never calls the classifier, so the entry must not
+		// advertise a classifier model or reasoning mode.
+		assert.equal("classifierModel" in entry, false);
+		assert.equal("reasoning" in entry, false);
+	} finally {
+		rmSync(t.dir, { recursive: true, force: true });
+	}
+});
+
+test("classifier-routed decisions record classifier provenance", async () => {
+	const t = await setupLogTest({
+		classifier: async () => ({ decision: "allow", tier: "allow", reason: "safe write" }),
+		config: baseConfig({
+			classifierModel: "test/model",
+			log: { enabled: true, classifierIo: false },
+		}),
+	});
+	try {
+		await t.fake.emit("tool_call", {
+			toolName: "write",
+			input: { path: "src/index.ts", content: "x" },
+		}, t.ctx);
+		const entry = JSON.parse(readFileSync(t.logPath, "utf8").trim());
+		assert.equal(entry.kind, "classifier");
+		// Only a classifier-routed decision records what classified it.
+		assert.equal(entry.classifierModel, "test/model");
+		assert.ok(entry.reasoning);
 	} finally {
 		rmSync(t.dir, { recursive: true, force: true });
 	}

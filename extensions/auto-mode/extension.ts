@@ -370,6 +370,24 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return `[pi-automode] Action blocked; the tool did not run. ${reason} Do not claim success, rely on effects from this call, or attempt an equivalent workaround. Report the block to the user before continuing with dependent work. Independent work can continue.`;
     }
 
+    /**
+     * Classifier provenance belongs only on classifier-routed decisions. A
+     * deterministic or permission decision never calls the classifier, so recording a
+     * classifier model and reasoning mode on it implies a verdict that was never
+     * requested and sends a reader looking for a `classifier` entry that does not exist.
+     */
+    function classifierFields(
+      kind: DecisionKind,
+      logCtx: LogCtx,
+    ): { classifierModel?: string; reasoning?: ClassifierReasoningLog } {
+      return kind === "classifier"
+        ? {
+            classifierModel: logCtx.classifierModel,
+            reasoning: logCtx.reasoning,
+          }
+        : {};
+    }
+
     function block(
       ctx: ExtensionContext,
       denial: DenialRecord,
@@ -393,8 +411,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           kind: denial.kind,
           outcome: "block",
           reason: denial.reason,
-          classifierModel: logCtx.classifierModel,
-          reasoning: logCtx.reasoning,
+          ...classifierFields(denial.kind, logCtx),
         });
       }
       if (ctx.hasUI) {
@@ -433,8 +450,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           kind,
           outcome: "allow",
           reason,
-          classifierModel: logCtx.classifierModel,
-          reasoning: logCtx.reasoning,
+          ...classifierFields(kind, logCtx),
         });
       }
       return undefined;

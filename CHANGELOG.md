@@ -14,6 +14,7 @@ All notable changes to this project are documented in this file.
 
 ## Bug fixes
 
+- **Classifier provenance on local decisions** — Record `classifierModel` and `reasoning` only on classifier-routed decision entries. A deterministic or permission decision never calls the classifier, so the previous entries advertised a classifier model and a `backend` reasoning mode for a verdict that was never requested, and a reader looking for the matching `classifier` entry would not find one.
 - **Status indicator separator** — Add one space between the `AM` prefix and the status symbol.
 - **Classifier context budgeting** — Estimate fast and detailed classifier requests in tokens instead of mixing UTF-8 bytes with token limits. Check detailed-stage capacity only after the fast stage requests review. Large project contexts no longer block small actions that fit. (#37)
 - **Explicit blocked-action feedback** — State that blocked tools did not run. Tell the agent not to claim success or rely on blocked effects. Require a report before dependent work continues. (#38)

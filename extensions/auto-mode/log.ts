@@ -23,7 +23,12 @@ export type DecisionLogEntry = {
   outcome: "allow" | "block";
   reason: string;
   classifierModel?: string;
-  reasoning: ClassifierReasoningLog;
+  /**
+   * Classifier reasoning provenance. Present only for a classifier-routed decision:
+   * a deterministic or permission decision never calls the classifier, so it carries
+   * no reasoning mode.
+   */
+  reasoning?: ClassifierReasoningLog;
 };
 
 /** The classifier prompt, raw responses, and parsed decision for one action. */
