@@ -8,7 +8,7 @@ All notable changes to this project are documented in this file.
 
 ## New features
 
-- **Jev classifier backend** — Add an opt-in `classifierBackend: "jev"` that replaces only the classifier stage with the Jev / SystemOne classifier over the OpenRouter decisions API. Deterministic permission, hard-deny, and path layers stay authoritative; Jev answers are probabilities mapped locally onto the existing tiers, and every Jev failure fails closed. Switch with `/automode backend <llm|jev>`.
+- **Jev classifier backend** — Add an opt-in `classifierBackend: "jev"` that replaces only the classifier stage with the Jev / SystemOne classifier over the OpenRouter decisions API. Deterministic permission, hard-deny, and path layers stay authoritative; Jev answers are probabilities mapped locally onto the existing tiers, and every Jev failure fails closed, including a response that omits a requested question. OpenRouter credentials are only sent when `jevBaseUrl` targets OpenRouter. Switch with `/automode backend <llm|jev>`.
 - **Schema-constrained classifier decisions** — Return detailed-stage decisions through an internal `classifier_decision` tool call. Supported providers enforce the schema during generation, and pi-automode validates every returned call locally. When strict tool sampling is available, this reduces fail-closed blocks caused by malformed or contract-invalid decision JSON. (#50)
 - **[Permission recipes](docs/permission-recipes.md)** — Add safe, composable examples for Bash permissions, working-directory changes, command chains, redirects, and classifier guidance. Thanks to @georgesleen for the impulse! (#46)
 

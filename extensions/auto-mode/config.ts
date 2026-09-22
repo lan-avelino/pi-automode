@@ -54,6 +54,7 @@ import type {
   ToolPattern,
 } from "./types.ts";
 import { hasOwn, stringArray } from "./utils.ts";
+import { jevRuleBudgetDiagnostics } from "./jev.ts";
 
 export type GlobalConfigPreparation = {
   status: "current" | "migrated" | "conflict" | "failed";
@@ -957,19 +958,23 @@ export function loadEffectiveConfigWithDiagnostics(
     projectSharedFiles,
   );
 
-  return {
-    config: buildEffectiveConfigFromSources({
-      globalSettings: loadedSettingsToSettings(globalFiles),
-      projectLocalSettings: loadedSettingsToSettings(projectLocalFiles),
-      projectSharedSettings: loadedSettingsToSettings(projectSharedFiles),
-      inlineSettings,
-    }),
-    diagnostics: [
-      ...fileDiagnostics,
-      ...sharedAllowDiagnostics,
-      ...diagnostics,
-    ],
-  };
+  const loadedDiagnostics = [
+    ...fileDiagnostics,
+    ...sharedAllowDiagnostics,
+    ...diagnostics,
+  ];
+
+  const config = buildEffectiveConfigFromSources({
+    globalSettings: loadedSettingsToSettings(globalFiles),
+    projectLocalSettings: loadedSettingsToSettings(projectLocalFiles),
+    projectSharedSettings: loadedSettingsToSettings(projectSharedFiles),
+    inlineSettings,
+  });
+  if (config.classifierBackend === "jev") {
+    loadedDiagnostics.push(...jevRuleBudgetDiagnostics(config));
+  }
+
+  return { config, diagnostics: loadedDiagnostics };
 }
 
 /** Load config from disk and environment variables. Exported for tests and diagnostics. */

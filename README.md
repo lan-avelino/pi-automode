@@ -150,11 +150,13 @@ Configure it in a user-owned config source:
 }
 ```
 
-Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend.
+Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. The OpenRouter registry and stored credentials are only sent when `jevBaseUrl` points at OpenRouter itself; a custom base URL must supply its own key through `jevApiKeyEnv`. A response that omits any requested question fails closed. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend.
 
 Switch backends with `/automode backend llm` or `/automode backend jev`. This writes the global config, like `/automode model`. In Jev mode, `/automode model` writes `jevModel` instead of `classifierModel`.
 
 The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
+
+Long rule lists are clipped before they reach the Jev classifier. When a rule list exceeds the classifier's per-list budget, pi-automode flags the truncation in `autoMode.<list>` diagnostics and in the question text; the deterministic layers still see the full list.
 
 Classification starts with a conservative one-token filter. If the filter requests review, pi-automode requests one internal `classifier_decision` tool call.
 

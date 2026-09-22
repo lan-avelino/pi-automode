@@ -1343,3 +1343,47 @@ test("writeGlobalAutoModeSetting persists one Jev key without dropping others", 
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("config diagnostics warn when a Jev rule list is truncated", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-budget-"));
+	const previousInlineSettings = process.env.PI_AUTOMODE_SETTINGS_JSON;
+	delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+	try {
+		const path = join(dir, "config.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				autoMode: {
+					classifierBackend: "jev",
+					softDeny: ["z".repeat(2000)],
+				},
+			}),
+		);
+		const loaded = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		assert.equal(loaded.config.classifierBackend, "jev");
+		assert.ok(
+			loaded.diagnostics.some((d) => /autoMode\.softDeny exceeds/.test(d)),
+			JSON.stringify(loaded.diagnostics),
+		);
+
+		// The same long list is silent when the LLM backend is active.
+		writeFileSync(
+			path,
+			JSON.stringify({
+				autoMode: { classifierBackend: "llm", softDeny: ["z".repeat(2000)] },
+			}),
+		);
+		const llm = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		assert.equal(
+			llm.diagnostics.some((d) => /autoMode\.softDeny exceeds/.test(d)),
+			false,
+		);
+	} finally {
+		if (previousInlineSettings === undefined) {
+			delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+		} else {
+			process.env.PI_AUTOMODE_SETTINGS_JSON = previousInlineSettings;
+		}
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

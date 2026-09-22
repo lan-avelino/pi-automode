@@ -9,7 +9,10 @@ import {
 	clearJevCache,
 	credentialKey,
 	defaultJevClassifyAction,
+	isOpenRouterBaseUrl,
 	jevDecision,
+	jevRuleBudgetDiagnostics,
+	missingJevAnswers,
 	openRouterDecisionsUrl,
 	parseJevResponse,
 	redactSecrets,
@@ -80,7 +83,6 @@ test("parseJevResponse reads the answers map and clamps out-of-range values", ()
 		soft_deny_uncovered: 0,
 		intent_mismatch: 0.4,
 	});
-	assert.equal(parsed.danger, 1);
 });
 
 test("parseJevResponse surfaces HTTP errors with the server message", () => {
@@ -100,11 +102,44 @@ test("parseJevResponse fails closed on unreadable, malformed, or empty bodies", 
 			[200, JSON.stringify({ model: "jev" })],
 			[200, JSON.stringify({ answers: {} })],
 			[200, JSON.stringify({ answers: { hard_deny: { type: "noul" } } })],
+			[200, JSON.stringify({ answers: [{ type: "noul", noul: 0.9 }] })],
 		] as Array<[number, string]>
 	) {
 		const parsed = parseJevResponse(status, body);
 		assert.equal(parsed.ok, false, body);
 	}
+});
+
+test("missingJevAnswers reports every unanswered question", () => {
+	const questions = buildJevQuestions(baseConfig());
+	assert.deepEqual(missingJevAnswers({}, questions).sort(), [
+		"hard_deny",
+		"intent_mismatch",
+		"scope_escape",
+		"soft_deny_uncovered",
+	]);
+	assert.deepEqual(
+		missingJevAnswers(
+			{
+				hard_deny: 0,
+				soft_deny_uncovered: 0,
+				intent_mismatch: 0,
+				scope_escape: 0,
+			},
+			questions,
+		),
+		[],
+	);
+	// An unrecognized answer id must not stand in for a real question.
+	assert.deepEqual(
+		missingJevAnswers({ bogus_question: 0.99 }, questions).sort(),
+		[
+			"hard_deny",
+			"intent_mismatch",
+			"scope_escape",
+			"soft_deny_uncovered",
+		],
+	);
 });
 
 // --- decision mapping ------------------------------------------------------
@@ -157,6 +192,15 @@ test("jevDecision honors configured thresholds", () => {
 	);
 });
 
+test("jevDecision prefers the hard tier when both bands are cleared", () => {
+	const decision = jevDecision(
+		{ hard_deny: 0.9, intent_mismatch: 0.9 },
+		baseConfig(),
+	);
+	assert.equal(decision.decision, "block");
+	assert.equal(decision.tier, "hard_deny");
+});
+
 test("buildJevQuestions phrases every question danger-side up with policy text", () => {
 	const questions = buildJevQuestions(
 		baseConfig({ environment: ["Trusted repo: acme"], hardDeny: ["no prod"] }),
@@ -166,6 +210,30 @@ test("buildJevQuestions phrases every question danger-side up with policy text",
 	}
 	assert.match(questions.hard_deny!.instructions, /no prod/);
 	assert.match(questions.scope_escape!.instructions, /Trusted repo: acme/);
+});
+
+test("buildJevQuestions redacts rule text and flags truncated rule lists", () => {
+	const longRule = "x".repeat(2000);
+	const questions = buildJevQuestions(
+		baseConfig({
+			hardDeny: ["API key: sk-or-v1-abcdefghijklmnop", longRule],
+		}),
+	);
+	const hard = questions.hard_deny!.instructions;
+	assert.doesNotMatch(hard, /sk-or-v1-abcdefghijklmnop/);
+	assert.match(hard, /TRUNCATED/);
+
+	const clean = buildJevQuestions(baseConfig());
+	assert.doesNotMatch(clean.hard_deny!.instructions, /TRUNCATED/);
+});
+
+test("jevRuleBudgetDiagnostics names only the truncated rule lists", () => {
+	assert.deepEqual(jevRuleBudgetDiagnostics(baseConfig()), []);
+	const diagnostics = jevRuleBudgetDiagnostics(
+		baseConfig({ softDeny: ["y".repeat(2000)] }),
+	);
+	assert.equal(diagnostics.length, 1);
+	assert.match(diagnostics[0]!, /autoMode\.softDeny exceeds 1500 characters/);
 });
 
 // --- state redaction -------------------------------------------------------
@@ -178,8 +246,8 @@ test("buildJevState redacts secrets and bounds intent", () => {
 		"deploy with sk-or-v1-abcdefghijklmnop",
 		"",
 	);
-	assert.doesNotMatch(state.tool_action!, /AKIAIOSFODNN7EXAMPLE/);
-	assert.match(state.tool_action!, /REDACTED/);
+	assert.doesNotMatch(state.action!, /AKIAIOSFODNN7EXAMPLE/);
+	assert.match(state.action!, /REDACTED/);
 	assert.doesNotMatch(state.user_request!, /sk-or-v1-abcdefghijklmnop/);
 	assert.equal(state.project_instructions, "(none)");
 });
@@ -246,6 +314,44 @@ test("resolveJevKey prefers the pi registry, then env, then stored auth", async 
 	assert.deepEqual(none, { source: "none" });
 });
 
+test("isOpenRouterBaseUrl only matches OpenRouter endpoints", () => {
+	assert.equal(isOpenRouterBaseUrl("https://openrouter.ai/api/v1"), true);
+	assert.equal(
+		isOpenRouterBaseUrl("https://openrouter.ai/api/alpha/decisions"),
+		true,
+	);
+	assert.equal(isOpenRouterBaseUrl("https://classifier.test/v1"), false);
+	assert.equal(isOpenRouterBaseUrl("https://openrouter.ai.evil.test/v1"), false);
+	assert.equal(isOpenRouterBaseUrl("not a url"), false);
+});
+
+test("resolveJevKey never sends OpenRouter credentials to a custom base URL", async () => {
+	const customBase = baseConfig({
+		jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY",
+		jevBaseUrl: "https://classifier.test/api/v1",
+	});
+	const registryKey = createFakeCtx([], {
+		modelRegistry: { getApiKeyForProvider: async () => "registry-key" },
+	}) as never;
+
+	// Registry and stored OpenRouter credentials are withheld for a custom host.
+	assert.deepEqual(
+		await resolveJevKey(registryKey, customBase, {
+			env: {},
+			readStoredCredential: () => ({ type: "api_key", key: "stored-key" }),
+		}),
+		{ source: "none" },
+	);
+	// The explicit env var is still honored for the custom endpoint.
+	assert.deepEqual(
+		await resolveJevKey(registryKey, customBase, {
+			env: { PI_AUTOMODE_TEST_JEV_KEY: "env-key" },
+			readStoredCredential: () => ({ type: "api_key", key: "stored-key" }),
+		}),
+		{ key: "env-key", source: "env" },
+	);
+});
+
 // --- classify action -------------------------------------------------------
 
 function jevTestConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveConfig {
@@ -253,6 +359,19 @@ function jevTestConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveConfi
 		jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY",
 		...overrides,
 	});
+}
+
+/** A complete answers map; every requested question must be answered. */
+function jevAnswers(
+	overrides: Partial<Record<string, number>> = {},
+): Record<string, { type: "noul"; noul: number }> {
+	const score = (key: string) => overrides[key] ?? 0.01;
+	return {
+		hard_deny: { type: "noul", noul: score("hard_deny") },
+		soft_deny_uncovered: { type: "noul", noul: score("soft_deny_uncovered") },
+		intent_mismatch: { type: "noul", noul: score("intent_mismatch") },
+		scope_escape: { type: "noul", noul: score("scope_escape") },
+	};
 }
 
 const JEV_KEY_DEPS = {
@@ -290,7 +409,7 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 		return new Response(
 			JSON.stringify({
 				model: "typesafe/jev-1.13",
-				answers: { hard_deny: { type: "noul", noul: 0.9 } },
+				answers: jevAnswers({ hard_deny: 0.9 }),
 			}),
 			{ status: 200 },
 		);
@@ -320,11 +439,11 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 		assert.equal(headers.Authorization, "Bearer test-key");
 		const payload = JSON.parse(String(calls[0]!.init.body)) as {
 			model: string;
-			state: { tool_action: string };
+			state: { action: string };
 			questions: Record<string, { type: string }>;
 		};
 		assert.equal(payload.model, "~typesafe/jev-latest");
-		assert.match(payload.state.tool_action, /deploy/);
+		assert.match(payload.state.action, /deploy/);
 		assert.equal(payload.questions.hard_deny!.type, "noul");
 		assert.equal(first.io?.model, "openrouter/typesafe/jev-1.13");
 
@@ -402,10 +521,7 @@ test("defaultJevClassifyAction allows a low-risk action", async () => {
 		new Response(
 			JSON.stringify({
 				model: "typesafe/jev-1.13",
-				answers: {
-					hard_deny: { type: "noul", noul: 0.01 },
-					intent_mismatch: { type: "noul", noul: 0.02 },
-				},
+				answers: jevAnswers({ hard_deny: 0.01, intent_mismatch: 0.02 }),
 			}),
 			{ status: 200 },
 		)) as typeof fetch;
@@ -421,6 +537,45 @@ test("defaultJevClassifyAction allows a low-risk action", async () => {
 		);
 		assert.equal(result.decision, "allow");
 		assert.equal(result.tier, "none");
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("defaultJevClassifyAction fails closed when answers omit a question", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	try {
+		const ctx = createFakeCtx([], {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		}) as never;
+		for (
+			const answers of [
+				// Only an unrecognized id, carrying high danger: must not allow.
+				{ bogus_question: { type: "noul", noul: 0.99 } },
+				// Partial: three of the four requested questions.
+				{
+					hard_deny: { type: "noul", noul: 0.01 },
+					soft_deny_uncovered: { type: "noul", noul: 0.01 },
+					intent_mismatch: { type: "noul", noul: 0.01 },
+				},
+			]
+		) {
+			globalThis.fetch = (async () =>
+				new Response(JSON.stringify({ answers }), {
+					status: 200,
+				})) as typeof fetch;
+			const result = await defaultJevClassifyAction(
+				ctx,
+				jevTestConfig(),
+				'{"toolName":"bash","input":{"command":"deploy"}}',
+				"",
+				JEV_KEY_DEPS,
+			);
+			assert.equal(result.decision, "block", JSON.stringify(answers));
+			assert.match(result.reason, /missing answers/);
+		}
 	} finally {
 		globalThis.fetch = originalFetch;
 		clearJevCache();

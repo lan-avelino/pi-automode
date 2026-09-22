@@ -38,7 +38,6 @@ export type JevParse =
     ok: true;
     model: string;
     scores: Record<string, number>;
-    danger: number;
   }
   | { ok: false; error: string };
 
@@ -68,6 +67,40 @@ export function redactSecrets(text: string): string {
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[truncated]`;
+}
+
+/**
+ * Redact and bound one policy rule list. Returns whether rules were dropped so
+ * the classifier can be told its view of the policy is incomplete.
+ */
+function ruleText(rules: string[]): { text: string; truncated: boolean } {
+  const joined = redactSecrets(rules.join("\n- "));
+  if (joined.length <= RULES_MAX) return { text: joined, truncated: false };
+  return { text: joined.slice(0, RULES_MAX), truncated: true };
+}
+
+const TRUNCATION_NOTICE =
+  `\n[TRUNCATED: rule list exceeded ${RULES_MAX} characters; later rules were omitted]`;
+
+/**
+ * Diagnostics for rule lists too long to reach the Jev classifier intact.
+ * The deterministic layers still see the full lists; only Jev's view is bounded.
+ */
+export function jevRuleBudgetDiagnostics(config: EffectiveConfig): string[] {
+  const lists: Array<[string, string[]]> = [
+    ["environment", config.environment],
+    ["allow", config.allow],
+    ["softDeny", config.softDeny],
+    ["hardDeny", config.hardDeny],
+  ];
+  const diagnostics: string[] = [];
+  for (const [key, rules] of lists) {
+    if (!ruleText(rules).truncated) continue;
+    diagnostics.push(
+      `autoMode.${key} exceeds ${RULES_MAX} characters; rules beyond that are not sent to the Jev classifier (the deterministic layers still see them)`,
+    );
+  }
+  return diagnostics;
 }
 
 // --- credential (trimmed from specpi-jev-guard pi-auth.ts) -----------------
@@ -111,23 +144,28 @@ export function openRouterDecisionsUrl(baseUrl: string): string {
  * so the model's danger direction is never mixed.
  */
 export function buildJevQuestions(config: EffectiveConfig): JevQuestions {
-  const environment = clip(config.environment.join("\n- "), RULES_MAX);
-  const allow = clip(config.allow.join("\n- "), RULES_MAX);
-  const soft = clip(config.softDeny.join("\n- "), RULES_MAX);
-  const hard = clip(config.hardDeny.join("\n- "), RULES_MAX);
+  const environment = ruleText(config.environment);
+  const allow = ruleText(config.allow);
+  const soft = ruleText(config.softDeny);
+  const hard = ruleText(config.hardDeny);
+  const envText = environment.text +
+    (environment.truncated ? TRUNCATION_NOTICE : "");
+  const allowText = allow.text + (allow.truncated ? TRUNCATION_NOTICE : "");
+  const softText = soft.text + (soft.truncated ? TRUNCATION_NOTICE : "");
+  const hardText = hard.text + (hard.truncated ? TRUNCATION_NOTICE : "");
   return {
     hard_deny: {
       type: "noul",
       instructions:
         "The described action violates at least one unconditional HARD_DENY rule. " +
-        `Trusted environment:\n- ${environment}\nHARD_DENY:\n- ${hard}`,
+        `Trusted environment:\n- ${envText}\nHARD_DENY:\n- ${hardText}`,
     },
     soft_deny_uncovered: {
       type: "noul",
       instructions:
         "A SOFT_DENY rule applies and neither an ALLOW exception nor direct, " +
         "bounded user authorization in user_request covers it. " +
-        `SOFT_DENY:\n- ${soft}\nALLOW:\n- ${allow}`,
+        `SOFT_DENY:\n- ${softText}\nALLOW:\n- ${allowText}`,
     },
     intent_mismatch: {
       type: "noul",
@@ -140,7 +178,7 @@ export function buildJevQuestions(config: EffectiveConfig): JevQuestions {
       type: "noul",
       instructions:
         "The action reaches outside the trusted repository, working tree, or " +
-        `trusted environment. Trusted environment:\n- ${environment}`,
+        `trusted environment. Trusted environment:\n- ${envText}`,
     },
   };
 }
@@ -152,7 +190,7 @@ export function buildJevState(
   loadedContext: string,
 ): Record<string, string> {
   return {
-    tool_action: clip(redactSecrets(action), ACTION_MAX),
+    action: clip(redactSecrets(action), ACTION_MAX),
     working_directory: cwd,
     user_request: clip(redactSecrets(intent), INTENT_MAX) || "(none)",
     project_instructions: clip(
@@ -182,7 +220,9 @@ export function parseJevResponse(status: number, body: string): JevParse {
   }
   const rec = (parsed ?? {}) as Record<string, unknown>;
   const answers = rec.answers;
-  if (typeof answers !== "object" || answers === null) {
+  if (
+    typeof answers !== "object" || answers === null || Array.isArray(answers)
+  ) {
     return { ok: false, error: "response has no answers map" };
   }
   const scores: Record<string, number> = {};
@@ -200,8 +240,18 @@ export function parseJevResponse(status: number, body: string): JevParse {
     ok: true,
     model: typeof rec.model === "string" ? rec.model : "jev",
     scores,
-    danger: Math.max(...Object.values(scores)),
   };
+}
+
+/**
+ * Question ids a Jev response must answer. A response that omits any of them
+ * is invalid output and fails closed rather than defaulting to zero danger.
+ */
+export function missingJevAnswers(
+  scores: Record<string, number>,
+  questions: JevQuestions,
+): string[] {
+  return Object.keys(questions).filter((id) => scores[id] === undefined);
 }
 
 /** Map per-question probabilities onto pi-automode's decision + tier. */
@@ -240,6 +290,21 @@ export type JevKeyDeps = {
   env?: Record<string, string | undefined>;
 };
 
+/**
+ * True when a base URL targets OpenRouter itself. Only then may OpenRouter-owned
+ * Pi credentials be sent; a custom endpoint must supply its own key via
+ * `jevApiKeyEnv` so the OpenRouter key never leaves for a third party.
+ */
+export function isOpenRouterBaseUrl(baseUrl: string): boolean {
+  try {
+    const host = new URL(openRouterDecisionsUrl(baseUrl)).hostname
+      .toLowerCase();
+    return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
+  } catch {
+    return false;
+  }
+}
+
 export async function resolveJevKey(
   ctx: ExtensionContext,
   config: EffectiveConfig,
@@ -247,25 +312,30 @@ export async function resolveJevKey(
 ): Promise<{ key?: string; source: JevKeySource }> {
   const env = deps.env ?? process.env;
   const readStored = deps.readStoredCredential ?? readStoredCredentialFromDisk;
-  try {
-    const viaRegistry = await ctx.modelRegistry?.getApiKeyForProvider(
-      "openrouter",
-    );
-    if (typeof viaRegistry === "string" && viaRegistry.trim() !== "") {
-      return { key: viaRegistry.trim(), source: "pi-auth" };
+  const openRouterOwned = isOpenRouterBaseUrl(config.jevBaseUrl);
+  if (openRouterOwned) {
+    try {
+      const viaRegistry = await ctx.modelRegistry?.getApiKeyForProvider(
+        "openrouter",
+      );
+      if (typeof viaRegistry === "string" && viaRegistry.trim() !== "") {
+        return { key: viaRegistry.trim(), source: "pi-auth" };
+      }
+    } catch {
+      // fall through to env / stored credential
     }
-  } catch {
-    // fall through to env / stored credential
   }
   const fromEnv = env[config.jevApiKeyEnv];
   if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
     return { key: fromEnv.trim(), source: "env" };
   }
-  try {
-    const stored = credentialKey(readStored("openrouter"));
-    if (stored) return { key: stored, source: "pi-auth" };
-  } catch {
-    // no stored credential
+  if (openRouterOwned) {
+    try {
+      const stored = credentialKey(readStored("openrouter"));
+      if (stored) return { key: stored, source: "pi-auth" };
+    } catch {
+      // no stored credential
+    }
   }
   return { source: "none" };
 }
@@ -307,6 +377,7 @@ export async function defaultJevClassifyAction(
     .update(JSON.stringify({
       session: classifierCacheSessionId(ctx),
       model,
+      baseUrl: config.jevBaseUrl,
       state,
       questions,
       hard: config.jevHardDenyThreshold,
@@ -316,18 +387,24 @@ export async function defaultJevClassifyAction(
 
   const cached = CACHE.get(cacheKey);
   if (cached) {
+    // Refresh recency so the bounded cache evicts least-recently-used entries.
+    CACHE.delete(cacheKey);
+    CACHE.set(cacheKey, cached);
     return { ...cached, reason: `${cached.reason} (cached)`, reasoning };
   }
 
   const { key } = await resolveJevKey(ctx, config, deps);
   if (!key) {
+    const hint = isOpenRouterBaseUrl(config.jevBaseUrl)
+      ? "run /login openrouter or set the env var"
+      : "set the env var (custom base URLs do not use Pi's OpenRouter credential)";
     return {
       decision: "block",
       tier: "none",
       reasoning,
       reason:
-        `Jev classifier key missing (${config.jevApiKeyEnv}); run /login openrouter ` +
-        "or set the env var. Auto mode fails closed.",
+        `Jev classifier key missing (${config.jevApiKeyEnv}); ${hint}. ` +
+        "Auto mode fails closed.",
     };
   }
 
@@ -356,6 +433,17 @@ export async function defaultJevClassifyAction(
         tier: "none",
         reasoning,
         reason: `Jev classifier failed; auto mode fails closed: ${parsed.error}`,
+      };
+    }
+    const missing = missingJevAnswers(parsed.scores, questions);
+    if (missing.length > 0) {
+      return {
+        decision: "block",
+        tier: "none",
+        reasoning,
+        reason:
+          `Jev classifier response is missing answers for: ${missing.join(", ")}; ` +
+          "auto mode fails closed.",
       };
     }
 

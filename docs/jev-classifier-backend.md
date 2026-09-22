@@ -1,6 +1,14 @@
 # Enhancing pi-automode with the Jev classifier backend
 
-Status: **proposal**
+Status: **implemented** — this is the design record for the shipped Jev backend.
+
+The shipped implementation is authoritative: `extensions/auto-mode/jev.ts`,
+`config.ts`, `types.ts`, `constants.ts`, and `extension.ts`. The code blocks
+below are the original proposal sketch and intentionally close to, but not
+guaranteed identical with, what shipped (for example, the final `jev.ts` adds
+a session-scoped cache key, `JevKeyDeps` test seams, missing-answer
+validation, and an OpenRouter-host guard on credential use). When they
+diverge, trust the source files.
 Scope: add an opt-in classifier backend that uses the Jev / SystemOne
 classifier (via OpenRouter) for intent, in place of the LLM classifier stage.
 
@@ -55,18 +63,18 @@ The Jev mechanics are taken from `specpi-jev-guard`
 
 ## Implementation checklist
 
-1. [ ] `types.ts`: add config fields, `EffectiveConfig` fields, and a
+1. [x] `types.ts`: add config fields, `EffectiveConfig` fields, and a
    `ClassifierReasoning` variant for the Jev backend.
-2. [ ] `constants.ts`: add Jev defaults.
-3. [ ] `config.ts`: validate, merge, and default the new keys; generalize
+2. [x] `constants.ts`: add Jev defaults.
+3. [x] `config.ts`: validate, merge, and default the new keys; generalize
    global model persistence.
-4. [ ] `jev.ts` (new): client, questions, state, parser, decision mapping,
+4. [x] `jev.ts` (new): client, questions, state, parser, decision mapping,
    key resolution, `defaultJevClassifyAction`.
-5. [ ] `extension.ts`: select the backend per call; report it in status/logs;
+5. [x] `extension.ts`: select the backend per call; report it in status/logs;
    add `/automode backend`.
-6. [ ] Tests: parser, thresholds, redaction, backend selection, and a
+6. [x] Tests: parser, thresholds, redaction, backend selection, and a
    hard-deny regression corpus.
-7. [ ] `npm test && npm run check`.
+7. [x] `npm test && npm run check`.
 
 ---
 
@@ -358,7 +366,7 @@ export function buildJevState(
   loadedContext: string,
 ): Record<string, string> {
   return {
-    tool_action: clip(redactSecrets(action), ACTION_MAX),
+    action: clip(redactSecrets(action), ACTION_MAX),
     working_directory: cwd,
     user_request: clip(redactSecrets(intent), INTENT_MAX) || "(none)",
     project_instructions: clip(redactSecrets(loadedContext || "(none)"), INTENT_MAX),
@@ -691,7 +699,7 @@ Update `/automode model` to write `jevModel` when
   the last message.
 - `project_instructions` = `loadedContext` (AGENTS.md and loaded project
   instructions).
-- `tool_action` = the full `{toolName, input}` JSON, **redacted**. Jev is a
+- `action` = the full `{toolName, input}` JSON, **redacted**. Jev is a
   different third party from the model provider, and `bash`/`write` payloads
   routinely contain `.env` / token text.
 - policy = `environment` / `allow` / `softDeny` / `hardDeny`, substituted into
@@ -725,17 +733,22 @@ error-prone.
 
 ## 6. Tests
 
-Add `tests/jev.test.ts`:
+`tests/jev.test.ts` covers:
 
 - `openRouterDecisionsUrl` for `/api/v1`, an explicit decisions URL, and an
   arbitrary base.
-- `parseJevResponse`: happy path
-  (`{ answers: { hard_deny: { type: "noul", noul: 0.9 } } }`), HTTP error with
-  `message`, unreadable JSON, missing `answers`, empty `answers`, and clamping
-  of out-of-range values.
-- `jevDecision`: boundaries for both thresholds and the resulting `tier`.
+- `parseJevResponse`: happy path, HTTP error with `message`, unreadable JSON,
+  missing `answers`, empty `answers`, an array `answers`, missing `noul`, and
+  clamping of out-of-range values.
+- `missingJevAnswers` / end-to-end fail-closed: a response that omits any
+  requested question id (including one that only returns an unrecognized id)
+  blocks instead of defaulting to zero danger.
+- `jevDecision`: boundaries for both thresholds, the resulting `tier`, and hard
+  precedence when both bands are cleared.
 - `buildJevState`: `AKIA…` / `sk-…` / private-key blocks are redacted.
 - no key → block; transport error → block; malformed response → block.
+- `resolveJevKey` / `isOpenRouterBaseUrl`: a custom base URL never receives
+  OpenRouter registry or stored credentials.
 
 Add a backend-selection test using `options.jevClassifyAction` with a stub
 `fetch` (or a stub key resolver), asserting `classifierBackend: "jev"` routes to
@@ -769,11 +782,16 @@ npm run check
    drop `scope_escape` (it overlaps the deterministic path checks) or collapse
    to two questions and branch on `danger = max`.
 5. `noul` is assumed 0..1 danger-side-up, matching `specpi-jev-guard`'s parsed
-   behavior. Validate with one live call before enabling enforcement.
-6. The cache is keyed on `(model, state, questions, thresholds)` and is
-   session-scoped. Identical retried tool calls become free.
+   behavior. Validate with one live call before enabling enforcement. Confirm
+   the `state` field names (`action`, `user_request`) still read as intended.
+6. The cache is keyed on
+   `(session, model, baseUrl, state, questions, thresholds)` and is
+   session-scoped, with least-recently-used eviction. Identical retried tool
+   calls become free.
 7. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the
-   Jev backend; document them as ignored when `classifierBackend === "jev"`.
+   Jev backend; they are reported as ignored when `classifierBackend === "jev"`.
+8. Rule lists are clipped to a bounded size before they reach Jev; a truncated
+   list emits a config diagnostic and a `[TRUNCATED]` marker in the question.
 
 ## 8. Configuration example
 
