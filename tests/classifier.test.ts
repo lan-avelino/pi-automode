@@ -176,6 +176,64 @@ test("classifier transcript preserves first and latest user turns within token b
 	assert.match(transcript, /<truncated approx_tokens="\d+" \/>/);
 });
 
+test("classifier transcript bounds tool-call input text", () => {
+	// Tool inputs are the agent's own actions, not the user's authorization, and
+	// long inputs carry security vocabulary that inflates classifier scores.
+	const entries = [
+		{ type: "message", message: { role: "user", content: "review the diff" } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						name: "subagent",
+						arguments: { task: `START${"s".repeat(4000)}END` },
+					},
+				],
+			},
+		},
+	];
+	const transcript = buildClassifierTranscript(createFakeCtx(entries) as never, {
+		maxUserTokens: 4000,
+		maxToolTokens: 4000,
+	});
+	assert.match(transcript, /ToolCall subagent:/);
+	assert.match(transcript, /START/);
+	// The full 4,000-character input must not reach the classifier.
+	assert.doesNotMatch(transcript, /s{500}/);
+	assert.ok(
+		transcript.length < 2200,
+		`tool input was not bounded: ${transcript.length} chars`,
+	);
+});
+
+test("classifier transcript keeps only the most recent tool calls", () => {
+	const entries = [
+		{ type: "message", message: { role: "user", content: "do the task" } },
+		...Array.from({ length: 20 }, (_unused, index) => ({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						name: "bash",
+						arguments: { command: `cmd-${index}` },
+					},
+				],
+			},
+		})),
+	];
+	const transcript = buildClassifierTranscript(createFakeCtx(entries) as never, {
+		maxUserTokens: 4000,
+		maxToolTokens: 4000,
+	});
+	assert.match(transcript, /cmd-19/);
+	assert.doesNotMatch(transcript, /cmd-0/);
+});
+
 
 function fakeComplete(responses: AssistantMessage[]) {
 	const calls: Array<{

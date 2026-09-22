@@ -53,13 +53,18 @@ The following keys apply only when `classifierBackend` is `"jev"`:
 | `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth. On a custom `jevBaseUrl`, the default variable is withheld and a custom variable must be named |
 | `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
 | `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
-| `jevSoftDenyThreshold` | `0.35` | Highest soft-side probability at or above which the action is blocked |
+| `jevSoftDenyThreshold` | `0.5` | Highest authorization-aware probability (`soft_deny_uncovered`, `intent_mismatch`) at or above which the action is blocked. The benign ceiling moves with the classifier transcript; see [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
+| `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which the action is blocked. Gated separately from the other soft-side questions |
+
+`scope_escape` gates at its own, higher threshold. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It has no LLM-classifier counterpart, and it never overrides `hard_deny`. Because it is a supporting signal, it must not decide the verdict alone: an action that `soft_deny_uncovered` and `intent_mismatch` both clear is not blocked by `scope_escape` unless it reaches `jevScopeEscapeThreshold`.
 
 `classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
 
 Jev key resolution is the Pi registry (`/login openrouter`), then `jevApiKeyEnv`, then stored `auth.json`. The registry and stored credentials are only used when `jevBaseUrl` targets OpenRouter. A custom base URL must name its own key variable in `jevApiKeyEnv`; the default `OPENROUTER_API_KEY` is withheld from custom hosts so the OpenRouter key is never sent to a third party. A response that omits any requested question id fails closed.
 
 Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action and does not re-bound the transcript or the rule lists for Jev; a payload the endpoint rejects fails closed.
+
+The transcript keeps only the most recent tool calls (12) and bounds each tool-call input to a budget whose string cap is `budget / 4` characters (375 with the default `1500`). Tool inputs are the agent's own actions, not the user's authorization. Measured against the live endpoint, the inflation tracks the security vocabulary in the input text rather than its length or recency, and the user's authorization lives in the user entries, which are budgeted separately and are unaffected by any tool-transcript budget. `maxToolTranscriptTokens` does not bind at its `4000` default because the retained tool calls are shorter than that.
 
 Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers, so its allow tier is always `none`. Only the optional `classifier` I/O log records that a Jev allow overrode a soft-deny rule, through the score summary.
 

@@ -104,7 +104,23 @@ export const DEFAULT_JEV_BASE_URL = "https://openrouter.ai/api/v1";
 export const DEFAULT_JEV_API_KEY_ENV = "OPENROUTER_API_KEY";
 export const DEFAULT_JEV_TIMEOUT_MS = 12_000;
 export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
-export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.35;
+/**
+ * The soft-deny band (`soft_deny_uncovered`, `intent_mismatch`) blocks at this
+ * probability. Measured against the live endpoint, a benign action with a real
+ * classifier transcript peaks near 0.30 on those axes, while actions that are
+ * soft-deny rules score 0.81-0.93, so 0.5 sits near the middle of the gap. The
+ * design-record value of 0.35 left only about 0.05 of margin. See
+ * docs/jev-classifier-backend.md for the measurements.
+ */
+export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.5;
+/**
+ * `scope_escape` gates at its own, higher threshold. It asks a question about
+ * location ("reaches outside the trusted repository, working tree, or trusted
+ * environment") that has no LLM-classifier counterpart and no location data in the
+ * Jev state, so it cannot be calibrated against the other backends and is the most
+ * false-positive-prone of the four questions. It never overrides `hard_deny`.
+ */
+export const DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD = 0.5;
 
 /** Built-in classifier hard-deny rules. These are unconditional. */
 export const DEFAULT_HARD_DENY = [

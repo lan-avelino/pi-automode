@@ -54,8 +54,9 @@ export type AutoModeSettings = {
   jevTimeoutMs?: number;
   /** Jev hard_deny probability at or above which the action is blocked (default 0.5). */
   jevHardDenyThreshold?: number;
-  /** Jev soft-deny probability at or above which the action is blocked (default 0.35). */
+  /** Jev soft-deny probability at or above which the action is blocked (default 0.5). */
   jevSoftDenyThreshold?: number;
+  jevScopeEscapeThreshold?: number;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */
   classifyReadOnlyTools?: boolean;
@@ -115,6 +116,7 @@ export type EffectiveConfig = {
   jevTimeoutMs: number;
   jevHardDenyThreshold: number;
   jevSoftDenyThreshold: number;
+  jevScopeEscapeThreshold: number;
   classifyReadOnlyTools: boolean;
   fastClassifierMaxTokens: number;
   classifierTimeoutMs: number;

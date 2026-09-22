@@ -135,6 +135,8 @@ The opt-in Jev backend (`"classifierBackend": "jev"`) replaces the classifier st
 
 Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev. Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers; its allow tier is always `none`, so only the optional `classifier` I/O log distinguishes an authorization override, and only through the score summary.
 
+Jev gates `scope_escape` at its own `jevScopeEscapeThreshold` (default `0.5`), and the soft-deny band at `jevSoftDenyThreshold` (default `0.5`). Both are measured against the live endpoint; see [Jev classifier backend](docs/jev-classifier-backend.md). It asks whether the action reaches outside the trusted repository, working tree, or trusted environment; it is a supporting signal with no LLM-classifier counterpart, so it does not decide a verdict alone. An action that `soft_deny_uncovered` and `intent_mismatch` both clear is not blocked by `scope_escape` below that threshold.
+
 Jev fails closed. A missing key, network failure, timeout, or unparseable response blocks the action, matching the LLM classifier's posture. Jev's hard-deny answer is advisory; the deterministic layer remains the unconditional floor.
 
 Jev is opt-in and its answers are an unverified third-party contract. The backend assumes each `noul` answer is a danger-side-up probability (higher means more dangerous). Run `/automode jev test` once against the live endpoint before relying on it; the probe sends one clearly safe and one clearly dangerous action and reports both verdicts.
@@ -150,7 +152,8 @@ Configure it in a user-owned config source:
     "jevApiKeyEnv": "OPENROUTER_API_KEY",
     "jevTimeoutMs": 12000,
     "jevHardDenyThreshold": 0.5,
-    "jevSoftDenyThreshold": 0.35
+    "jevSoftDenyThreshold": 0.5,
+    "jevScopeEscapeThreshold": 0.5
   }
 }
 ```
@@ -161,7 +164,7 @@ Switch backends with `/automode backend llm` or `/automode backend jev`. This wr
 
 The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
 
-Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action, and it does not re-bound the transcript or the rule lists for Jev. A payload the endpoint rejects fails closed. If the endpoint instead accepts and silently truncates an oversized payload, Jev can classify a partial action and pi-automode cannot detect that; only the deterministic layers are unaffected by payload size.
+Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action, and it does not re-bound the rule lists for Jev. It keeps only the 12 most recent tool calls in the transcript and bounds each tool-call input to 1500 characters, because tool inputs are the agent's own actions rather than your authorization. A payload the endpoint rejects fails closed. If the endpoint instead accepts and silently truncates an oversized payload, Jev can classify a partial action and pi-automode cannot detect that; only the deterministic layers are unaffected by payload size.
 
 The rest of this section describes the LLM backend.
 

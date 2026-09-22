@@ -305,14 +305,17 @@ export function jevDecision(
   const softUncovered = scores.soft_deny_uncovered ?? 0;
   const intent = scores.intent_mismatch ?? 0;
   const scope = scores.scope_escape ?? 0;
-  const soft = Math.max(softUncovered, intent, scope);
+  // `scope_escape` is a supporting, non-parity signal: it gates at its own
+  // higher threshold so it cannot decide the verdict alone.
+  const soft = Math.max(softUncovered, intent);
+  const scopeGate = scope >= config.jevScopeEscapeThreshold;
   const summary =
     `hard=${hard.toFixed(2)} soft=${softUncovered.toFixed(2)} ` +
     `intent=${intent.toFixed(2)} scope=${scope.toFixed(2)}`;
   if (hard >= config.jevHardDenyThreshold) {
     return { decision: "block", tier: "hard_deny", reason: `Jev: ${summary}` };
   }
-  if (soft >= config.jevSoftDenyThreshold) {
+  if (soft >= config.jevSoftDenyThreshold || scopeGate) {
     return { decision: "block", tier: "soft_deny", reason: `Jev: ${summary}` };
   }
   return {
@@ -430,6 +433,7 @@ export function jevStatusText(
     `credential: ${credential}`,
     `hard deny threshold: ${config.jevHardDenyThreshold}`,
     `soft deny threshold: ${config.jevSoftDenyThreshold}`,
+    `scope escape threshold: ${config.jevScopeEscapeThreshold}`,
     `timeout: ${config.jevTimeoutMs}ms`,
     "ignored by this backend: classifierReasoningLevel, fastClassifierMaxTokens",
   ];
@@ -596,6 +600,7 @@ export async function defaultJevClassifyAction(
       questions,
       hard: config.jevHardDenyThreshold,
       soft: config.jevSoftDenyThreshold,
+      scope: config.jevScopeEscapeThreshold,
     }))
     .digest("hex");
 

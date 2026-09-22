@@ -187,27 +187,23 @@ test("jevDecision blocks at or above the hard threshold", () => {
 	);
 });
 
-test("jevDecision blocks the soft band from any danger-side question", () => {
+test("jevDecision blocks the soft band from the authorization-aware questions", () => {
 	const config = baseConfig();
+	// Use the configured threshold so this stays true if the default moves.
+	const at = config.jevSoftDenyThreshold;
 	for (
 		const scores of [
 			{
 				hard_deny: 0.49,
-				soft_deny_uncovered: 0.35,
+				soft_deny_uncovered: at,
 				intent_mismatch: 0,
 				scope_escape: 0,
 			},
 			{
 				hard_deny: 0.0,
 				soft_deny_uncovered: 0,
-				intent_mismatch: 0.35,
+				intent_mismatch: at,
 				scope_escape: 0,
-			},
-			{
-				hard_deny: 0.0,
-				soft_deny_uncovered: 0,
-				intent_mismatch: 0,
-				scope_escape: 0.36,
 			},
 		]
 	) {
@@ -215,6 +211,92 @@ test("jevDecision blocks the soft band from any danger-side question", () => {
 		assert.equal(decision.decision, "block", JSON.stringify(scores));
 		assert.equal(decision.tier, "soft_deny");
 	}
+});
+
+test("the default soft-deny threshold matches the measured benign ceiling", () => {
+	// Measured against the live endpoint: a benign action with a real classifier
+	// transcript peaks near 0.30 on the soft axes, while actions that are
+	// soft-deny rules score 0.81-0.93. The design-record default of 0.35 left
+	// only ~0.05 of margin, so the default moved to the middle of the gap.
+	assert.equal(baseConfig().jevSoftDenyThreshold, 0.5);
+	// The old default would block a benign action at the measured ceiling.
+	const benign = jevDecision(
+		{
+			hard_deny: 0.13,
+			soft_deny_uncovered: 0.3,
+			intent_mismatch: 0.25,
+			scope_escape: 0.21,
+		},
+		baseConfig(),
+		baseQuestions(),
+	);
+	assert.equal(benign.decision, "allow", benign.reason);
+});
+
+test("jevDecision gates scope_escape at its own higher threshold", () => {
+	// scope_escape is a supporting, non-parity signal: it must not decide the
+	// verdict on its own at the soft threshold.
+	const config = baseConfig();
+	const scores = {
+		hard_deny: 0.0,
+		soft_deny_uncovered: 0,
+		intent_mismatch: 0,
+		scope_escape: 0.36,
+	};
+	const decision = jevDecision(scores, config, baseQuestions());
+	assert.equal(decision.decision, "allow", decision.reason);
+	assert.equal(decision.tier, "none");
+});
+
+test("jevDecision blocks a scope_escape at or above its own threshold", () => {
+	const config = baseConfig();
+	const decision = jevDecision(
+		{
+			hard_deny: 0.0,
+			soft_deny_uncovered: 0,
+			intent_mismatch: 0,
+			scope_escape: 0.5,
+		},
+		config,
+		baseQuestions(),
+	);
+	assert.equal(decision.decision, "block", decision.reason);
+	assert.equal(decision.tier, "soft_deny");
+});
+
+test("a raised scope_escape threshold cannot suppress the other soft questions", () => {
+	const config = baseConfig({ jevScopeEscapeThreshold: 1 });
+	const decision = jevDecision(
+		{
+			hard_deny: 0.0,
+			soft_deny_uncovered: config.jevSoftDenyThreshold,
+			intent_mismatch: 0,
+			scope_escape: 0,
+		},
+		config,
+		baseQuestions(),
+	);
+	assert.equal(decision.decision, "block", decision.reason);
+	assert.equal(decision.tier, "soft_deny");
+});
+
+test("a raised scope_escape threshold cannot suppress a hard deny", () => {
+	const config = baseConfig({
+		jevScopeEscapeThreshold: 1,
+		jevSoftDenyThreshold: 1,
+	});
+	const decision = jevDecision(
+		{
+			hard_deny: 0.9,
+			soft_deny_uncovered: 0,
+			intent_mismatch: 0,
+			scope_escape: 0,
+		},
+		config,
+		baseQuestions(),
+	);
+	assert.equal(decision.decision, "block", decision.reason);
+	assert.equal(decision.tier, "hard_deny");
 });
 
 test("jevDecision allows below both thresholds", () => {

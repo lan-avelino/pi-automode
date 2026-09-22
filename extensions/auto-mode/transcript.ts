@@ -2,8 +2,22 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { safeJson, truncateMiddle } from "./utils.ts";
 
 const MAX_USER_ENTRY_TOKENS = 1000;
-const MAX_TOOL_ENTRY_TOKENS = 1000;
-const MAX_RECENT_TOOL_ENTRIES = 40;
+const MAX_TOOL_ENTRY_TOKENS = 400;
+const MAX_RECENT_TOOL_ENTRIES = 12;
+/**
+ * Per-tool-call input budget. `safeJson` divides it by 4, so each string value is
+ * capped at `MAX_TOOL_INPUT_BUDGET / 4` characters (375 here, down from 2000 with
+ * the previous inline 8000).
+ *
+ * Tool inputs are the agent's own actions, not the user's authorization. Measured
+ * against the live endpoint with the same 12 tool calls: real inputs scored
+ * `soft=0.30`, the same inputs emptied scored `soft=0.15`, and benign filler of
+ * the *same length* scored `soft=0.18`. So the inflation is the security
+ * vocabulary in the input text, not its length or recency. The user's authorization
+ * lives in the user entries, which are budgeted separately by
+ * `maxUserTranscriptTokens`.
+ */
+const MAX_TOOL_INPUT_BUDGET = 1500;
 const CHARS_PER_APPROX_TOKEN = 4;
 
 type TranscriptEntry = {
@@ -111,7 +125,9 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
         index,
         order,
         kind: "tool",
-        text: `${toolCall.name}: ${safeJson(toolCall.input, 8000)}`,
+        text: `${toolCall.name}: ${
+          safeJson(toolCall.input, MAX_TOOL_INPUT_BUDGET)
+        }`,
       });
     }
   }

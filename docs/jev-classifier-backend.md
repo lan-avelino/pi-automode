@@ -91,7 +91,7 @@ Add to `AutoModeSettings`:
   jevApiKeyEnv?: string;          // default "OPENROUTER_API_KEY"
   jevTimeoutMs?: number;          // default 12000
   jevHardDenyThreshold?: number;  // default 0.5
-  jevSoftDenyThreshold?: number;  // default 0.35
+  jevSoftDenyThreshold?: number;  // default 0.5
 ```
 
 Add the same fields (resolved, non-optional) to `EffectiveConfig`:
@@ -132,7 +132,7 @@ export const DEFAULT_JEV_BASE_URL = "https://openrouter.ai/api/v1";
 export const DEFAULT_JEV_API_KEY_ENV = "OPENROUTER_API_KEY";
 export const DEFAULT_JEV_TIMEOUT_MS = 12_000;
 export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
-export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.35;
+export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.5;
 ```
 
 ### `extensions/auto-mode/config.ts`
@@ -710,7 +710,7 @@ Update `/automode model` to write `jevModel` when
 
 ## 5. Thresholds and tier mapping
 
-Defaults: `jevHardDenyThreshold = 0.5`, `jevSoftDenyThreshold = 0.35`.
+Defaults: `jevHardDenyThreshold = 0.5`, `jevSoftDenyThreshold = 0.5`.
 
 The deterministic layer already covers the obvious hard-deny cases, so Jev's
 hard question catches residual categories (fabricated public content, IAM/RBAC
@@ -718,7 +718,8 @@ grants, credential scanning) where a false negative is expensive — hence the
 lower hard bar. Mapping:
 
 - `hard_deny >= 0.5` → `{ block, tier: "hard_deny" }`
-- `max(soft_deny_uncovered, intent_mismatch, scope_escape) >= 0.35` →
+- `max(soft_deny_uncovered, intent_mismatch) >= 0.5`, or
+  `scope_escape >= 0.5` →
   `{ block, tier: "soft_deny" }`
 - otherwise → `{ allow, tier: "none" }`
 
@@ -829,6 +830,45 @@ npm run check
     more often on slow endpoints. Raise it if that matters.
 14. An out-of-range `noul` probability is treated as a contract violation: the
     answer is dropped, so the call fails closed rather than clamping the score.
+15. `scope_escape` gates at its own `jevScopeEscapeThreshold` (default 0.5) rather
+    than `jevSoftDenyThreshold`. It is the only question with no LLM-path
+    counterpart, and it asks about location while the state carries no location
+    data, so it cannot be calibrated against the other backends and is the most
+    false-positive-prone of the four. It never overrides `hard_deny`, and the other
+    two soft-side questions keep the soft-deny threshold.
+16. The classifier transcript keeps only the 12 most recent tool calls and bounds
+    each tool-call input to a budget whose string cap is `budget / 4` characters
+    (375 with the default `1500`). Tool inputs are the agent's own actions, not the
+    user's authorization. The user's authorization lives in the user entries, which
+    are budgeted separately by `maxUserTranscriptTokens` and are unaffected by any
+    tool-transcript budget.
+
+17. Measured against the live endpoint on 2026-09-23, with one benign read-only
+    action and the real transcript from a review session:
+
+    | transcript | chars | hard | soft | intent | scope |
+    | --- | --- | --- | --- | --- | --- |
+    | no transcript | 30 | 0.03 | 0.07 | 0.11 | 0.04 |
+    | real tool inputs | 4025 | 0.12 | 0.30 | 0.24 | 0.21 |
+    | same inputs emptied | 1486 | 0.09 | 0.15 | 0.16 | 0.10 |
+    | benign filler, same length | 3965 | 0.17 | 0.18 | 0.40 | 0.14 |
+
+    The inflation tracks the *vocabulary* in the tool input text, not its length or
+    recency: keeping the length while replacing the words drops `soft` from 0.30 to
+    0.18. Replacing the words with unrelated filler also raises `intent_mismatch`
+    (0.24 to 0.40), because the transcript stops looking like a coherent task.
+    Four actions that are soft-deny rules (force push to main, production delete,
+    remote-shell write, mass delete) scored `soft` 0.81-0.86 and `intent`
+    0.79-0.93 with the same transcript.
+
+18. Because the benign ceiling moves with the transcript, `jevSoftDenyThreshold` is
+    measured against `0.5` rather than the design-record default of `0.35`. With the
+    measurements above, `0.5` leaves about 0.20 of margin below the benign ceiling
+    and about 0.31 above the lowest true positive. `0.35` leaves only 0.05 below the
+    benign ceiling. The same transcript scored `soft=0.30` and `soft=0.29` on two runs
+    with identical input, so treat differences below ~0.05 as noise. Note that
+    `maxToolTranscriptTokens` does not bind at its `4000` default: 12 retained tool
+    calls total about 900 tokens, so the entry count is the binding limit.
 
 ## 8. Configuration example
 
@@ -843,7 +883,7 @@ npm run check
     "jevApiKeyEnv": "OPENROUTER_API_KEY",
     "jevTimeoutMs": 12000,
     "jevHardDenyThreshold": 0.5,
-    "jevSoftDenyThreshold": 0.35
+    "jevSoftDenyThreshold": 0.5
   }
 }
 ```

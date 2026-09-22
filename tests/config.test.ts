@@ -22,6 +22,7 @@ import {
 	DEFAULT_HARD_DENY,
 	DEFAULT_JEV_HARD_DENY_THRESHOLD,
 	DEFAULT_JEV_MODEL,
+	DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
 	DEFAULT_JEV_SOFT_DENY_THRESHOLD,
 	DEFAULT_JEV_TIMEOUT_MS,
 	DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
@@ -718,13 +719,22 @@ test("shared project permissions.allow is ignored with a diagnostic", () => {
 		mkdirSync(join(project, ".pi"), { recursive: true });
 		writeFileSync(
 			join(project, ".pi/automode.json"),
-			JSON.stringify({ permissions: { allow: ["bash(git status*)"], deny: ["bash(rm -rf *)"] } }),
+			JSON.stringify({
+				permissions: {
+					allow: ["bash(shared-project-only*)"],
+					deny: ["bash(rm -rf *)"],
+				},
+			}),
 		);
 
 		const { config, diagnostics } = loadEffectiveConfigWithDiagnostics(project, true);
 
+		// A distinctive pattern: the merged list also contains the developer's real
+		// global config, so a common pattern would make this assertion meaningless.
 		assert.equal(
-			config.permissionAllow.some((pattern) => pattern.raw === "bash(git status*)"),
+			config.permissionAllow.some((pattern) =>
+				pattern.raw === "bash(shared-project-only*)"
+			),
 			false,
 		);
 		assert.equal(config.permissionDeny.some((pattern) => pattern.raw === "bash(rm -rf *)"), true);
@@ -1260,6 +1270,35 @@ test("Jev backend defaults are seeded without configuration", () => {
 	assert.equal(config.jevTimeoutMs, DEFAULT_JEV_TIMEOUT_MS);
 	assert.equal(config.jevHardDenyThreshold, DEFAULT_JEV_HARD_DENY_THRESHOLD);
 	assert.equal(config.jevSoftDenyThreshold, DEFAULT_JEV_SOFT_DENY_THRESHOLD);
+	assert.equal(
+		config.jevScopeEscapeThreshold,
+		DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+	);
+});
+
+test("validateSettingsFile accepts and rejects jevScopeEscapeThreshold", () => {
+	const accepted = validateSettingsFile({
+		autoMode: { classifierBackend: "jev", jevScopeEscapeThreshold: 0.6 },
+	});
+	assert.equal(accepted.length, 0, accepted.join("; "));
+
+	const rejected = validateSettingsFile({
+		autoMode: { classifierBackend: "jev", jevScopeEscapeThreshold: 1.4 },
+	});
+	assert.ok(
+		rejected.some((d) =>
+			/jevScopeEscapeThreshold must be a number from 0 through 1/.test(d)
+		),
+		rejected.join("; "),
+	);
+});
+
+test("project-local jevScopeEscapeThreshold overrides the global value", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevScopeEscapeThreshold: 0.8 } }],
+		projectLocalSettings: [{ autoMode: { jevScopeEscapeThreshold: 0.7 } }],
+	});
+	assert.equal(config.jevScopeEscapeThreshold, 0.7);
 });
 
 test("validateSettingsFile accepts the Jev classifier keys", () => {

@@ -22,6 +22,7 @@ import {
   DEFAULT_JEV_BASE_URL,
   DEFAULT_JEV_HARD_DENY_THRESHOLD,
   DEFAULT_JEV_MODEL,
+  DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
   DEFAULT_JEV_SOFT_DENY_THRESHOLD,
   DEFAULT_JEV_TIMEOUT_MS,
   DEFAULT_LOG_CONFIG,
@@ -312,6 +313,7 @@ export function validateSettingsFile(
         "jevTimeoutMs",
         "jevHardDenyThreshold",
         "jevSoftDenyThreshold",
+        "jevScopeEscapeThreshold",
         "log",
       ]);
       for (const key of Object.keys(autoMode)) {
@@ -368,6 +370,7 @@ export function validateSettingsFile(
         const key of [
           "jevHardDenyThreshold",
           "jevSoftDenyThreshold",
+          "jevScopeEscapeThreshold",
         ] as const
       ) {
         const value = autoMode[key];
@@ -718,6 +721,9 @@ function applyAutoModeScalars(
     jevSoftDenyThreshold: validProbability(settings.jevSoftDenyThreshold)
       ? settings.jevSoftDenyThreshold
       : base.jevSoftDenyThreshold,
+    jevScopeEscapeThreshold: validProbability(settings.jevScopeEscapeThreshold)
+      ? settings.jevScopeEscapeThreshold
+      : base.jevScopeEscapeThreshold,
     classifierReasoningLevel: isClassifierReasoningLevel(
         settings.classifierReasoningLevel,
       )
@@ -788,6 +794,7 @@ export function buildEffectiveConfigFromSources(
     jevTimeoutMs: DEFAULT_JEV_TIMEOUT_MS,
     jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
     jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+    jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
