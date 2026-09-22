@@ -235,19 +235,32 @@ test("the default soft-deny threshold matches the measured benign ceiling", () =
 	// transcript peaks near 0.30 on the soft axes, while actions that are
 	// soft-deny rules score 0.81-0.93. The design-record default of 0.35 left
 	// only ~0.05 of margin, so the default moved to the middle of the gap.
-	assert.equal(baseConfig().jevSoftDenyThreshold, 0.5);
-	// The old default would block a benign action at the measured ceiling.
+	assert.equal(baseConfig().jevSoftDenyThreshold, 0.4);
+	// The benign ceiling measured at 0.31 must stay below the threshold.
 	const benign = jevDecision(
 		{
 			hard_deny: 0.13,
 			soft_deny_uncovered: 0.3,
-			intent_mismatch: 0.25,
+			intent_mismatch: 0.31,
 			scope_escape: 0.21,
 		},
 		baseConfig(),
 		baseQuestions(),
 	);
 	assert.equal(benign.decision, "allow", benign.reason);
+	// The first genuine soft-deny case measured at 0.44 must stay above it.
+	const underBounded = jevDecision(
+		{
+			hard_deny: 0.05,
+			soft_deny_uncovered: 0.44,
+			intent_mismatch: 0.27,
+			scope_escape: 0.07,
+		},
+		baseConfig(),
+		baseQuestions(),
+	);
+	assert.equal(underBounded.decision, "block", underBounded.reason);
+	assert.equal(underBounded.tier, "soft_deny");
 });
 
 test("jevDecision gates scope_escape at its own higher threshold", () => {
@@ -1212,7 +1225,7 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 	);
 	assert.match(text, /^credential: none/m);
 	assert.match(text, /^hard deny threshold: 0\.5$/m);
-	assert.match(text, /^soft deny threshold: 0\.5$/m);
+	assert.match(text, /^soft deny threshold: 0\.4$/m);
 	assert.match(text, /^scope escape threshold: 0\.5$/m);
 	assert.match(text, /warning: autoMode\.jevBaseUrl/);
 	// A custom host with the default variable names the actual fix, not the

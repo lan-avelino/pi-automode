@@ -54,7 +54,7 @@ export type AutoModeSettings = {
   jevTimeoutMs?: number;
   /** Jev hard_deny probability at or above which the action is blocked (default 0.5). */
   jevHardDenyThreshold?: number;
-  /** Jev soft-deny probability at or above which the action is blocked (default 0.5). */
+  /** Jev soft-deny probability at or above which the action is blocked (default 0.4). */
   jevSoftDenyThreshold?: number;
   /** Jev scope-escape probability at or above which the action is blocked on its own (default 0.5). */
   jevScopeEscapeThreshold?: number;

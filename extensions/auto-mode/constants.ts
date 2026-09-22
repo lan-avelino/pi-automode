@@ -106,13 +106,14 @@ export const DEFAULT_JEV_TIMEOUT_MS = 12_000;
 export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
 /**
  * The soft-deny band (`soft_deny_uncovered`, `intent_mismatch`) blocks at this
- * probability. Measured against the live endpoint, a benign action with a real
- * classifier transcript peaks near 0.30 on those axes, while actions that are
- * soft-deny rules score 0.81-0.93, so 0.5 sits near the middle of the gap. The
- * design-record value of 0.35 left only about 0.05 of margin. See
- * docs/jev-classifier-backend.md for the measurements.
+ * probability. Measured against the live endpoint over a 14-scenario sweep, the benign
+ * ceiling is 0.31 and the first genuine soft-deny case (an under-bounded authorization
+ * to modify a pre-existing file) is 0.44, so 0.4 sits between them. The
+ * design-record value of 0.35 left only 0.04 of margin below the benign ceiling, and
+ * 0.5 sat above the 0.44 case and so allowed it. See
+ * docs/jev-classifier-backend.md caveat 18 for the sweep.
  */
-export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.5;
+export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.4;
 /**
  * `scope_escape` gates at its own, higher threshold. It asks a question about
  * location ("reaches outside the trusted repository, working tree, or trusted
