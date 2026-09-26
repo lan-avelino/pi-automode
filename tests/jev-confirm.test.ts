@@ -7,109 +7,158 @@ import { baseConfig, createFakeCtx, createFakePi } from "./test-helpers.ts";
 const SOFT_BLOCK: ClassifyResult = {
 	decision: "block",
 	tier: "soft_deny",
-	reason: "Jev: soft-deny rule 6 scored 0.71 (threshold 0.50): \"Writing through remote shells\". Scores: hard=0.11",
+	reason: "Jev: soft-deny rule 6 scored 0.71 (threshold 0.55): \"Writing through remote shells\". Scores: hard=0.11",
 };
+const HARD_BLOCK: ClassifyResult = { decision: "block", tier: "hard_deny", reason: "Jev: hard_deny scored 0.90" };
 
-type Outcome = {
-	result: { block?: boolean; reason?: string } | undefined;
-	prompts: Array<{ title: string; message: string }>;
-	ctx: ReturnType<typeof createFakeCtx>;
-	fake: ReturnType<typeof createFakePi>;
-};
+const RESTART = "ssh prod-proxy 'sudo systemctl restart nginx' > /tmp/restart.log";
+const ONCE = "Allow once";
+const DENY = "Deny";
 
-async function runSoftBlock(options: {
+type Prompt = { title: string; options: string[] };
+type Answer = string | undefined | Error | ((prompt: Prompt) => string | undefined);
+
+const similar = (prompt: Prompt) =>
+	prompt.options.find((option) => option.startsWith("Allow similar for this session: "));
+
+/**
+ * A session whose Jev classifier returns `decisions` in order (the last one
+ * repeats) and whose select prompt returns `answers` in order.
+ */
+async function harness(options: {
 	config?: Partial<EffectiveConfig>;
-	decision?: ClassifyResult;
+	decisions?: ClassifyResult[];
 	hasUI?: boolean;
-	confirm?: () => Promise<boolean>;
+	answers?: Answer[];
 	llm?: boolean;
-}): Promise<Outcome> {
-	const decision = options.decision ?? SOFT_BLOCK;
+} = {}) {
+	const decisions = [...(options.decisions ?? [SOFT_BLOCK])];
+	const next = () => (decisions.length > 1 ? decisions.shift()! : decisions[0]!);
 	const fake = createFakePi();
 	createPiAutomode({
 		loadConfig: () =>
-			baseConfig({
-				classifierBackend: options.llm ? "llm" : "jev",
-				...options.config,
-			}),
-		classifyAction: async () => decision,
-		jevClassifyAction: async () => decision,
+			baseConfig({ classifierBackend: options.llm ? "llm" : "jev", ...options.config }),
+		classifyAction: async () => next(),
+		jevClassifyAction: async () => next(),
 	})(fake.pi);
 	const ctx = createFakeCtx(fake.entries, { hasUI: options.hasUI ?? true });
-	const prompts: Outcome["prompts"] = [];
-	ctx.ui.confirm = async (title: string, message: string) => {
-		prompts.push({ title, message });
-		return options.confirm ? options.confirm() : true;
+	const prompts: Prompt[] = [];
+	const answers = [...(options.answers ?? [])];
+	(ctx.ui as Record<string, unknown>).select = async (title: string, choices: string[]) => {
+		const prompt = { title, options: choices };
+		prompts.push(prompt);
+		const answer = answers.shift();
+		if (answer instanceof Error) throw answer;
+		return typeof answer === "function" ? answer(prompt) : answer;
 	};
 	await fake.emit("session_start", { type: "session_start" }, ctx);
-	const result = await fake.emit("tool_call", {
-		toolName: "bash",
-		input: { command: "ssh prod-proxy 'curl -s localhost:4000/metrics/' > /tmp/m.txt" },
-	}, ctx) as Outcome["result"];
-	return { result, prompts, ctx, fake };
+	const run = async (command: string, toolName = "bash") =>
+		await fake.emit("tool_call", {
+			toolName,
+			input: toolName === "bash" ? { command } : { url: command },
+		}, ctx) as { block?: boolean; reason?: string } | undefined;
+	return { fake, ctx, prompts, run };
 }
 
-test("a Jev soft deny asks the user and runs the action once on approval", async () => {
-	const { result, prompts } = await runSoftBlock({});
-	assert.equal(result, undefined);
-	assert.equal(prompts.length, 1);
-	assert.equal(prompts[0]!.title, "Auto mode soft deny");
-	// The prompt shows why Jev objected and the exact action.
-	assert.match(prompts[0]!.message, /soft-deny rule 6 scored 0\.71/);
-	assert.match(prompts[0]!.message, /ssh prod-proxy 'curl -s localhost:4000\/metrics\/' > \/tmp\/m\.txt/);
-	assert.match(prompts[0]!.message, /Allow this action once\?/);
+test("a Jev soft deny offers once, similar-for-session, and deny, with the reason and action", async () => {
+	const h = await harness({ answers: [ONCE] });
+	assert.equal(await h.run(RESTART), undefined);
+	assert.equal(h.prompts.length, 1);
+	const prompt = h.prompts[0]!;
+	assert.match(prompt.title, /^Auto mode soft deny/);
+	assert.match(prompt.title, /soft-deny rule 6 scored 0\.71/);
+	assert.match(prompt.title, /ssh prod-proxy 'sudo systemctl restart nginx' > \/tmp\/restart\.log/);
+	assert.deepEqual(prompt.options, [
+		ONCE,
+		"Allow similar for this session: ssh prod-proxy 'sudo systemctl restart nginx' > /tmp/restart.log",
+		DENY,
+	]);
 });
 
-test("approval does not carry over to the next identical action", async () => {
-	let answers = [true, false];
-	const { fake, ctx, prompts } = await runSoftBlock({
-		confirm: async () => answers.shift() ?? false,
-	});
-	const second = await fake.emit("tool_call", {
-		toolName: "bash",
-		input: { command: "ssh prod-proxy 'curl -s localhost:4000/metrics/' > /tmp/m.txt" },
-	}, ctx) as { block?: boolean; reason?: string };
-	assert.equal(prompts.length, 2);
-	assert.equal(second.block, true);
-	assert.match(second.reason ?? "", /The user declined it/);
-	assert.match(second.reason ?? "", /soft-deny rule 6 scored 0\.71/);
+test("allow once does not carry over to the next identical action", async () => {
+	const h = await harness({ answers: [ONCE, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	const second = await h.run(RESTART);
+	assert.equal(h.prompts.length, 2);
+	assert.equal(second?.block, true);
+	assert.match(second?.reason ?? "", /The user declined it\./);
 });
 
-test("a declined soft deny blocks with the Jev reason", async () => {
-	const { result } = await runSoftBlock({ confirm: async () => false });
+test("allow similar skips the prompt for matching soft denies for the rest of the session", async () => {
+	const h = await harness({ answers: [similar, DENY, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	// A matching command runs without a prompt.
+	assert.equal(await h.run(RESTART), undefined);
+	assert.equal(h.prompts.length, 1);
+	// A different command still asks.
+	const other = await h.run("ssh prod-proxy 'sudo systemctl restart php-fpm'");
+	assert.equal(other?.block, true);
+	assert.equal(h.prompts.length, 2);
+
+	// /automode approvals lists the pattern, and clear removes it.
+	await h.fake.commands.get("automode")?.handler("approvals", h.ctx);
+	const listing = h.ctx.notifications.at(-1)?.message ?? "";
+	assert.match(listing, /1 session approval/);
+	assert.match(listing, /ssh prod-proxy 'sudo systemctl restart nginx'/);
+	await h.fake.commands.get("automode")?.handler("approvals clear", h.ctx);
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /Cleared 1 session approval/);
+	assert.equal((await h.run(RESTART))?.block, true);
+	assert.equal(h.prompts.length, 3);
+});
+
+test("a session approval never overrides a hard deny", async () => {
+	const h = await harness({ decisions: [SOFT_BLOCK, HARD_BLOCK], answers: [similar] });
+	assert.equal(await h.run(RESTART), undefined);
+	const hard = await h.run(RESTART);
+	assert.equal(hard?.block, true);
+	assert.match(hard?.reason ?? "", /hard_deny/);
+	assert.equal(h.prompts.length, 1);
+});
+
+test("session approvals are cleared when a session starts", async () => {
+	const h = await harness({ answers: [similar, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	await h.fake.emit("session_start", { type: "session_start" }, h.ctx);
+	assert.equal((await h.run(RESTART))?.block, true);
+	assert.equal(h.prompts.length, 2);
+});
+
+test("a soft deny with no parser pattern offers only once and deny", async () => {
+	const dynamic = await harness({ answers: [DENY] });
+	assert.equal((await dynamic.run("ls $(pwd) > /tmp/x"))?.block, true);
+	assert.deepEqual(dynamic.prompts[0]!.options, [ONCE, DENY]);
+	const web = await harness({ answers: [ONCE] });
+	assert.equal(await web.run("https://example.com", "webfetch"), undefined);
+	assert.deepEqual(web.prompts[0]!.options, [ONCE, DENY]);
+});
+
+test("a dismissed, failing, or cancelled prompt blocks", async () => {
+	const dismissed = await harness({ answers: [undefined] });
+	const result = await dismissed.run(RESTART);
 	assert.equal(result?.block, true);
-	assert.match(result?.reason ?? "", /soft-deny rule 6 scored 0\.71/);
-	assert.match(result?.reason ?? "", /The user declined it/);
-});
+	assert.match(result?.reason ?? "", /The user declined it\./);
 
-test("a failing or cancelled prompt blocks", async () => {
-	const { result } = await runSoftBlock({
-		confirm: async () => {
-			throw new Error("aborted");
-		},
-	});
-	assert.equal(result?.block, true);
-	assert.match(result?.reason ?? "", /soft-deny rule 6 scored 0\.71/);
-	assert.match(result?.reason ?? "", /The approval prompt was cancelled or failed\./);
+	const failing = await harness({ answers: [new Error("aborted")] });
+	const failed = await failing.run(RESTART);
+	assert.equal(failed?.block, true);
+	assert.match(failed?.reason ?? "", /The approval prompt was cancelled or failed\./);
 });
 
 test("hard denies, classifier failures, headless runs, and the LLM backend never ask", async () => {
-	const cases: Array<Parameters<typeof runSoftBlock>[0] & { name: string }> = [
-		{
-			name: "hard deny",
-			decision: { decision: "block", tier: "hard_deny", reason: "Jev: hard_deny 0.90" },
-		},
+	const cases: Array<Parameters<typeof harness>[0] & { name: string }> = [
+		{ name: "hard deny", decisions: [HARD_BLOCK] },
 		{
 			name: "classifier failure",
-			decision: { decision: "block", tier: "none", reason: "Jev classifier failed; auto mode fails closed" },
+			decisions: [{ decision: "block", tier: "none", reason: "Jev classifier failed; auto mode fails closed" }],
 		},
 		{ name: "headless", hasUI: false },
 		{ name: "disabled", config: { jevConfirmSoftDeny: false } },
 		{ name: "llm backend", llm: true },
 	];
 	for (const { name, ...options } of cases) {
-		const { result, prompts } = await runSoftBlock(options);
-		assert.equal(prompts.length, 0, name);
+		const h = await harness({ ...options, answers: [ONCE] });
+		const result = await h.run(RESTART);
+		assert.equal(h.prompts.length, 0, name);
 		assert.equal(result?.block, true, name);
 	}
 });

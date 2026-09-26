@@ -7,6 +7,7 @@
  */
 
 export * from "./auto-mode/classifier.ts";
+export * from "./auto-mode/approvals.ts";
 export * from "./auto-mode/bash.ts";
 export * from "./auto-mode/config.ts";
 export * from "./auto-mode/constants.ts";

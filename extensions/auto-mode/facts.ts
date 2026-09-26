@@ -178,7 +178,7 @@ function fileWriteTargets(commands: BashCommandAnalysis[]): string[] {
 }
 
 /** Strip a leading `timeout [opts] DURATION`, which only bounds run time. */
-function unwrapTimeout(name: string | undefined, args: string[]): {
+export function unwrapTimeout(name: string | undefined, args: string[]): {
   name?: string;
   args: string[];
 } {
@@ -200,7 +200,19 @@ function unwrapTimeout(name: string | undefined, args: string[]): {
  * option outside the safe set, a missing command (interactive shell), or a
  * remote command that is not verifiably read-only.
  */
-function analyzeSsh(args: string[]): RemoteShell {
+export type SshInvocation = {
+  /** The option words before the host, as written. */
+  options: string[];
+  /** The target host, lowercased, without `user@`. */
+  host?: string;
+  /** The remote command, joined the way ssh joins it. */
+  remoteSource: string;
+  /** False when any option is outside the safe set. */
+  optionsSafe: boolean;
+};
+
+/** Split `ssh [options] HOST COMMAND...` arguments. */
+export function parseSshArgs(args: string[]): SshInvocation {
   let optionsSafe = true;
   let index = 0;
   while (index < args.length && args[index]!.startsWith("-")) {
@@ -222,9 +234,17 @@ function analyzeSsh(args: string[]): RemoteShell {
     if (!SSH_FLAG_PATTERN.test(option)) optionsSafe = false;
     index += 1;
   }
-  const target = args[index];
-  const host = target?.split("@").pop()?.toLowerCase();
-  const remoteSource = args.slice(index + 1).join(" ");
+  const host = args[index]?.split("@").pop()?.toLowerCase();
+  return {
+    options: args.slice(0, index),
+    ...(host ? { host } : {}),
+    remoteSource: args.slice(index + 1).join(" "),
+    optionsSafe,
+  };
+}
+
+function analyzeSsh(args: string[]): RemoteShell {
+  const { host, remoteSource, optionsSafe } = parseSshArgs(args);
   if (!host || remoteSource.trim() === "") {
     return { host, commands: [], readOnly: false };
   }

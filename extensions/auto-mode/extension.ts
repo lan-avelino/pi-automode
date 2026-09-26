@@ -13,6 +13,7 @@ import {
   defaultClassifyAction,
   serializeClassifierAction,
 } from "./classifier.ts";
+import { approvalSignature, type ApprovalSignature } from "./approvals.ts";
 import { analyzeBash, type BashAnalysis } from "./bash.ts";
 import {
   AUTO_MODE_GUIDANCE,
@@ -246,6 +247,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
     let loadResult = loadConfigWithDiagnostics(process.cwd(), false);
     let config: EffectiveConfig = loadResult.config;
     let configDiagnostics: string[] = loadResult.diagnostics;
+    // Parser-derived patterns the user chose to allow for this session after a
+    // Jev soft deny. In memory only and cleared at session start.
+    const sessionApprovals = new Map<string, string>();
     let state: AutoModeState = {
       checkedActions: 0,
       blockedActions: 0,
@@ -464,6 +468,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       config = loadResult.config;
       configDiagnostics = loadResult.diagnostics;
       state = restoreState(ctx);
+      sessionApprovals.clear();
       if (
         ctx.hasUI &&
         globalConfig.notification &&
@@ -820,33 +825,39 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
-      // A Jev soft deny is a probability near a measured threshold, not a rule
-      // match, so an interactive user may approve the one call. Hard denies and
-      // classifier failures (tier "none") never ask, and neither do headless runs.
-      if (
-        cfg.classifierBackend === "jev" &&
-        cfg.jevConfirmSoftDeny &&
-        decision.tier === "soft_deny" &&
-        ctx.hasUI
-      ) {
-        let approved = false;
+      const askSoftDeny = async (
+        signature: ApprovalSignature | undefined,
+      ): Promise<ReturnType<typeof block> | undefined> => {
+        const allowOnce = "Allow once";
+        const allowSimilar = signature
+          ? `Allow similar for this session: ${signature.description}`
+          : undefined;
+        const deny = "Deny";
+        let choice: string | undefined;
         let outcome = "The user declined it.";
         try {
-          approved = await ctx.ui.confirm(
-            "Auto mode soft deny",
-            `${decision.reason}\n\nAction:\n${summary}\n\nAllow this action once?`,
+          choice = await ctx.ui.select(
+            `Auto mode soft deny\n\n${decision.reason}\n\nAction:\n${summary}`,
+            allowSimilar ? [allowOnce, allowSimilar, deny] : [allowOnce, deny],
             { signal: ctx.signal },
           );
         } catch {
           // A cancelled or failed prompt is not an approval.
           outcome = "The approval prompt was cancelled or failed.";
         }
-        if (approved === true) {
+        if (choice === allowOnce || (allowSimilar && choice === allowSimilar)) {
+          if (signature && choice === allowSimilar) {
+            sessionApprovals.set(signature.key, signature.description);
+          }
           state.classifierAllowed += 1;
           return allow(
             ctx,
             "classifier.confirmed",
-            `User approved a Jev soft deny: ${decision.reason}`,
+            `${
+              choice === allowOnce
+                ? "User approved a Jev soft deny once"
+                : `User approved similar actions for this session (${signature!.description})`
+            }: ${decision.reason}`,
             event.toolName,
             summary,
             logCtx,
@@ -860,6 +871,33 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           action: summary,
           kind: "classifier",
         }, logCtx);
+      };
+
+      // A Jev soft deny is a probability near a measured threshold, not a rule
+      // match, so an interactive user may approve it: once, or for the rest of
+      // the session for a parser-derived pattern. Hard denies and classifier
+      // failures (tier "none") never ask, and neither do headless runs.
+      if (
+        cfg.classifierBackend === "jev" &&
+        cfg.jevConfirmSoftDeny &&
+        decision.tier === "soft_deny"
+      ) {
+        const signature = approvalSignature(
+          serializeClassifierAction(event.toolName, input),
+        );
+        const approved = signature && sessionApprovals.get(signature.key);
+        if (approved !== undefined) {
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `Matched a session approval (${approved}): ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        if (ctx.hasUI) return await askSoftDeny(signature);
       }
 
       state.classifierDenied += 1;
@@ -986,6 +1024,28 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             16000,
           ),
           configDiagnostics.length > 0 ? "warning" : "info",
+        );
+        return;
+      }
+      if (command === "approvals") {
+        if (rest.join(" ").trim() === "clear") {
+          const count = sessionApprovals.size;
+          sessionApprovals.clear();
+          ctx.ui.notify(
+            `Cleared ${count} session approval${count === 1 ? "" : "s"}.`,
+            "info",
+          );
+          return;
+        }
+        const patterns = [...sessionApprovals.values()];
+        ctx.ui.notify(
+          patterns.length === 0
+            ? "No session approvals. Choosing \"Allow similar for this session\" on a Jev soft-deny prompt adds one."
+            : [
+              `${patterns.length} session approval${patterns.length === 1 ? "" : "s"} (cleared when the session starts; /automode approvals clear removes them):`,
+              ...patterns.map((pattern) => `- ${pattern}`),
+            ].join("\n"),
+          "info",
         );
         return;
       }
@@ -1168,14 +1228,14 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
 
       ctx.ui.notify(
-        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|backend <llm|jev>|jev [test]|model [provider/id]]",
+        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|approvals [clear]|backend <llm|jev>|jev [test]|model [provider/id]]",
         "error",
       );
     }
 
     pi.registerCommand("automode", {
       description:
-        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, backend, jev, model",
+        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, approvals, backend, jev, model",
       handler: handleAutomodeCommand,
     });
 

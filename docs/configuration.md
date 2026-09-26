@@ -40,7 +40,20 @@ Higher levels can use all 512 or 1200 stage tokens before they produce visible o
 
 If a request stalls or exceeds its budget, pi-automode aborts it. Then auto mode fails closed and blocks the action.
 
-Under the Jev backend, `allow` exceptions do not reach the per-rule soft-deny questions, so they do not lift a soft deny. This makes Jev stricter than the LLM classifier for those actions. In an interactive session, `jevConfirmSoftDeny` lets you approve a single call; use `permissions.allow` for an action that Jev keeps blocking.
+Under the Jev backend, `allow` exceptions do not reach the per-rule soft-deny questions, so they do not lift a soft deny. This makes Jev stricter than the LLM classifier for those actions. In an interactive session, `jevConfirmSoftDeny` lets you approve a single call or similar calls for the rest of the session; use `permissions.allow` for an action that Jev keeps blocking across sessions.
+
+### Session approvals
+
+"Allow similar for this session" stores a pattern that pi-automode's Bash parser derives from the command. A later action matches only if it has the same shape:
+
+- the same command names in the same order, with the same separators (`|`, `&&`, `;`);
+- the same flags and the same non-numeric arguments;
+- the same `ssh` host and the same remote commands under the same rules;
+- the same redirect targets.
+
+Only numbers in value positions may differ: a number after a flag (`-n 50`), a count flag (`head -20`), a `key=15` value, or a `timeout` duration. `--flag=value` values may also differ. Bare positional numbers stay exact, and every number stays exact for commands whose numbers are targets (`kill`, `chmod`, `chown`, `umask`, firewall tools), including behind `sudo`. Heredocs, nested shells (`bash -c`, `eval`), dynamic words, and compound shell syntax get no pattern, so only **Allow once** is offered.
+
+A session approval only replaces the soft-deny prompt. Permission rules, deterministic hard-deny checks, and a Jev `hard_deny` still apply. Approvals live in memory, are cleared when a session starts, and can be listed or cleared with `/automode approvals` and `/automode approvals clear`.
 
 ## Trusted hosts
 
@@ -72,7 +85,7 @@ The following keys apply only when `classifierBackend` is `"jev"`:
 | `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
 | `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
 | `jevSoftDenyThreshold` | `0.55` | Highest soft-side probability at or above which the action is blocked: the highest per-rule `soft_deny_<n>` score or `intent_mismatch`. Jev asks one question per `soft_deny` rule, so each configured rule adds one question to every request. See [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
-| `jevConfirmSoftDeny` | `true` | In an interactive session, a Jev `soft_deny` block (a soft-deny rule or `intent_mismatch`) asks you to allow the one call instead of blocking outright. The prompt shows the reason and the action. Approval covers only that call. Hard denies, classifier failures, and headless runs never ask; if the prompt is cancelled or fails, the action is blocked |
+| `jevConfirmSoftDeny` | `true` | In an interactive session, a Jev `soft_deny` block (a soft-deny rule or `intent_mismatch`) asks instead of blocking outright: **Allow once**, **Allow similar for this session**, or **Deny**. The prompt shows the reason and the action. "Similar" is offered only for `bash` actions the parser can pin down (see below). Hard denies, classifier failures, and headless runs never ask; a dismissed, cancelled, or failed prompt blocks |
 | `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which a block reason names it as advisory. `scope_escape` never blocks |
 
 `scope_escape` is advisory. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment, and it has no LLM-classifier counterpart. It is logged and, at or above `jevScopeEscapeThreshold`, named in a block reason, but it never blocks: in the calibration sweep it blocked no violation that the soft-deny rules or `intent_mismatch` missed, while it blocked read-only remote queries, public GET requests, and declared installs.

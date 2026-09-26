@@ -744,9 +744,11 @@ lower hard bar. Mapping:
   reason names it as advisory (caveat 20).
 - otherwise → `{ allow, tier: "none" }`
 
-A `soft_deny` block asks the user to allow the one call when `ctx.hasUI` is true and
-`jevConfirmSoftDeny` is on (the default). An approval is logged as decision kind
-`classifier.confirmed`. `hard_deny` and `none` (classifier failure) never ask, and a
+A `soft_deny` block asks the user when `ctx.hasUI` is true and `jevConfirmSoftDeny` is
+on (the default): allow once, allow similar for this session, or deny. "Similar" is
+the parser-derived pattern from `approvalSignature` (`extensions/auto-mode/approvals.ts`);
+a matching later soft deny is allowed without a prompt for the rest of the session.
+Approvals are logged as decision kind `classifier.confirmed`. `hard_deny` and `none` (classifier failure) never ask, and a
 cancelled or failed prompt blocks.
 
 Calibrate the way `specpi-jev-guard` does: replay commands that must stop and
