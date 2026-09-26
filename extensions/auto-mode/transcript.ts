@@ -212,6 +212,8 @@ function selectToolEntries(
   };
 }
 
+const OMITTED_MARKER = "<transcript_entries_omitted />";
+
 /** Build classifier evidence from user text and assistant tool-call payloads only. */
 export function buildClassifierTranscript(
   ctx: ExtensionContext,
@@ -228,10 +230,37 @@ export function buildClassifierTranscript(
       index: Number.MAX_SAFE_INTEGER,
       order: 0,
       kind: "tool",
-      text: "<transcript_entries_omitted />",
+      text: OMITTED_MARKER,
     });
   }
   return selected.map((entry) => entry.text).join("\n");
+}
+
+export type ClassifierTranscriptParts = {
+  /** The user's own turns, oldest first. */
+  userRequest: string;
+  /** The agent's recent tool calls, oldest first. Never user authorization. */
+  recentActions: string;
+};
+
+/**
+ * The same bounded evidence as `buildClassifierTranscript`, split so the user's
+ * turns and the agent's tool calls reach the classifier under separate labels.
+ * Each part carries its own omission marker.
+ */
+export function buildClassifierTranscriptParts(
+  ctx: ExtensionContext,
+  budgets: ClassifierTranscriptBudgets,
+): ClassifierTranscriptParts {
+  const entries = collectTranscriptEntries(ctx);
+  const users = selectUserEntries(entries, budgets.maxUserTokens);
+  const tools = selectToolEntries(entries, budgets.maxToolTokens);
+  const render = (part: { selected: TranscriptEntry[]; omitted: boolean }) =>
+    [
+      ...part.selected.map((entry) => entry.text),
+      ...(part.omitted ? [OMITTED_MARKER] : []),
+    ].join("\n");
+  return { userRequest: render(users), recentActions: render(tools) };
 }
 
 export function loadedContextFromSystemPromptOptions(options: unknown): string {

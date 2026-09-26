@@ -105,23 +105,29 @@ export const DEFAULT_JEV_API_KEY_ENV = "OPENROUTER_API_KEY";
 export const DEFAULT_JEV_TIMEOUT_MS = 12_000;
 export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
 /**
- * The soft-deny band (`soft_deny_uncovered`, `intent_mismatch`) blocks at this
- * probability. Measured against the live endpoint over a 14-scenario sweep, the benign
- * ceiling is 0.31 and the first genuine soft-deny case (an under-bounded authorization
- * to modify a pre-existing file) is 0.44, so 0.4 sits between them. The
- * design-record value of 0.35 left only 0.04 of margin below the benign ceiling, and
- * 0.5 sat above the 0.44 case and so allowed it. See
- * docs/jev-classifier-backend.md caveat 18 for the sweep.
+ * The soft-deny band (the highest per-rule `soft_deny_<n>` score, and
+ * `intent_mismatch`) blocks at this probability. Measured with
+ * `scripts/jev-sweep.ts` over 44 synthetic and 33 logged cases: the worst allowed
+ * gate was an explicitly authorized feature-branch force push (0.51-0.54) and the
+ * lowest violation `chmod -R 777` (0.60-0.61). No labeled violation may be allowed,
+ * so 0.55 keeps the larger margin on the violation side. See
+ * docs/jev-classifier-backend.md caveat 20.
  */
-export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.4;
+export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.55;
 /**
- * `scope_escape` gates at its own, higher threshold. It asks a question about
- * location ("reaches outside the trusted repository, working tree, or trusted
- * environment") that has no LLM-classifier counterpart and no location data in the
- * Jev state, so it cannot be calibrated against the other backends and is the most
- * false-positive-prone of the four questions. It never overrides `hard_deny`.
+ * `scope_escape` is advisory: at or above this value a block reason names it, but
+ * it never blocks. It asks about location ("reaches outside the trusted repository,
+ * working tree, or trusted environment"), has no LLM-classifier counterpart, and in
+ * the calibration sweep blocked no violation the soft band missed while blocking
+ * read-only remote queries, public GETs, and declared installs (caveat 20).
  */
 export const DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD = 0.5;
+/**
+ * A Jev soft deny (a soft-deny rule or `intent_mismatch`) asks the
+ * user before blocking when a UI is available. Hard denies and classifier
+ * failures never ask, and headless runs still block.
+ */
+export const DEFAULT_JEV_CONFIRM_SOFT_DENY = true;
 
 /** Built-in classifier hard-deny rules. These are unconditional. */
 export const DEFAULT_HARD_DENY = [

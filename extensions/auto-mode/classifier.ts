@@ -30,10 +30,22 @@ import type {
   EffectiveConfig,
 } from "./types.ts";
 
+/**
+ * Trusted-environment lines shared by both classifier backends: the configured
+ * `environment` rules plus one line naming `trustedHosts`, when any are set.
+ */
+export function classifierEnvironment(config: EffectiveConfig): string[] {
+  if (config.trustedHosts.length === 0) return config.environment;
+  return [
+    ...config.environment,
+    `Trusted SSH hosts (autoMode.trustedHosts): ${config.trustedHosts.join(", ")}.`,
+  ];
+}
+
 export function buildClassifierPrompt(config: EffectiveConfig): string {
   return CLASSIFIER_SYSTEM_PROMPT.replace(
     "<ENVIRONMENT>",
-    config.environment.map((line) => `- ${line}`).join("\n"),
+    classifierEnvironment(config).map((line) => `- ${line}`).join("\n"),
   )
     .replace(
       "<ALLOW_RULES>",

@@ -54,10 +54,12 @@ export type AutoModeSettings = {
   jevTimeoutMs?: number;
   /** Jev hard_deny probability at or above which the action is blocked (default 0.5). */
   jevHardDenyThreshold?: number;
-  /** Jev soft-deny probability at or above which the action is blocked (default 0.4). */
+  /** Jev soft-deny probability at or above which the action is blocked (default 0.55). */
   jevSoftDenyThreshold?: number;
-  /** Jev scope-escape probability at or above which the action is blocked on its own (default 0.5). */
+  /** Jev scope-escape probability at or above which a block reason names it as advisory (default 0.5). It never blocks. */
   jevScopeEscapeThreshold?: number;
+  /** When true (default), a Jev soft deny asks the user in interactive sessions instead of blocking outright. */
+  jevConfirmSoftDeny?: boolean;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */
   classifyReadOnlyTools?: boolean;
@@ -72,6 +74,8 @@ export type AutoModeSettings = {
   maxUserTranscriptTokens?: number;
   maxToolTranscriptTokens?: number;
   environment?: unknown;
+  /** SSH host names the classifier treats as part of the trusted environment. User-owned sources only. */
+  trustedHosts?: unknown;
   allow?: unknown;
   protectedPaths?: unknown;
   soft_deny?: unknown;
@@ -118,6 +122,7 @@ export type EffectiveConfig = {
   jevHardDenyThreshold: number;
   jevSoftDenyThreshold: number;
   jevScopeEscapeThreshold: number;
+  jevConfirmSoftDeny: boolean;
   classifyReadOnlyTools: boolean;
   fastClassifierMaxTokens: number;
   classifierTimeoutMs: number;
@@ -126,6 +131,8 @@ export type EffectiveConfig = {
   maxUserTranscriptTokens: number;
   maxToolTranscriptTokens: number;
   environment: string[];
+  /** Lowercase SSH host names from user-owned config sources. */
+  trustedHosts: string[];
   allow: string[];
   protectedPaths: string[];
   softDeny: string[];
@@ -165,6 +172,7 @@ export type DenialRecord = {
 export type DecisionKind =
   | DenialRecord["kind"]
   | "permissions.allow"
+  | "classifier.confirmed"
   | "read-only"
   | "inside-working-directory";
 

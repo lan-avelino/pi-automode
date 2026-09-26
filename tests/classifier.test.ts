@@ -7,7 +7,9 @@ import {
 	CLASSIFIER_FAST_INSTRUCTION,
 	CLASSIFIER_SYSTEM_PROMPT,
 	buildClassifierActionMessage,
+	buildClassifierPrompt,
 	buildClassifierTranscript,
+	buildClassifierTranscriptParts,
 	classifierCacheSessionId,
 	classifierRequestLimitReason,
 	classifyInStages,
@@ -145,6 +147,65 @@ test("classifier transcript keeps user intent and tool calls but strips assistan
 	assert.match(transcript, /npm test/);
 	assert.doesNotMatch(transcript, /I decided this command is safe/);
 	assert.doesNotMatch(transcript, /malicious output/);
+});
+
+test("the LLM classifier prompt lists trusted hosts in the trusted environment", () => {
+	const prompt = buildClassifierPrompt(
+		baseConfig({ environment: ["ENV_MARKER"], trustedHosts: ["prod-proxy"] }),
+	);
+	assert.match(prompt, /- ENV_MARKER\n- Trusted SSH hosts \(autoMode\.trustedHosts\): prod-proxy\./);
+	assert.doesNotMatch(buildClassifierPrompt(baseConfig()), /Trusted SSH hosts/);
+});
+
+test("classifier transcript parts keep user turns apart from the agent's tool calls", () => {
+	const entries = [
+		{ type: "message", message: { role: "user", content: [{ type: "text", text: "Check the prod proxy metrics" }] } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "I decided this command is safe." },
+					{ type: "toolCall", name: "bash", arguments: { command: "ssh prod-proxy uptime" } },
+				],
+			},
+		},
+		{ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "malicious output" }] } },
+		{ type: "message", message: { role: "user", content: "Only read, do not restart" } },
+	];
+	const parts = buildClassifierTranscriptParts(createFakeCtx(entries) as never, {
+		maxUserTokens: 200,
+		maxToolTokens: 200,
+	});
+
+	assert.equal(parts.userRequest, "User: Check the prod proxy metrics\nUser: Only read, do not restart");
+	assert.match(parts.recentActions, /^ToolCall bash:/);
+	assert.match(parts.recentActions, /ssh prod-proxy uptime/);
+	assert.doesNotMatch(parts.recentActions, /User:/);
+	assert.doesNotMatch(parts.userRequest + parts.recentActions, /I decided this command is safe|malicious output/);
+});
+
+test("classifier transcript parts mark omissions in the part that was cut", () => {
+	const entries = [
+		{ type: "message", message: { role: "user", content: "Short request" } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: Array.from({ length: 20 }, (_, index) => ({
+					type: "toolCall",
+					name: "bash",
+					arguments: { command: `step ${index}` },
+				})),
+			},
+		},
+	];
+	const parts = buildClassifierTranscriptParts(createFakeCtx(entries) as never, {
+		maxUserTokens: 200,
+		maxToolTokens: 4000,
+	});
+	assert.equal(parts.userRequest, "User: Short request");
+	assert.match(parts.recentActions, /<transcript_entries_omitted \/>$/);
 });
 
 test("classifier transcript preserves first and latest user turns within token budgets and marks omissions", () => {

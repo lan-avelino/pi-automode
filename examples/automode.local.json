@@ -14,6 +14,9 @@
       "Trusted internal domains: *.corp.example.com, api.internal.example.com",
       "Trusted cloud buckets: s3://acme-build-artifacts, gs://acme-dev-scratch"
     ],
+    "trustedHosts": [
+      "build-runner-1"
+    ],
     "allow": [
       "$defaults",
       "Deploying to the staging namespace is allowed when the command names staging explicitly."

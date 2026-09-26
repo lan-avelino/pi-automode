@@ -380,7 +380,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       kind: DecisionKind,
       logCtx: LogCtx,
     ): { classifierModel?: string; reasoning?: ClassifierReasoningLog } {
-      return kind === "classifier"
+      return kind === "classifier" || kind === "classifier.confirmed"
         ? {
             classifierModel: logCtx.classifierModel,
             reasoning: logCtx.reasoning,
@@ -818,6 +818,48 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           summary,
           logCtx,
         );
+      }
+
+      // A Jev soft deny is a probability near a measured threshold, not a rule
+      // match, so an interactive user may approve the one call. Hard denies and
+      // classifier failures (tier "none") never ask, and neither do headless runs.
+      if (
+        cfg.classifierBackend === "jev" &&
+        cfg.jevConfirmSoftDeny &&
+        decision.tier === "soft_deny" &&
+        ctx.hasUI
+      ) {
+        let approved = false;
+        let outcome = "The user declined it.";
+        try {
+          approved = await ctx.ui.confirm(
+            "Auto mode soft deny",
+            `${decision.reason}\n\nAction:\n${summary}\n\nAllow this action once?`,
+            { signal: ctx.signal },
+          );
+        } catch {
+          // A cancelled or failed prompt is not an approval.
+          outcome = "The approval prompt was cancelled or failed.";
+        }
+        if (approved === true) {
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `User approved a Jev soft deny: ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        state.classifierDenied += 1;
+        return block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason: `${decision.reason} ${outcome}`,
+          action: summary,
+          kind: "classifier",
+        }, logCtx);
       }
 
       state.classifierDenied += 1;

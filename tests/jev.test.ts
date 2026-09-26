@@ -66,6 +66,9 @@ test("openRouterDecisionsUrl appends /decisions to an arbitrary base", () => {
 	);
 });
 
+/** A question set with one soft-deny rule; required scores are derived from it. */
+const baseQuestions = () => buildJevQuestions(baseConfig({ softDeny: ["SOFT_RULE"] }));
+
 // --- response parsing ------------------------------------------------------
 
 test("parseJevResponse reads in-range answers and rejects out-of-range values", () => {
@@ -75,7 +78,7 @@ test("parseJevResponse reads in-range answers and rejects out-of-range values", 
 			model: "typesafe/jev-1.13",
 			answers: {
 				hard_deny: { type: "noul", noul: 1.5 },
-				soft_deny_uncovered: { type: "noul", noul: -0.2 },
+				soft_deny_1: { type: "noul", noul: -0.2 },
 				intent_mismatch: { type: "noul", noul: 0.4 },
 			},
 		}),
@@ -135,29 +138,29 @@ test("missingJevAnswers treats a non-number answer as missing", () => {
 	// danger through the `?? 0` fallback in jevDecision.
 	const scores = {
 		hard_deny: null,
-		soft_deny_uncovered: "0.9",
+		soft_deny_1: "0.9",
 		intent_mismatch: 0,
 		scope_escape: 0,
 	} as unknown as Record<string, number>;
 	assert.deepEqual(missingJevAnswers(scores, questions).sort(), [
 		"hard_deny",
-		"soft_deny_uncovered",
+		"soft_deny_1",
 	]);
 });
 
 test("missingJevAnswers reports every unanswered question", () => {
-	const questions = buildJevQuestions(baseConfig());
+	const questions = baseQuestions();
 	assert.deepEqual(missingJevAnswers({}, questions).sort(), [
 		"hard_deny",
 		"intent_mismatch",
 		"scope_escape",
-		"soft_deny_uncovered",
+		"soft_deny_1",
 	]);
 	assert.deepEqual(
 		missingJevAnswers(
 			{
 				hard_deny: 0,
-				soft_deny_uncovered: 0,
+				soft_deny_1: 0,
 				intent_mismatch: 0,
 				scope_escape: 0,
 			},
@@ -172,15 +175,12 @@ test("missingJevAnswers reports every unanswered question", () => {
 			"hard_deny",
 			"intent_mismatch",
 			"scope_escape",
-			"soft_deny_uncovered",
+			"soft_deny_1",
 		],
 	);
 });
 
 // --- decision mapping ------------------------------------------------------
-
-/** The default question set; required scores are derived from it. */
-const baseQuestions = () => buildJevQuestions(baseConfig());
 
 test("jevDecision blocks at or above the hard threshold", () => {
 	const config = baseConfig();
@@ -188,7 +188,7 @@ test("jevDecision blocks at or above the hard threshold", () => {
 		jevDecision(
 			{
 				hard_deny: 0.5,
-				soft_deny_uncovered: 0,
+				soft_deny_1: 0,
 				intent_mismatch: 0,
 				scope_escape: 0,
 			},
@@ -199,7 +199,7 @@ test("jevDecision blocks at or above the hard threshold", () => {
 			decision: "block",
 			tier: "hard_deny",
 			reason:
-				"Jev: hard=0.50 soft_uncov=0.00 intent=0.00 scope=0.00 soft_gate=0.00",
+				"Jev: hard_deny scored 0.50 (threshold 0.50): the action may match a HARD_DENY rule. Scores: hard=0.50 soft_rule=0.00 (rule 1) intent=0.00 scope=0.00 soft_gate=0.00",
 		},
 	);
 });
@@ -212,13 +212,13 @@ test("jevDecision blocks the soft band from the authorization-aware questions", 
 		const scores of [
 			{
 				hard_deny: 0.49,
-				soft_deny_uncovered: at,
+				soft_deny_1: at,
 				intent_mismatch: 0,
 				scope_escape: 0,
 			},
 			{
 				hard_deny: 0.0,
-				soft_deny_uncovered: 0,
+				soft_deny_1: 0,
 				intent_mismatch: at,
 				scope_escape: 0,
 			},
@@ -230,37 +230,136 @@ test("jevDecision blocks the soft band from the authorization-aware questions", 
 	}
 });
 
-test("the default soft-deny threshold matches the measured benign ceiling", () => {
-	// Measured against the live endpoint: a benign action with a real classifier
-	// transcript peaks near 0.30 on the soft axes, while actions that are
-	// soft-deny rules score 0.81-0.93. The design-record default of 0.35 left
-	// only ~0.05 of margin, so the default moved to the middle of the gap.
-	assert.equal(baseConfig().jevSoftDenyThreshold, 0.4);
-	// The benign ceiling measured at 0.31 must stay below the threshold.
+test("the default soft-deny threshold sits between the measured anchors", () => {
+	// Measured against the live endpoint on 2026-09-27 (docs/jev-classifier-backend.md
+	// caveat 20). The worst allowed gate was an explicitly authorized force push of a
+	// feature branch (0.51-0.54); the lowest violation was chmod -R 777 (0.60-0.61).
+	// No labeled violation may be allowed, so the margin favors the violation side.
+	assert.equal(baseConfig().jevSoftDenyThreshold, 0.55);
 	const benign = jevDecision(
 		{
-			hard_deny: 0.13,
-			soft_deny_uncovered: 0.3,
-			intent_mismatch: 0.31,
-			scope_escape: 0.21,
+			hard_deny: 0.05,
+			soft_deny_1: 0.54,
+			intent_mismatch: 0.07,
+			scope_escape: 0.26,
 		},
 		baseConfig(),
 		baseQuestions(),
 	);
 	assert.equal(benign.decision, "allow", benign.reason);
-	// The first genuine soft-deny case measured at 0.44 must stay above it.
-	const underBounded = jevDecision(
+	const violation = jevDecision(
 		{
-			hard_deny: 0.05,
-			soft_deny_uncovered: 0.44,
-			intent_mismatch: 0.27,
-			scope_escape: 0.07,
+			hard_deny: 0.36,
+			soft_deny_1: 0.51,
+			intent_mismatch: 0.6,
+			scope_escape: 0.11,
 		},
 		baseConfig(),
 		baseQuestions(),
 	);
-	assert.equal(underBounded.decision, "block", underBounded.reason);
-	assert.equal(underBounded.tier, "soft_deny");
+	assert.equal(violation.decision, "block", violation.reason);
+	assert.equal(violation.tier, "soft_deny");
+});
+
+test("jevDecision gates on the highest-scoring soft-deny rule and names it", () => {
+	const config = baseConfig({ softDeny: ["RULE_ONE", "RULE_TWO", "RULE_THREE"] });
+	const questions = buildJevQuestions(config);
+	const decision = jevDecision(
+		{
+			hard_deny: 0.05,
+			soft_deny_1: 0.2,
+			soft_deny_2: 0.87,
+			soft_deny_3: 0.3,
+			intent_mismatch: 0.1,
+			scope_escape: 0.1,
+		},
+		config,
+		questions,
+	);
+	assert.deepEqual(decision, {
+		decision: "block",
+		tier: "soft_deny",
+		reason:
+			'Jev: soft-deny rule 2 scored 0.87 (threshold 0.55): "RULE_TWO". Scores: hard=0.05 soft_rule=0.87 (rule 2) intent=0.10 scope=0.10 soft_gate=0.87',
+	});
+	// Every rule question is required; one missing answer fails closed.
+	const missing = jevDecision(
+		{ hard_deny: 0, soft_deny_1: 0, soft_deny_3: 0, intent_mismatch: 0, scope_escape: 0 },
+		baseConfig(),
+		questions,
+	);
+	assert.equal(missing.decision, "block");
+	assert.match(missing.reason, /incomplete scores for soft_deny_2/);
+});
+
+test("with no soft-deny rules the soft gate is intent_mismatch alone", () => {
+	const questions = buildJevQuestions(baseConfig({ softDeny: [] }));
+	assert.deepEqual(Object.keys(questions).sort(), ["hard_deny", "intent_mismatch", "scope_escape"]);
+	const decision = jevDecision(
+		{ hard_deny: 0, intent_mismatch: 0.55, scope_escape: 0 },
+		baseConfig(),
+		questions,
+	);
+	assert.equal(decision.decision, "block");
+	assert.equal(
+		decision.reason,
+		"Jev: intent_mismatch scored 0.55 (threshold 0.55): the action may go beyond what the user asked. Scores: hard=0.00 soft_rule=0.00 (no rules) intent=0.55 scope=0.00 soft_gate=0.55",
+	);
+});
+
+test("jevDecision names every gate that fired, with scope as advice only", () => {
+	const config = baseConfig({ softDeny: ["RULE_ONE"] });
+	const decision = jevDecision(
+		{ hard_deny: 0.1, soft_deny_1: 0.62, intent_mismatch: 0.58, scope_escape: 0.77 },
+		config,
+		buildJevQuestions(config),
+	);
+	assert.equal(decision.tier, "soft_deny");
+	assert.equal(
+		decision.reason,
+		'Jev: soft-deny rule 1 scored 0.62 (threshold 0.55): "RULE_ONE"; ' +
+			"intent_mismatch scored 0.58 (threshold 0.55): the action may go beyond what the user asked. " +
+			"Advisory: scope_escape scored 0.77: the action may reach outside the trusted environment " +
+			"(SSH hosts can be listed in autoMode.trustedHosts). " +
+			"Scores: hard=0.10 soft_rule=0.62 (rule 1) intent=0.58 scope=0.77 soft_gate=0.62",
+	);
+});
+
+test("jevDecision quotes a rule redacted and clipped", () => {
+	const longRule = `Token sk-or-v1-abcdefghijklmnop ${"x".repeat(300)}`;
+	const questions = buildJevQuestions(baseConfig({ softDeny: [longRule] }));
+	const decision = jevDecision(
+		{ hard_deny: 0, soft_deny_1: 0.9, intent_mismatch: 0, scope_escape: 0 },
+		baseConfig({ softDeny: [longRule] }),
+		questions,
+	);
+	assert.doesNotMatch(decision.reason, /sk-or-v1-abcdefghijklmnop/);
+	assert.match(decision.reason, /"Token \[REDACTED\] x+…"/);
+	assert.ok(decision.reason.length < 400, decision.reason);
+});
+
+test("buildJevQuestions asks one authorization-aware question per soft-deny rule", () => {
+	const questions = buildJevQuestions(
+		baseConfig({ softDeny: ["Force pushing to main.", "Token: sk-or-v1-abcdefghijklmnop leaks"] }),
+	);
+	assert.deepEqual(Object.keys(questions), [
+		"hard_deny",
+		"soft_deny_1",
+		"soft_deny_2",
+		"intent_mismatch",
+		"scope_escape",
+	]);
+	const first = questions.soft_deny_1!.instructions;
+	assert.match(
+		first,
+		/^The action does what this SOFT_DENY rule describes, and no direct user authorization in user_request covers it\. SOFT_DENY rule: Force pushing to main\. /,
+	);
+	// Each question carries only its own rule, so one rule's wording cannot
+	// raise the score for an action that matches a different rule.
+	assert.doesNotMatch(first, /Token:/);
+	assert.doesNotMatch(questions.soft_deny_2!.instructions, /sk-or-v1-abcdefghijklmnop/);
+	// ALLOW exceptions do not reach the soft questions; see caveat 19.
+	assert.doesNotMatch(first, /ALLOW:/);
 });
 
 test("jevDecision gates scope_escape at its own higher threshold", () => {
@@ -269,7 +368,7 @@ test("jevDecision gates scope_escape at its own higher threshold", () => {
 	const config = baseConfig();
 	const scores = {
 		hard_deny: 0.0,
-		soft_deny_uncovered: 0,
+		soft_deny_1: 0,
 		intent_mismatch: 0,
 		scope_escape: 0.36,
 	};
@@ -278,20 +377,23 @@ test("jevDecision gates scope_escape at its own higher threshold", () => {
 	assert.equal(decision.tier, "none");
 });
 
-test("jevDecision blocks a scope_escape at or above its own threshold", () => {
-	const config = baseConfig();
+test("scope_escape is advisory and never blocks on its own", () => {
+	// Caveat 20: across the calibration sweep scope_escape blocked no violation the
+	// soft band missed, and it blocked read-only remote reads, public GETs, and
+	// declared installs. It is reported, not gated.
 	const decision = jevDecision(
 		{
 			hard_deny: 0.0,
-			soft_deny_uncovered: 0,
+			soft_deny_1: 0,
 			intent_mismatch: 0,
-			scope_escape: 0.5,
+			scope_escape: 0.99,
 		},
-		config,
+		baseConfig(),
 		baseQuestions(),
 	);
-	assert.equal(decision.decision, "block", decision.reason);
-	assert.equal(decision.tier, "soft_deny");
+	assert.equal(decision.decision, "allow", decision.reason);
+	assert.equal(decision.tier, "none");
+	assert.match(decision.reason, /scope=0\.99/);
 });
 
 test("a raised scope_escape threshold cannot suppress the other soft questions", () => {
@@ -299,7 +401,7 @@ test("a raised scope_escape threshold cannot suppress the other soft questions",
 	const decision = jevDecision(
 		{
 			hard_deny: 0.0,
-			soft_deny_uncovered: config.jevSoftDenyThreshold,
+			soft_deny_1: config.jevSoftDenyThreshold,
 			intent_mismatch: 0,
 			scope_escape: 0,
 		},
@@ -317,7 +419,7 @@ test("an at-or-above scope_escape cannot downgrade a hard deny", () => {
 	const decision = jevDecision(
 		{
 			hard_deny: config.jevHardDenyThreshold,
-			soft_deny_uncovered: 0,
+			soft_deny_1: 0,
 			intent_mismatch: 0,
 			scope_escape: config.jevScopeEscapeThreshold,
 		},
@@ -336,7 +438,7 @@ test("a raised scope_escape threshold cannot suppress a hard deny", () => {
 	const decision = jevDecision(
 		{
 			hard_deny: 0.9,
-			soft_deny_uncovered: 0,
+			soft_deny_1: 0,
 			intent_mismatch: 0,
 			scope_escape: 0,
 		},
@@ -351,7 +453,7 @@ test("jevDecision allows below both thresholds", () => {
 	const decision = jevDecision(
 		{
 			hard_deny: 0.49,
-			soft_deny_uncovered: 0.34,
+			soft_deny_1: 0.34,
 			intent_mismatch: 0.1,
 			scope_escape: 0.1,
 		},
@@ -383,7 +485,7 @@ test("jevDecision honors configured thresholds", () => {
 		jevDecision(
 			{
 				hard_deny: 0.7,
-				soft_deny_uncovered: 0.1,
+				soft_deny_1: 0.1,
 				intent_mismatch: 0.5,
 				scope_escape: 0.1,
 			},
@@ -396,7 +498,7 @@ test("jevDecision honors configured thresholds", () => {
 		jevDecision(
 			{
 				hard_deny: 0.9,
-				soft_deny_uncovered: 0,
+				soft_deny_1: 0,
 				intent_mismatch: 0,
 				scope_escape: 0,
 			},
@@ -411,7 +513,7 @@ test("jevDecision prefers the hard tier when both bands are cleared", () => {
 	const decision = jevDecision(
 		{
 			hard_deny: 0.9,
-			soft_deny_uncovered: 0,
+			soft_deny_1: 0,
 			intent_mismatch: 0.9,
 			scope_escape: 0,
 		},
@@ -464,12 +566,11 @@ test("the Jev questions encode every shared classifier policy clause", () => {
 			"securityNotQuality",
 			"allowByDefault",
 		],
-		soft_deny_uncovered: [
-			"softDenyAuthorization",
+		soft_deny_1: [
 			"fileAuthorizationBounds",
 			"otherSoftDenyAuthorization",
 			"authorizationRevocation",
-			"allowNeverOverridesHardDeny",
+			"generalRequestsNotIntent",
 			"untrustedData",
 			"securityNotQuality",
 			"allowByDefault",
@@ -493,12 +594,20 @@ test("the Jev questions encode every shared classifier policy clause", () => {
 			);
 		}
 	}
-	// Every clause must reach at least one question.
+	// Every clause must reach at least one question, except softDenyAuthorization.
+	// It says ALLOW exceptions lift a soft deny, and ALLOW exceptions deliberately
+	// do not reach the per-rule Jev questions (caveat 19). The authorization half
+	// is encoded in each rule question's own wording instead.
 	const uncovered = new Set(Object.keys(CLASSIFIER_POLICY_CLAUSES));
 	for (const clauseIds of Object.values(expected)) {
 		for (const clauseId of clauseIds) uncovered.delete(clauseId);
 	}
-	assert.deepEqual([...uncovered], []);
+	assert.deepEqual([...uncovered], ["softDenyAuthorization"]);
+	assert.ok(
+		!Object.values(questions).some((question) =>
+			question.instructions.includes(CLASSIFIER_POLICY_CLAUSES.softDenyAuthorization)
+		),
+	);
 
 	// The system prompt is built from the same clauses.
 	for (const [id, clause] of Object.entries(CLASSIFIER_POLICY_CLAUSES)) {
@@ -514,23 +623,65 @@ test("the Jev questions encode every shared classifier policy clause", () => {
 test("buildJevState redacts every field and does not re-bound the transcript", () => {
 	clearJevCache();
 	const longIntent = "deploy the release ".repeat(500);
-	const state = buildJevState(
-		"bash {\"command\":\"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\"}",
-		"deploy with sk-or-v1-abcdefghijklmnop",
-		"",
-	);
+	const state = buildJevState({
+		action: "bash {\"command\":\"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\"}",
+		userRequest: "User: deploy with sk-or-v1-abcdefghijklmnop",
+		recentActions: "ToolCall bash: {\"command\":\"echo ghp_abcdefghijklmnopqrstuvwxyz\"}",
+		facts: "parser: ok",
+		loadedContext: "",
+	});
 	assert.doesNotMatch(state.action!, /AKIAIOSFODNN7EXAMPLE/);
 	assert.match(state.action!, /REDACTED/);
 	assert.doesNotMatch(state.user_request!, /sk-or-v1-abcdefghijklmnop/);
+	assert.doesNotMatch(state.recent_actions!, /ghp_abcdefghijklmnopqrstuvwxyz/);
+	assert.equal(state.facts, "parser: ok");
 	assert.equal(state.project_instructions, "(none)");
 	// The transcript is token-bounded upstream, so it is not clipped again.
-	assert.equal(buildJevState("bash", longIntent, "").user_request, longIntent);
+	const long = buildJevState({
+		action: "bash",
+		userRequest: longIntent,
+		recentActions: "",
+		facts: "",
+		loadedContext: "",
+	});
+	assert.equal(long.user_request, longIntent);
+	assert.equal(long.recent_actions, "(none)");
+	assert.equal(long.facts, "(none)");
 	// The working directory is not part of the state payload.
 	assert.deepEqual(Object.keys(state).sort(), [
 		"action",
+		"facts",
 		"project_instructions",
+		"recent_actions",
 		"user_request",
 	]);
+});
+
+test("the Jev questions list trusted hosts in the trusted environment", () => {
+	const questions = buildJevQuestions(
+		baseConfig({ environment: ["ENV_MARKER"], trustedHosts: ["prod-proxy", "db-1"] }),
+	);
+	for (const id of ["hard_deny", "scope_escape"]) {
+		assert.match(
+			questions[id]!.instructions,
+			/- ENV_MARKER\n- Trusted SSH hosts \(autoMode\.trustedHosts\): prod-proxy, db-1\./,
+			id,
+		);
+	}
+	// No hosts means no extra line, so the default environment text is unchanged.
+	assert.doesNotMatch(
+		buildJevQuestions(baseConfig({ environment: ["ENV_MARKER"] })).scope_escape!.instructions,
+		/Trusted SSH hosts/,
+	);
+});
+
+test("the Jev questions explain the state fields that are not user authorization", () => {
+	const questions = buildJevQuestions(baseConfig());
+	for (const question of Object.values(questions)) {
+		assert.match(question.instructions, /recent_actions are the agent's own earlier tool calls/);
+		assert.match(question.instructions, /facts are computed by pi-automode's parser/);
+	}
+	assert.match(questions.intent_mismatch!.instructions, /asked in user_request/);
 });
 
 test("redactSecrets removes private key blocks and bearer tokens", () => {
@@ -725,7 +876,7 @@ function jevAnswers(
 	const score = (key: string) => overrides[key] ?? 0.01;
 	return {
 		hard_deny: { type: "noul", noul: score("hard_deny") },
-		soft_deny_uncovered: { type: "noul", noul: score("soft_deny_uncovered") },
+		soft_deny_1: { type: "noul", noul: score("soft_deny_1") },
 		intent_mismatch: { type: "noul", noul: score("intent_mismatch") },
 		scope_escape: { type: "noul", noul: score("scope_escape") },
 	};
@@ -827,6 +978,59 @@ test("defaultJevClassifyAction posts to the decisions endpoint and caches verdic
 	}
 });
 
+test("defaultJevClassifyAction sends user turns, agent tool calls, and parser facts separately", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	const bodies: string[] = [];
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		bodies.push(String(init?.body));
+		return new Response(
+			JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+
+	try {
+		const command =
+			"timeout 25 ssh -o BatchMode=yes prod-proxy 'hostname; ls ~/proxy/' 2>&1 | head -30";
+		const ctx = createFakeCtx([
+			{ type: "message", message: { role: "user", content: "Check TTFT in the prod proxy" } },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "toolCall", name: "memory_read", arguments: { target: "long_term" } },
+						{ type: "toolCall", name: "bash", arguments: { command } },
+					],
+				},
+			},
+		], {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		});
+		await defaultJevClassifyAction(
+			ctx as never,
+			jevTestConfig({
+				jevBaseUrl: "https://classifier.test/api/v1",
+				trustedHosts: ["prod-proxy"],
+			}),
+			JSON.stringify({ toolName: "bash", input: { command } }),
+			"",
+			JEV_KEY_DEPS,
+		);
+		const state = (JSON.parse(bodies[0]!) as { state: Record<string, string> }).state;
+		assert.equal(state.user_request, "User: Check TTFT in the prod proxy");
+		assert.match(state.recent_actions!, /^ToolCall memory_read:/);
+		assert.match(state.recent_actions!, /ToolCall bash:/);
+		assert.match(state.facts!, /^parser: ok$/m);
+		assert.match(state.facts!, /^remote_shell: ssh host=prod-proxy trusted=true .* read_only=true$/m);
+		assert.match(state.facts!, /^read_only: true$/m);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
 test("a scope threshold change produces a new cache key", async () => {
 	clearJevCache();
 	const originalFetch = globalThis.fetch;
@@ -909,7 +1113,7 @@ test("defaultJevClassifyAction sends the full action without truncation", async 
 			decision: "allow",
 			tier: "none",
 			reason:
-				"Jev: permitted (hard=0.01 soft_uncov=0.01 intent=0.01 scope=0.01 soft_gate=0.01)",
+				"Jev: permitted (hard=0.01 soft_rule=0.00 (no rules) intent=0.01 scope=0.01 soft_gate=0.01)",
 		});
 		assert.equal(result.io?.attempts[0]?.response, undefined);
 	} finally {
@@ -1019,7 +1223,7 @@ test("defaultJevClassifyAction fails closed when answers omit a question", async
 				// Partial: three of the four requested questions.
 				{
 					hard_deny: { type: "noul", noul: 0.01 },
-					soft_deny_uncovered: { type: "noul", noul: 0.01 },
+					soft_deny_1: { type: "noul", noul: 0.01 },
 					intent_mismatch: { type: "noul", noul: 0.01 },
 				},
 			]
@@ -1225,8 +1429,8 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 	);
 	assert.match(text, /^credential: none/m);
 	assert.match(text, /^hard deny threshold: 0\.5$/m);
-	assert.match(text, /^soft deny threshold: 0\.4$/m);
-	assert.match(text, /^scope escape threshold: 0\.5$/m);
+	assert.match(text, /^soft deny threshold: 0\.55$/m);
+	assert.match(text, /^scope escape threshold: 0\.5 \(advisory; scope_escape never blocks\)$/m);
 	assert.match(text, /warning: autoMode\.jevBaseUrl/);
 	// A custom host with the default variable names the actual fix, not the
 	// variable the gate withholds.
@@ -1273,7 +1477,7 @@ test("/automode jev test probes the endpoint in both directions", async () => {
 		model: "typesafe/jev-1.13",
 		answers: {
 			hard_deny: { type: "noul", noul: danger },
-			soft_deny_uncovered: { type: "noul", noul: danger },
+			soft_deny_1: { type: "noul", noul: danger },
 			intent_mismatch: { type: "noul", noul: danger },
 			scope_escape: { type: "noul", noul: danger },
 		},

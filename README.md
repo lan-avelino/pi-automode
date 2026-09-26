@@ -135,7 +135,7 @@ The opt-in Jev backend (`"classifierBackend": "jev"`) replaces the classifier st
 
 Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev. Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers; its allow tier is always `none`, so only the optional `classifier` I/O log distinguishes an authorization override, and only through the score summary.
 
-Jev gates `scope_escape` at its own `jevScopeEscapeThreshold` (default `0.5`), and the soft-deny band at `jevSoftDenyThreshold` (default `0.4`). The soft-deny value is measured against the live endpoint; the scope-escape value is a judgment, since no benign action has been observed scoring high on it under the bounded transcript. See [Jev classifier backend](docs/jev-classifier-backend.md) for the measurements. `scope_escape` asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It is a supporting signal with no LLM-classifier counterpart, so it never joins the soft-deny band and cannot lower the bar for `soft_deny_uncovered` or `intent_mismatch`. It can still block on its own once it reaches its own threshold, and it never overrides `hard_deny`.
+Jev blocks at `jevHardDenyThreshold` (default `0.5`) and at the soft-deny band's `jevSoftDenyThreshold` (default `0.55`). The soft-deny band is the highest score among one question per `soft_deny` rule, each asking whether the action does what that rule describes without direct user authorization, together with `intent_mismatch`. `allow` exceptions are not sent to these questions, so under Jev they do not lift a soft deny; use `permissions.allow` for an action Jev keeps blocking. In an interactive session, a Jev soft deny asks you to allow the one call instead of blocking outright (`jevConfirmSoftDeny`, default `true`); hard denies, classifier failures, and headless runs still block. Jev block reasons name the gate that fired, quote the soft-deny rule when one fired, and list the scores. Both values are measured against the live endpoint with `npm run jev:sweep`; see [Jev classifier backend](docs/jev-classifier-backend.md). `scope_escape` asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It is advisory: it is logged, and named in a block reason at or above `jevScopeEscapeThreshold` (default `0.5`), but it never blocks. In the calibration sweep it blocked no violation that the other questions missed, while it did block read-only remote queries, public GET requests, and declared installs.
 
 Jev fails closed. A missing key, network failure, timeout, or unparseable response blocks the action, matching the LLM classifier's posture. Jev's hard-deny answer is advisory; the deterministic layer remains the unconditional floor.
 
@@ -152,7 +152,7 @@ Configure it in a user-owned config source:
     "jevApiKeyEnv": "OPENROUTER_API_KEY",
     "jevTimeoutMs": 12000,
     "jevHardDenyThreshold": 0.5,
-    "jevSoftDenyThreshold": 0.4,
+    "jevSoftDenyThreshold": 0.55,
     "jevScopeEscapeThreshold": 0.5
   }
 }

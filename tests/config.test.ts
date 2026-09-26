@@ -695,6 +695,64 @@ test("project shared Pi settings can add deny and ask permissions but cannot wea
 	assert.deepEqual(config.permissionAllow, []);
 });
 
+test("autoMode.trustedHosts merges user-owned scopes and ignores shared project config", () => {
+	assert.deepEqual(buildEffectiveConfigFromSources({}).trustedHosts, []);
+
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { trustedHosts: ["Prod-Proxy"] } }],
+		projectSharedSettings: [{ autoMode: { trustedHosts: ["checked-in-host"] } }],
+		projectLocalSettings: [{ autoMode: { trustedHosts: ["db-1", "prod-proxy"] } }],
+		inlineSettings: [{ autoMode: { trustedHosts: ["build.internal"] } }],
+	});
+	// Hosts are compared case-insensitively, so they are stored lowercase and deduplicated.
+	assert.deepEqual(config.trustedHosts, ["prod-proxy", "db-1", "build.internal"]);
+});
+
+test("autoMode.jevConfirmSoftDeny defaults on and must be a boolean", () => {
+	assert.equal(buildEffectiveConfigFromSources({}).jevConfirmSoftDeny, true);
+	assert.equal(
+		buildEffectiveConfigFromSources({
+			globalSettings: [{ autoMode: { jevConfirmSoftDeny: false } }],
+		}).jevConfirmSoftDeny,
+		false,
+	);
+	// A checked-in project file cannot change it.
+	assert.equal(
+		buildEffectiveConfigFromSources({
+			globalSettings: [{ autoMode: { jevConfirmSoftDeny: false } }],
+			projectSharedSettings: [{ autoMode: { jevConfirmSoftDeny: true } }],
+		}).jevConfirmSoftDeny,
+		false,
+	);
+	assert.deepEqual(
+		validateSettingsFile({ autoMode: { jevConfirmSoftDeny: "yes" } }, "inline"),
+		["inline: autoMode.jevConfirmSoftDeny must be a boolean"],
+	);
+});
+
+test("autoMode.trustedHosts drops entries that are not plain host names", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{
+			autoMode: { trustedHosts: ["ok-host", "*", "user@host", "two words", "", 7] as never },
+		}],
+	});
+	assert.deepEqual(config.trustedHosts, ["ok-host"]);
+
+	const diagnostics = validateSettingsFile(
+		{ autoMode: { trustedHosts: ["ok-host", "*", "user@host"] } },
+		"inline",
+	);
+	assert.ok(diagnostics.some((line) => line.includes("autoMode.trustedHosts[1]")));
+	assert.ok(diagnostics.some((line) => line.includes("autoMode.trustedHosts[2]")));
+	assert.ok(!diagnostics.some((line) => line.includes("unknown autoMode key")));
+	// trustedHosts has no built-in list, so it does not ask for $defaults.
+	assert.ok(!diagnostics.some((line) => line.includes("$defaults")));
+	assert.deepEqual(
+		validateSettingsFile({ autoMode: { trustedHosts: "proxy" } }, "inline"),
+		["inline: autoMode.trustedHosts must be an array of strings"],
+	);
+});
+
 test("permissions.allow is read only from user-owned permission scopes", () => {
 	assert.deepEqual(buildEffectiveConfigFromSources({}).permissionAllow, []);
 

@@ -19,6 +19,7 @@ import {
   DEFAULT_FAST_CLASSIFIER_MAX_TOKENS,
   DEFAULT_HARD_DENY,
   DEFAULT_JEV_API_KEY_ENV,
+  DEFAULT_JEV_CONFIRM_SOFT_DENY,
   DEFAULT_JEV_BASE_URL,
   DEFAULT_JEV_HARD_DENY_THRESHOLD,
   DEFAULT_JEV_MODEL,
@@ -301,6 +302,7 @@ export function validateSettingsFile(
         "maxUserTranscriptTokens",
         "maxToolTranscriptTokens",
         "environment",
+        "trustedHosts",
         "allow",
         "protectedPaths",
         "soft_deny",
@@ -314,6 +316,7 @@ export function validateSettingsFile(
         "jevHardDenyThreshold",
         "jevSoftDenyThreshold",
         "jevScopeEscapeThreshold",
+        "jevConfirmSoftDeny",
         "log",
       ]);
       for (const key of Object.keys(autoMode)) {
@@ -402,6 +405,14 @@ export function validateSettingsFile(
         );
       }
       if (
+        hasOwn(autoMode, "jevConfirmSoftDeny") &&
+        typeof autoMode.jevConfirmSoftDeny !== "boolean"
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevConfirmSoftDeny must be a boolean`,
+        );
+      }
+      if (
         hasOwn(autoMode, "classifyReadOnlyTools") &&
         typeof autoMode.classifyReadOnlyTools !== "boolean"
       ) {
@@ -452,6 +463,7 @@ export function validateSettingsFile(
         "autoMode.environment",
         diagnostics,
       );
+      validateTrustedHostsSetting(autoMode.trustedHosts, source, diagnostics);
       validateStringArraySetting(
         autoMode.allow,
         source,
@@ -562,6 +574,36 @@ function applyRuleSetting(
 function finalizeRuleSetting(accumulator: RuleAccumulator): string[] {
   const base = accumulator.includeDefaults ? accumulator.defaults : [];
   return [...new Set([...base, ...accumulator.entries])];
+}
+
+/**
+ * A trusted host is one plain SSH host name or alias. Wildcards, `user@host`,
+ * ports, and whitespace are rejected so an entry can never widen to more hosts
+ * than it names.
+ */
+const TRUSTED_HOST_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/i;
+
+export function isValidTrustedHost(value: unknown): value is string {
+  return typeof value === "string" && TRUSTED_HOST_PATTERN.test(value);
+}
+
+function validateTrustedHostsSetting(
+  value: unknown,
+  source: string,
+  diagnostics: string[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    diagnostics.push(`${source}: autoMode.trustedHosts must be an array of strings`);
+    return;
+  }
+  for (const [index, entry] of value.entries()) {
+    if (!isValidTrustedHost(entry)) {
+      diagnostics.push(
+        `${source}: autoMode.trustedHosts[${index}] must be a plain host name (no wildcards, user@, ports, or spaces); it is ignored`,
+      );
+    }
+  }
 }
 
 function validateLogSetting(
@@ -724,6 +766,9 @@ function applyAutoModeScalars(
     jevScopeEscapeThreshold: validProbability(settings.jevScopeEscapeThreshold)
       ? settings.jevScopeEscapeThreshold
       : base.jevScopeEscapeThreshold,
+    jevConfirmSoftDeny: typeof settings.jevConfirmSoftDeny === "boolean"
+      ? settings.jevConfirmSoftDeny
+      : base.jevConfirmSoftDeny,
     classifierReasoningLevel: isClassifierReasoningLevel(
         settings.classifierReasoningLevel,
       )
@@ -795,6 +840,7 @@ export function buildEffectiveConfigFromSources(
     jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
     jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
     jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+    jevConfirmSoftDeny: DEFAULT_JEV_CONFIRM_SOFT_DENY,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
@@ -803,6 +849,7 @@ export function buildEffectiveConfigFromSources(
     maxUserTranscriptTokens: DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
     maxToolTranscriptTokens: DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
     environment: [...DEFAULT_ENVIRONMENT],
+    trustedHosts: [],
     allow: [...DEFAULT_ALLOW],
     protectedPaths: [...DEFAULT_PROTECTED_PATHS],
     softDeny: [...DEFAULT_SOFT_DENY],
@@ -824,6 +871,9 @@ export function buildEffectiveConfigFromSources(
     ...inlineSettings,
   ];
   const environment = createRuleAccumulator(DEFAULT_ENVIRONMENT);
+  // Trusted hosts widen what the classifier treats as in scope, so they come
+  // only from user-owned sources, like every other autoMode setting.
+  const trustedHosts = new Set<string>();
   const allow = createRuleAccumulator(DEFAULT_ALLOW);
   const protectedPaths = createRuleAccumulator(DEFAULT_PROTECTED_PATHS);
   const deniedPaths = createRuleAccumulator(DEFAULT_DENIED_PATHS);
@@ -833,6 +883,12 @@ export function buildEffectiveConfigFromSources(
   for (const settings of configurableSettings) {
     config = applyAutoModeScalars(config, settings.autoMode);
     applyRuleSetting(environment, settings.autoMode?.environment);
+    const hosts = settings.autoMode?.trustedHosts;
+    if (Array.isArray(hosts)) {
+      for (const host of hosts) {
+        if (isValidTrustedHost(host)) trustedHosts.add(host.toLowerCase());
+      }
+    }
     applyRuleSetting(allow, settings.autoMode?.allow);
     applyRuleSetting(protectedPaths, settings.autoMode?.protectedPaths);
     applyRuleSetting(
@@ -853,6 +909,7 @@ export function buildEffectiveConfigFromSources(
   config = {
     ...config,
     environment: finalizeRuleSetting(environment),
+    trustedHosts: [...trustedHosts],
     allow: finalizeRuleSetting(allow),
     protectedPaths: finalizeRuleSetting(protectedPaths),
     deniedPaths: finalizeRuleSetting(deniedPaths),

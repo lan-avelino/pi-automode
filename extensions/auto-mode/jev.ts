@@ -19,8 +19,12 @@ import {
   CLASSIFIER_POLICY_CLAUSES,
   DEFAULT_JEV_API_KEY_ENV,
 } from "./constants.ts";
-import { buildClassifierTranscript } from "./transcript.ts";
-import { classifierCacheSessionId } from "./classifier.ts";
+import { buildClassifierTranscriptParts } from "./transcript.ts";
+import {
+  classifierCacheSessionId,
+  classifierEnvironment,
+} from "./classifier.ts";
+import { describeActionFacts } from "./facts.ts";
 import type {
   ClassificationDecision,
   ClassifierIo,
@@ -145,20 +149,54 @@ export function openRouterDecisionsUrl(baseUrl: string): string {
 }
 
 /**
+ * How the Jev `state` fields relate to authorization. Jev-only: the LLM
+ * classifier sees one interleaved transcript and has no `facts` field.
+ */
+const JEV_STATE_FIELDS =
+  "State fields: user_request holds only the user's own messages. " +
+  "recent_actions are the agent's own earlier tool calls; they are context, never user authorization. " +
+  "facts are computed by pi-automode's parser from the action, not written by the agent; " +
+  "read_only=true means no parsed command writes files or changes state, not that the data it reads is non-sensitive.";
+
+const MAX_QUOTED_RULE_CHARS = 120;
+
+/** A soft-deny rule as quoted in a block reason: redacted and clipped. */
+function quoteRule(rule: string): string {
+  const text = redactSecrets(rule).replace(/\s+/g, " ").trim();
+  return text.length <= MAX_QUOTED_RULE_CHARS
+    ? text
+    : `${text.slice(0, MAX_QUOTED_RULE_CHARS)}…`;
+}
+
+/** Id of the question for the soft-deny rule at `index` (0-based). */
+function softDenyQuestionId(index: number): string {
+  return `soft_deny_${index + 1}`;
+}
+
+const SOFT_DENY_QUESTION_ID = /^soft_deny_(\d+)$/;
+
+/**
  * Intent questions, all phrased danger-side up (high probability = block),
  * so the model's danger direction is never mixed. Each question restates the
  * shared `CLASSIFIER_POLICY_CLAUSES` so Jev encodes the same policy as the LLM
  * classifier instead of a paraphrase of it.
+ *
+ * Each soft-deny rule gets its own question. Jev returns one probability per
+ * question and does not reason through "matches one of ten rules unless one of
+ * six exceptions applies", so a single combined question let one rule's wording
+ * (`ssh` in the remote-shell rule) raise the score for a read-only action.
+ * Authorization stays inside each rule question: judging the action alone
+ * blocked explicitly authorized force pushes and deletes (caveat 19). ALLOW
+ * exceptions are not sent to these questions, which only makes Jev stricter.
  */
 export function buildJevQuestions(config: EffectiveConfig): JevQuestions {
-  const envText = redactRules(config.environment);
-  const allowText = redactRules(config.allow);
-  const softText = redactRules(config.softDeny);
+  const envText = redactRules(classifierEnvironment(config));
   const hardText = redactRules(config.hardDeny);
-  const shared = `${CLASSIFIER_POLICY_CLAUSES.untrustedData} ` +
+  const shared = `${JEV_STATE_FIELDS} ` +
+    `${CLASSIFIER_POLICY_CLAUSES.untrustedData} ` +
     `${CLASSIFIER_POLICY_CLAUSES.securityNotQuality} ` +
     `${CLASSIFIER_POLICY_CLAUSES.allowByDefault}`;
-  return {
+  const questions: JevQuestions = {
     hard_deny: {
       type: "noul",
       instructions:
@@ -168,52 +206,64 @@ export function buildJevQuestions(config: EffectiveConfig): JevQuestions {
         `Trusted environment:\n- ${envText}\nHARD_DENY:\n- ${hardText}\n` +
         shared,
     },
-    soft_deny_uncovered: {
+  };
+  config.softDeny.forEach((rule, index) => {
+    questions[softDenyQuestionId(index)] = {
       type: "noul",
       instructions:
-        "The described action matches a SOFT_DENY rule that is not covered. " +
-        `${CLASSIFIER_POLICY_CLAUSES.softDenyAuthorization} ` +
-        `${CLASSIFIER_POLICY_CLAUSES.fileAuthorizationBounds} ` +
+        "The action does what this SOFT_DENY rule describes, and no direct user " +
+        "authorization in user_request covers it. " +
+        `SOFT_DENY rule: ${redactSecrets(rule)} ` +
         `${CLASSIFIER_POLICY_CLAUSES.otherSoftDenyAuthorization} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.fileAuthorizationBounds} ` +
         `${CLASSIFIER_POLICY_CLAUSES.authorizationRevocation} ` +
-        `${CLASSIFIER_POLICY_CLAUSES.allowNeverOverridesHardDeny} ` +
-        `SOFT_DENY:\n- ${softText}\nALLOW:\n- ${allowText}\n` +
-        shared,
-    },
-    intent_mismatch: {
-      type: "noul",
-      instructions:
-        "The action exceeds, contradicts, or is not authorized by what the user " +
-        'actually asked in user_request. ' +
         `${CLASSIFIER_POLICY_CLAUSES.generalRequestsNotIntent} ` +
         shared,
-    },
-    scope_escape: {
-      type: "noul",
-      instructions:
-        "The action reaches outside the trusted repository, working tree, or " +
-        `trusted environment. Trusted environment:\n- ${envText}\n` +
-        shared,
-    },
+    };
+  });
+  questions.intent_mismatch = {
+    type: "noul",
+    instructions:
+      "The action exceeds, contradicts, or is not authorized by what the user " +
+      "actually asked in user_request. " +
+      `${CLASSIFIER_POLICY_CLAUSES.generalRequestsNotIntent} ` +
+      shared,
   };
+  questions.scope_escape = {
+    type: "noul",
+    instructions:
+      "The action reaches outside the trusted repository, working tree, or " +
+      `trusted environment. Trusted environment:\n- ${envText}\n` +
+      shared,
+  };
+  return questions;
 }
 
+export type JevStateInput = {
+  action: string;
+  /** The user's own turns, from `buildClassifierTranscriptParts`. */
+  userRequest: string;
+  /** The agent's recent tool calls, from `buildClassifierTranscriptParts`. */
+  recentActions: string;
+  /** Parser facts from `describeActionFacts`. */
+  facts: string;
+  loadedContext: string;
+};
+
 /**
- * Build the Jev `state`. Every field is redacted. The transcript is already
- * token-bounded by `maxUserTranscriptTokens`/`maxToolTranscriptTokens`, and
- * `loadedContext` is already per-file bounded upstream, so neither is re-bounded
- * here; an oversized action fails closed at the endpoint instead of being
- * truncated.
+ * Build the Jev `state`. Every field is redacted. The transcript parts are
+ * already token-bounded by `maxUserTranscriptTokens`/`maxToolTranscriptTokens`,
+ * and `loadedContext` is already per-file bounded upstream, so neither is
+ * re-bounded here; an oversized action fails closed at the endpoint instead of
+ * being truncated.
  */
-export function buildJevState(
-  action: string,
-  intent: string,
-  loadedContext: string,
-): Record<string, string> {
+export function buildJevState(input: JevStateInput): Record<string, string> {
   return {
-    action: redactSecrets(action),
-    user_request: redactSecrets(intent) || "(none)",
-    project_instructions: redactSecrets(loadedContext) || "(none)",
+    action: redactSecrets(input.action),
+    user_request: redactSecrets(input.userRequest) || "(none)",
+    recent_actions: redactSecrets(input.recentActions) || "(none)",
+    facts: redactSecrets(input.facts) || "(none)",
+    project_instructions: redactSecrets(input.loadedContext) || "(none)",
   };
 }
 
@@ -284,6 +334,54 @@ export function missingJevAnswers(
   return Object.keys(questions).filter((id) => typeof scores[id] !== "number");
 }
 
+export type JevGateScores = {
+  hard: number;
+  /** The highest `soft_deny_<n>` score, or 0 with no soft-deny rules. */
+  softRule: number;
+  /** The 1-based rule behind `softRule`, or undefined with no soft-deny rules. */
+  softRuleNumber?: number;
+  intent: number;
+  scope: number;
+  /** The soft-deny band: `max(softRule, intent)`. */
+  soft: number;
+};
+
+/**
+ * The gate values `jevDecision` compares against its thresholds. Exported so
+ * calibration tooling measures exactly what the classifier gates on.
+ */
+export function jevGateScores(
+  scores: Record<string, number>,
+  questions: JevQuestions,
+): JevGateScores {
+  const hard = scores.hard_deny ?? 0;
+  const intent = scores.intent_mismatch ?? 0;
+  const scope = scores.scope_escape ?? 0;
+  // The highest-scoring soft-deny rule question, by rule number.
+  let softRule = 0;
+  let softRuleNumber: number | undefined;
+  for (const id of Object.keys(questions)) {
+    const match = SOFT_DENY_QUESTION_ID.exec(id);
+    if (!match) continue;
+    const score = scores[id] ?? 0;
+    if (softRuleNumber === undefined || score > softRule) {
+      softRule = score;
+      softRuleNumber = Number(match[1]);
+    }
+  }
+  // `scope_escape` is a supporting, non-parity signal. It is excluded from the
+  // soft-deny band and is advisory: it is reported but never blocks.
+  const soft = Math.max(softRule, intent);
+  return {
+    hard,
+    softRule,
+    ...(softRuleNumber === undefined ? {} : { softRuleNumber }),
+    intent,
+    scope,
+    soft,
+  };
+}
+
 /**
  * Map per-question probabilities onto pi-automode's decision + tier. Missing
  * scores fail closed, so a caller that skips `missingJevAnswers` cannot turn
@@ -303,28 +401,54 @@ export function jevDecision(
         `Jev: incomplete scores for ${missing.join(", ")}; auto mode fails closed.`,
     };
   }
-  const hard = scores.hard_deny ?? 0;
-  const softUncovered = scores.soft_deny_uncovered ?? 0;
-  const intent = scores.intent_mismatch ?? 0;
-  const scope = scores.scope_escape ?? 0;
-  // `scope_escape` is a supporting, non-parity signal. It is excluded from the
-  // soft-deny band, so it cannot lower the bar for `soft_deny_uncovered` or
-  // `intent_mismatch`; it blocks only at its own higher threshold. Note that it
-  // can still block on its own once it reaches that threshold.
-  const soft = Math.max(softUncovered, intent);
-  const scopeGate = scope >= config.jevScopeEscapeThreshold;
+  const { hard, softRule, softRuleNumber, intent, scope, soft } = jevGateScores(
+    scores,
+    questions,
+  );
   // Label the components and the gating value separately: a block driven by
-  // `intent_mismatch` would otherwise report the smaller `soft_deny_uncovered`
-  // under a bare "soft" label.
+  // `intent_mismatch` would otherwise report the smaller rule score under a
+  // bare "soft" label.
   const summary =
-    `hard=${hard.toFixed(2)} soft_uncov=${softUncovered.toFixed(2)} ` +
+    `hard=${hard.toFixed(2)} soft_rule=${softRule.toFixed(2)} (${
+      softRuleNumber === undefined ? "no rules" : `rule ${softRuleNumber}`
+    }) ` +
     `intent=${intent.toFixed(2)} scope=${scope.toFixed(2)} ` +
     `soft_gate=${soft.toFixed(2)}`;
+  // Name each gate that fired in words. The reason reaches the agent, the user's
+  // notification, and the soft-deny prompt, so a bare score line is not enough to
+  // act on.
+  const fired: string[] = [];
+  const scored = (label: string, score: number, threshold: number) =>
+    `${label} scored ${score.toFixed(2)} (threshold ${threshold.toFixed(2)})`;
   if (hard >= config.jevHardDenyThreshold) {
-    return { decision: "block", tier: "hard_deny", reason: `Jev: ${summary}` };
+    fired.push(
+      `${scored("hard_deny", hard, config.jevHardDenyThreshold)}: the action may match a HARD_DENY rule`,
+    );
   }
-  if (soft >= config.jevSoftDenyThreshold || scopeGate) {
-    return { decision: "block", tier: "soft_deny", reason: `Jev: ${summary}` };
+  if (softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold) {
+    const rule = config.softDeny[softRuleNumber - 1];
+    fired.push(
+      `${scored(`soft-deny rule ${softRuleNumber}`, softRule, config.jevSoftDenyThreshold)}${
+        rule === undefined ? "" : `: "${quoteRule(rule)}"`
+      }`,
+    );
+  }
+  if (intent >= config.jevSoftDenyThreshold) {
+    fired.push(
+      `${scored("intent_mismatch", intent, config.jevSoftDenyThreshold)}: the action may go beyond what the user asked`,
+    );
+  }
+  // `scope_escape` is advisory: it never blocks (caveat 20). At or above its
+  // threshold it is still named, so the user sees why the action looked risky.
+  const advisory = scope >= config.jevScopeEscapeThreshold
+    ? ` Advisory: scope_escape scored ${scope.toFixed(2)}: the action may reach outside the trusted environment (SSH hosts can be listed in autoMode.trustedHosts).`
+    : "";
+  const reason = `Jev: ${fired.join("; ")}.${advisory} Scores: ${summary}`;
+  if (hard >= config.jevHardDenyThreshold) {
+    return { decision: "block", tier: "hard_deny", reason };
+  }
+  if (soft >= config.jevSoftDenyThreshold) {
+    return { decision: "block", tier: "soft_deny", reason };
   }
   return {
     decision: "allow",
@@ -441,7 +565,8 @@ export function jevStatusText(
     `credential: ${credential}`,
     `hard deny threshold: ${config.jevHardDenyThreshold}`,
     `soft deny threshold: ${config.jevSoftDenyThreshold}`,
-    `scope escape threshold: ${config.jevScopeEscapeThreshold}`,
+    `scope escape threshold: ${config.jevScopeEscapeThreshold} (advisory; scope_escape never blocks)`,
+    `confirm soft deny: ${config.jevConfirmSoftDeny ? "on (asks in interactive sessions)" : "off"}`,
     `timeout: ${config.jevTimeoutMs}ms`,
     "ignored by this backend: classifierReasoningLevel, fastClassifierMaxTokens",
   ];
@@ -589,15 +714,17 @@ export async function defaultJevClassifyAction(
     backend: "jev",
     model,
   };
-  const intent = buildClassifierTranscript(ctx, {
+  const transcript = buildClassifierTranscriptParts(ctx, {
     maxUserTokens: config.maxUserTranscriptTokens,
     maxToolTokens: config.maxToolTranscriptTokens,
   });
-  const state = buildJevState(
+  const state = buildJevState({
     action,
-    intent,
+    userRequest: transcript.userRequest,
+    recentActions: transcript.recentActions,
+    facts: describeActionFacts(action, config.trustedHosts),
     loadedContext,
-  );
+  });
   const questions = buildJevQuestions(config);
   const cacheKey = createHash("sha256")
     .update(JSON.stringify({
@@ -725,11 +852,13 @@ export async function probeJevClassifier(
   const probes: JevProbe[] = [];
   let model = config.jevModel;
   for (const probe of PROBES) {
-    const state = buildJevState(
-      probe.action,
-      probe.request,
-      "",
-    );
+    const state = buildJevState({
+      action: probe.action,
+      userRequest: `User: ${probe.request}`,
+      recentActions: "",
+      facts: describeActionFacts(probe.action, config.trustedHosts),
+      loadedContext: "",
+    });
     const result = await requestJevScores(ctx, config, state, questions, deps);
     if (!result.ok) return { ok: false, reason: result.reason };
     model = result.model;

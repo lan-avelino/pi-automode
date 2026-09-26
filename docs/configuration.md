@@ -40,6 +40,24 @@ Higher levels can use all 512 or 1200 stage tokens before they produce visible o
 
 If a request stalls or exceeds its budget, pi-automode aborts it. Then auto mode fails closed and blocks the action.
 
+Under the Jev backend, `allow` exceptions do not reach the per-rule soft-deny questions, so they do not lift a soft deny. This makes Jev stricter than the LLM classifier for those actions. In an interactive session, `jevConfirmSoftDeny` lets you approve a single call; use `permissions.allow` for an action that Jev keeps blocking.
+
+## Trusted hosts
+
+`trustedHosts` lists SSH host names or aliases that the classifier should treat as part of the trusted environment:
+
+```json
+{
+  "autoMode": {
+    "trustedHosts": ["prod-proxy"]
+  }
+}
+```
+
+Both classifier backends receive the list as one extra trusted-environment line. The Jev backend also marks the parsed `ssh` target as `trusted=true` in its parser facts. A trusted host is only context for the classifier. It does not allow any command, and a write to a trusted host still matches the remote-shell soft-deny rule.
+
+Each entry must be one plain host name: no wildcards, `user@`, ports, or spaces. Invalid entries are dropped with a diagnostic. Matching is case-insensitive. The list has no built-in entries, so it needs no `$defaults`. It merges across global, project-local, and inline config. Shared project `.pi/automode.json` cannot add trusted hosts.
+
 ## Jev classifier backend
 
 `classifierBackend` selects the classifier stage: `"llm"` (default) or `"jev"`. The Jev backend replaces only the classifier stage and leaves every deterministic layer unchanged. Any Jev error fails closed.
@@ -53,10 +71,11 @@ The following keys apply only when `classifierBackend` is `"jev"`:
 | `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth. On a custom `jevBaseUrl`, the default variable is withheld and a custom variable must be named |
 | `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
 | `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
-| `jevSoftDenyThreshold` | `0.4` | Highest authorization-aware probability (`soft_deny_uncovered`, `intent_mismatch`) at or above which the action is blocked. The benign ceiling moves with the classifier transcript; see [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
-| `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which the action is blocked. Gated separately from the other soft-side questions |
+| `jevSoftDenyThreshold` | `0.55` | Highest soft-side probability at or above which the action is blocked: the highest per-rule `soft_deny_<n>` score or `intent_mismatch`. Jev asks one question per `soft_deny` rule, so each configured rule adds one question to every request. See [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
+| `jevConfirmSoftDeny` | `true` | In an interactive session, a Jev `soft_deny` block (a soft-deny rule or `intent_mismatch`) asks you to allow the one call instead of blocking outright. The prompt shows the reason and the action. Approval covers only that call. Hard denies, classifier failures, and headless runs never ask; if the prompt is cancelled or fails, the action is blocked |
+| `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which a block reason names it as advisory. `scope_escape` never blocks |
 
-`scope_escape` gates at its own threshold. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It has no LLM-classifier counterpart, and it never overrides `hard_deny`. Because it is a supporting signal, it never joins the soft-deny band and cannot lower the bar for `soft_deny_uncovered` or `intent_mismatch`. It can still block on its own once it reaches `jevScopeEscapeThreshold`, so an action that `soft_deny_uncovered` and `intent_mismatch` both clear is blocked if it also reaches that threshold.
+`scope_escape` is advisory. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment, and it has no LLM-classifier counterpart. It is logged and, at or above `jevScopeEscapeThreshold`, named in a block reason, but it never blocks: in the calibration sweep it blocked no violation that the soft-deny rules or `intent_mismatch` missed, while it blocked read-only remote queries, public GET requests, and declared installs.
 
 `classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
 
