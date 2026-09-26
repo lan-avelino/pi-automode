@@ -51,6 +51,8 @@ Under the Jev backend, `allow` exceptions do not reach the per-rule soft-deny qu
 - the same `ssh` host and the same remote commands under the same rules;
 - the same redirect targets.
 
+The option is offered only when the pattern is short enough to recur: at most 3 substantive commands (output trimmers such as `head -20`, `tail -n 50`, and `wc -l` do not count), no literal argument over 40 characters (paths and URLs up to 100), and at most 120 literal characters in total. Long `grep -E` regexes, `sed` scripts, inline SQL, and chains of marker `echo`s are one-off probes, so they get only **Allow once**. The prompt shows the pattern as a shell command, with `<n>` and `…` where values may differ.
+
 Only numbers in value positions may differ: a number after a flag (`-n 50`), a count flag (`head -20`), a `key=15` value, or a `timeout` duration. `--flag=value` values may also differ. Bare positional numbers stay exact, and every number stays exact for commands whose numbers are targets (`kill`, `chmod`, `chown`, `umask`, firewall tools), including behind `sudo`. Heredocs, nested shells (`bash -c`, `eval`), dynamic words, and compound shell syntax get no pattern, so only **Allow once** is offered.
 
 A session approval only replaces the soft-deny prompt. Permission rules, deterministic hard-deny checks, and a Jev `hard_deny` still apply. Approvals live in memory, are cleared when a session starts, and can be listed or cleared with `/automode approvals` and `/automode approvals clear`.

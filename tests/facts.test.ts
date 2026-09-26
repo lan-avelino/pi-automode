@@ -167,3 +167,96 @@ test("describeActionFacts returns none for non-bash or unreadable actions", () =
 		"",
 	);
 });
+
+// --- SQL -------------------------------------------------------------------
+
+function sqlLine(command: string): string | undefined {
+	return factMap(describeActionFacts(bash(command), ["prod-proxy"])).sql;
+}
+
+const VIA_DOCKER = "ssh prod-proxy 'sudo -n docker exec -i app_db psql -U app -d app -P pager=off' <<'SQL' 2>&1 | head -60";
+
+test("describeActionFacts reports read-only SQL sent to a database client", () => {
+	assert.equal(
+		sqlLine(`${VIA_DOCKER}\nSELECT date_trunc('day', created_at), count(*)\nFROM sessions -- recent\nWHERE created_at > now() - interval '3 days'\nGROUP BY 1;\nSQL`),
+		"client=psql statements=SELECT read_only=true",
+	);
+	assert.equal(
+		sqlLine("ssh prod-proxy 'sudo -n docker exec app_db psql -U app -d app -c \"\\d sessions\"'"),
+		"client=psql statements=\\d read_only=true",
+	);
+	assert.equal(
+		sqlLine(`${VIA_DOCKER}\n\\echo === counts ===\nWITH s AS (SELECT 1 AS n) SELECT n FROM s;\nEXPLAIN SELECT 1;\nSQL`),
+		"client=psql statements=\\echo, WITH, EXPLAIN read_only=true",
+	);
+	// A write word inside a string literal is data, not a statement.
+	assert.equal(
+		sqlLine(`${VIA_DOCKER}\nSELECT count(*) FROM audit WHERE action = 'delete' OR note = 'drop table x';\nSQL`),
+		"client=psql statements=SELECT read_only=true",
+	);
+	assert.equal(sqlLine("mysql -h db -e 'select count(*) from orders'"), "client=mysql statements=SELECT read_only=true");
+	// No database client, no sql line; naming a client is not running it.
+	assert.equal(sqlLine("ssh prod-proxy 'uptime'"), undefined);
+	assert.equal(sqlLine("ssh prod-proxy 'which psql; man mysql | head'"), undefined);
+	assert.equal(sqlLine("kubectl exec -i db-0 -- psql -U app -c 'select 1'"), "client=psql statements=SELECT read_only=true");
+});
+
+test("describeActionFacts never marks writing or unknown SQL read-only", () => {
+	for (const body of [
+		"DELETE FROM sessions WHERE created_at < now();",
+		"SELECT count(*) FROM sessions;\nDELETE FROM sessions WHERE user_id IS NULL;",
+		"UPDATE users SET role = 'admin';",
+		"TRUNCATE sessions;",
+		"WITH gone AS (DELETE FROM sessions RETURNING id) SELECT count(*) FROM gone;",
+		"SELECT * INTO sessions_copy FROM sessions;",
+		"SELECT pg_terminate_backend(1234);",
+		"EXPLAIN ANALYZE DELETE FROM sessions;",
+		"SELECT 1 FOR UPDATE;",
+		"\\copy sessions TO '/tmp/sessions.csv' CSV",
+		"\\! rm -rf /tmp/x",
+		"CALL cleanup();",
+	]) {
+		const line = sqlLine(`${VIA_DOCKER}\n${body}\nSQL`);
+		assert.match(line ?? "", /read_only=unverified$/, body);
+	}
+	// SQL that cannot be read.
+	assert.match(sqlLine("psql -U app -f cleanup.sql") ?? "", /read_only=unverified$/);
+	assert.match(sqlLine("psql -U app") ?? "", /read_only=unverified$/);
+	// An unquoted heredoc expands $(...) before psql sees it.
+	assert.match(
+		sqlLine("ssh prod-proxy 'psql -U app' <<SQL\nSELECT $(cat /tmp/q);\nSQL") ?? "",
+		/read_only=unverified$/,
+	);
+});
+
+test("a verified read-only SQL call through sudo and docker exec counts as read-only", () => {
+	const select = factMap(describeActionFacts(
+		bash(`${VIA_DOCKER}\nSELECT count(*) FROM sessions;\nSQL`),
+		["prod-proxy"],
+	));
+	assert.match(select.remote_shell!, /read_only=true$/);
+	assert.equal(select.read_only, "true");
+	const kubectl = factMap(describeActionFacts(
+		bash("kubectl exec -i -n prod db-0 -- psql -U app -c 'select 1'"),
+		[],
+	));
+	assert.equal(kubectl.read_only, "true");
+	for (const command of [
+		`${VIA_DOCKER}\nDELETE FROM sessions;\nSQL`,
+		// Only exec into an existing container; run starts one.
+		"docker run --rm postgres psql -h db -c 'select 1'",
+		// A sudo option outside the safe set.
+		"sudo -s psql -c 'select 1'",
+		// psql options that write files.
+		"psql -o /tmp/out.txt -c 'select 1'",
+		"psql -L /tmp/session.log -c 'select 1'",
+		"mysql --tee=/tmp/t.log -e 'select 1'",
+		// sqlite3 creates a missing database file.
+		"sqlite3 app.db 'select 1'",
+		// Unknown SQL.
+		"psql -f cleanup.sql",
+	]) {
+		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "unverified", command);
+	}
+});
+

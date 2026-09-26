@@ -829,7 +829,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         signature: ApprovalSignature | undefined,
       ): Promise<ReturnType<typeof block> | undefined> => {
         const allowOnce = "Allow once";
-        const allowSimilar = signature
+        // One-off commands would never match again, so "similar" is offered
+        // only for patterns short enough to recur.
+        const allowSimilar = signature?.recurs
           ? `Allow similar for this session: ${signature.description}`
           : undefined;
         const deny = "Deny";

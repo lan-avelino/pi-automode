@@ -132,6 +132,14 @@ test("a soft deny with no parser pattern offers only once and deny", async () =>
 	assert.deepEqual(web.prompts[0]!.options, [ONCE, DENY]);
 });
 
+test("a one-off command offers only once and deny", async () => {
+	const h = await harness({ answers: [ONCE] });
+	const probe =
+		"ssh prod-proxy 'sudo -n true 2>&1 && echo SUDO_NOPASS_OK || echo SUDO_NEEDS_PASS; echo ---; grep -n -B2 -A12 \"^  db:\" ~/proxy/docker-compose.yml | head -40'";
+	assert.equal(await h.run(probe), undefined);
+	assert.deepEqual(h.prompts[0]!.options, [ONCE, DENY]);
+});
+
 test("a dismissed, failing, or cancelled prompt blocks", async () => {
 	const dismissed = await harness({ answers: [undefined] });
 	const result = await dismissed.run(RESTART);

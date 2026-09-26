@@ -145,6 +145,273 @@ const WRITE_OPERATORS = new Set([">", ">>", ">|", "<>", "&>", "&>>"]);
 
 type ActionShape = { toolName?: unknown; input?: { command?: unknown } };
 
+// --- SQL -------------------------------------------------------------------
+
+const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3"]);
+/** Statements that start this way only read, unless a write word appears. */
+const SQL_READ_STARTS = new Set(["SELECT", "WITH", "SHOW", "EXPLAIN", "TABLE", "VALUES"]);
+/**
+ * Words that make a statement write, execute, or change session state. Checked
+ * anywhere in the statement, so `WITH … DELETE`, `SELECT … INTO`, `FOR UPDATE`,
+ * and `EXPLAIN ANALYZE` are all unverified. Conservative: a column named like
+ * one of these also makes the SQL unverified.
+ */
+const SQL_WRITE_WORDS =
+  /\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|COPY|CALL|DO|VACUUM|REINDEX|CLUSTER|REFRESH|LOCK|ANALYZE|INTO|SET|RESET|COMMENT|IMPORT|LOAD|ATTACH|DETACH|PRAGMA|NOTIFY|PREPARE|EXECUTE|KILL|SHUTDOWN|FLUSH|OUTFILE|DUMPFILE)\b/i;
+/** Functions with side effects or that read server files. */
+const SQL_SIDE_EFFECT_FUNCTIONS =
+  /\b(pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|pg_create_\w+|pg_drop_\w+|pg_advisory\w*|pg_sleep\w*|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|lo_unlink|set_config|nextval|setval|dblink\w*|load_file|sleep)\s*\(/i;
+/** psql meta-commands that only describe or format output. */
+const PSQL_READ_META = new Set([
+  "\\d", "\\dt", "\\dt+", "\\d+", "\\di", "\\dv", "\\dn", "\\du", "\\df", "\\l", "\\l+",
+  "\\echo", "\\x", "\\pset", "\\timing", "\\conninfo", "\\q", "\\t", "\\a", "\\encoding",
+]);
+/** sqlite3 dot-commands that only describe or format output. */
+const SQLITE_READ_DOT = new Set([".tables", ".schema", ".indexes", ".headers", ".mode", ".width"]);
+
+type SqlText = { text?: string; unknown?: string };
+
+/**
+ * The statement kinds in a SQL script and whether all of them only read.
+ * String literals and comments are removed first, so a write word in data does
+ * not count. Dollar-quoted bodies are not parsed and make the script unverified.
+ */
+function classifySql(script: string): { statements: string[]; readOnly: boolean } {
+  const statements: string[] = [];
+  let readOnly = true;
+  const kinds = (kind: string) => {
+    if (!statements.includes(kind)) statements.push(kind);
+  };
+  if (/\$[A-Za-z_]*\$/.test(script)) readOnly = false;
+  const cleaned = script
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/"(?:[^"]|"")*"/g, '""')
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ");
+  const sqlLines: string[] = [];
+  for (const line of cleaned.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("\\")) {
+      const meta = trimmed.split(/\s+/)[0]!;
+      kinds(meta);
+      if (!PSQL_READ_META.has(meta)) readOnly = false;
+      continue;
+    }
+    if (trimmed.startsWith(".")) {
+      const dot = trimmed.split(/\s+/)[0]!;
+      kinds(dot);
+      if (!SQLITE_READ_DOT.has(dot)) readOnly = false;
+      continue;
+    }
+    sqlLines.push(line);
+  }
+  for (const statement of sqlLines.join("\n").split(";")) {
+    const text = statement.trim();
+    if (text === "") continue;
+    const first = text.split(/[\s(]+/)[0]!.toUpperCase();
+    kinds(first);
+    if (
+      !SQL_READ_STARTS.has(first) ||
+      SQL_WRITE_WORDS.test(text) ||
+      SQL_SIDE_EFFECT_FUNCTIONS.test(text)
+    ) {
+      readOnly = false;
+    }
+  }
+  if (statements.length === 0) readOnly = false;
+  return { statements, readOnly };
+}
+
+/** SQL passed to a client on its command line. */
+function sqlFromClientArgs(client: string, args: string[]): SqlText[] {
+  const texts: SqlText[] = [];
+  const valueOf = (index: number, long: string) => {
+    const arg = args[index]!;
+    return arg.startsWith(`${long}=`) ? arg.slice(long.length + 1) : args[index + 1];
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (client === "psql" && (arg === "-c" || arg === "--command" || arg.startsWith("--command="))) {
+      texts.push({ text: valueOf(index, "--command") ?? "" });
+    } else if (client === "psql" && (arg === "-f" || arg === "--file" || arg.startsWith("--file="))) {
+      texts.push({ unknown: "(file)" });
+    } else if (
+      (client === "mysql" || client === "mariadb") &&
+      (arg === "-e" || arg === "--execute" || arg.startsWith("--execute="))
+    ) {
+      texts.push({ text: valueOf(index, "--execute") ?? "" });
+    }
+  }
+  if (client === "sqlite3") {
+    const positional = args.filter((arg) => !arg.startsWith("-"));
+    if (positional.length > 1) texts.push({ text: positional.slice(1).join(" ") });
+  }
+  return texts;
+}
+
+/** SQL fed on stdin by a heredoc or here-string. */
+function sqlFromRedirects(command: BashCommandAnalysis): SqlText[] {
+  return command.redirects.flatMap((redirect): SqlText[] => {
+    if (redirect.heredoc) {
+      const body = redirect.heredocContent ?? "";
+      // An unquoted heredoc expands $(...) and backticks before the client runs.
+      if (!redirect.heredocQuoted && /\$\(|`|\$\{?[A-Za-z_]/.test(body)) {
+        return [{ unknown: "(expanded heredoc)" }];
+      }
+      return [{ text: body }];
+    }
+    if (redirect.operator === "<<<") {
+      return redirect.targetDynamic ? [{ unknown: "(expanded here-string)" }] : [{ text: redirect.target ?? "" }];
+    }
+    if (redirect.operator === "<") return [{ unknown: "(file)" }];
+    return [];
+  });
+}
+
+/** Commands that run another command given as their arguments. */
+const COMMAND_WRAPPERS = new Set(["sudo", "doas", "docker", "podman", "kubectl", "env", "nice", "nohup", "time"]);
+
+/** The database client a command runs, directly or behind a wrapper such as sudo or docker exec. */
+function sqlClient(command: BashCommandAnalysis): { client: string; args: string[] } | undefined {
+  const name = command.effectiveCommand.name;
+  const args = command.effectiveCommand.args;
+  if (name && SQL_CLIENTS.has(name)) return { client: name, args };
+  // `which psql` names a client without running it.
+  if (!name || !COMMAND_WRAPPERS.has(name)) return undefined;
+  const index = args.findIndex((arg) => SQL_CLIENTS.has(arg.split("/").pop() ?? ""));
+  if (index < 0) return undefined;
+  return { client: args[index]!.split("/").pop()!, args: args.slice(index + 1) };
+}
+
+/** Client options that write local files. */
+const SQL_CLIENT_WRITE_OPTIONS = /^(-o|--output|-L|--log-file|--tee|-f|--file)(=|$)/;
+
+/**
+ * Skip `[sudo|doas [-n] [-u U] [-g G]] [docker|podman exec OPTS CONTAINER |
+ * kubectl exec OPTS POD [--]]` and return the index of the database client, or
+ * -1 when any word falls outside that exact shape.
+ */
+function sqlClientIndex(words: string[]): number {
+  let index = 0;
+  const take = (flags: Set<string>, valueFlags: Set<string>): boolean => {
+    while (index < words.length && words[index]!.startsWith("-")) {
+      const word = words[index]!;
+      if (word === "--") return true;
+      const bare = word.split("=")[0]!;
+      if (flags.has(word)) index += 1;
+      else if (valueFlags.has(bare)) index += word.includes("=") ? 1 : 2;
+      else return false;
+    }
+    return true;
+  };
+  if (words[index] === "sudo" || words[index] === "doas") {
+    index += 1;
+    if (!take(new Set(["-n"]), new Set(["-u", "-g"]))) return -1;
+  }
+  const tool = words[index];
+  if (tool === "docker" || tool === "podman") {
+    if (words[index + 1] !== "exec") return -1;
+    index += 2;
+    if (
+      !take(
+        new Set(["-i", "-t", "-it", "-ti", "--interactive", "--tty"]),
+        new Set(["-u", "--user", "-e", "--env", "-w", "--workdir"]),
+      )
+    ) return -1;
+    index += 1; // container
+  } else if (tool === "kubectl") {
+    if (words[index + 1] !== "exec") return -1;
+    index += 2;
+    if (
+      !take(
+        new Set(["-i", "-t", "-it", "-ti", "--stdin", "--tty"]),
+        new Set(["-n", "--namespace", "-c", "--container", "--context"]),
+      )
+    ) return -1;
+    index += 1; // pod
+    if (words[index] === "--") index += 1;
+  }
+  const client = words[index]?.split("/").pop();
+  return client === "psql" || client === "mysql" || client === "mariadb" ? index : -1;
+}
+
+/**
+ * True when a command is exactly a database client call, possibly behind the
+ * wrappers `sqlClientIndex` accepts, with no file-writing client options and
+ * with SQL that `classifySql` verifies as read-only. sqlite3 is never claimed:
+ * opening a missing database file creates it.
+ */
+function sqlCallIsReadOnly(command: BashCommandAnalysis, stdin: SqlText[]): boolean {
+  if (command.dynamic) return false;
+  const name = command.effectiveCommand.name;
+  if (!name) return false;
+  const words = [name, ...command.effectiveCommand.args];
+  const index = sqlClientIndex(words);
+  if (index < 0) return false;
+  const client = words[index]!.split("/").pop()!;
+  const clientArgs = words.slice(index + 1);
+  if (clientArgs.some((arg) => SQL_CLIENT_WRITE_OPTIONS.test(arg))) return false;
+  const texts = [
+    ...sqlFromClientArgs(client, clientArgs),
+    ...sqlFromRedirects(command),
+    ...stdin,
+  ];
+  if (texts.length === 0) return false;
+  return texts.every((text) => text.unknown === undefined && classifySql(text.text ?? "").readOnly);
+}
+
+function sqlFact(client: string, texts: SqlText[], dynamic: boolean): string {
+  const statements: string[] = [];
+  let readOnly = !dynamic && texts.length > 0;
+  for (const text of texts) {
+    if (text.unknown !== undefined) {
+      statements.push(text.unknown);
+      readOnly = false;
+      continue;
+    }
+    const result = classifySql(text.text ?? "");
+    for (const statement of result.statements) {
+      if (!statements.includes(statement)) statements.push(statement);
+    }
+    readOnly &&= result.readOnly;
+  }
+  return `sql: client=${client} statements=${statements.join(", ") || "(none)"} read_only=${
+    readOnly ? "true" : "unverified"
+  }`;
+}
+
+/** One `sql:` fact per database client call, local or behind ssh. */
+function sqlFacts(commands: BashCommandAnalysis[]): string[] {
+  const facts: string[] = [];
+  for (const command of commands) {
+    const unwrapped = unwrapTimeout(command.effectiveCommand.name, command.effectiveCommand.args);
+    if (unwrapped.name === "ssh") {
+      const { remoteSource } = parseSshArgs(unwrapped.args);
+      if (remoteSource.trim() === "") continue;
+      // A local heredoc on ssh is the remote command's stdin.
+      const stdin = sqlFromRedirects(command);
+      for (const remote of analyzeBash(remoteSource).commands) {
+        const found = sqlClient(remote);
+        if (!found) continue;
+        facts.push(sqlFact(
+          found.client,
+          [...sqlFromClientArgs(found.client, found.args), ...sqlFromRedirects(remote), ...stdin],
+          command.dynamic || remote.dynamic,
+        ));
+      }
+      continue;
+    }
+    const found = sqlClient(command);
+    if (!found) continue;
+    facts.push(sqlFact(
+      found.client,
+      [...sqlFromClientArgs(found.client, found.args), ...sqlFromRedirects(command)],
+      command.dynamic,
+    ));
+  }
+  return facts;
+}
+
 type RemoteShell = {
   host?: string;
   commands: string[];
@@ -243,7 +510,11 @@ export function parseSshArgs(args: string[]): SshInvocation {
   };
 }
 
-function analyzeSsh(args: string[]): RemoteShell {
+/**
+ * `stdin` is SQL fed to the ssh command itself (a local heredoc), which the
+ * remote command reads.
+ */
+function analyzeSsh(args: string[], stdin: SqlText[] = []): RemoteShell {
   const { host, remoteSource, optionsSafe } = parseSshArgs(args);
   if (!host || remoteSource.trim() === "") {
     return { host, commands: [], readOnly: false };
@@ -255,13 +526,14 @@ function analyzeSsh(args: string[]): RemoteShell {
   const readOnly = optionsSafe &&
     remote.errors.length === 0 &&
     fileWriteTargets(remote.commands).length === 0 &&
-    remote.commands.every((command) => commandIsReadOnly(command, false));
+    remote.commands.every((command) => commandIsReadOnly(command, false, stdin));
   return { host, commands, readOnly };
 }
 
 function commandIsReadOnly(
   command: BashCommandAnalysis,
   allowRemoteShell: boolean,
+  stdin: SqlText[] = [],
 ): boolean {
   if (command.dynamic || command.effectiveCommand.unresolvedTransparentDispatch) {
     return false;
@@ -271,7 +543,10 @@ function commandIsReadOnly(
     command.effectiveCommand.args,
   );
   if (!name) return false;
-  if (name === "ssh") return allowRemoteShell && analyzeSsh(args).readOnly;
+  if (name === "ssh") {
+    return allowRemoteShell && analyzeSsh(args, sqlFromRedirects(command)).readOnly;
+  }
+  if (sqlCallIsReadOnly(command, stdin)) return true;
   if (name === "curl") return curlIsReadOnly(args);
   return READ_ONLY_COMMANDS.has(name) && !hasUnsafeArgument(name, args);
 }
@@ -320,7 +595,7 @@ export function describeActionFacts(
       bashCommand.effectiveCommand.args,
     );
     if (unwrapped.name !== "ssh") continue;
-    const remote = analyzeSsh(unwrapped.args);
+    const remote = analyzeSsh(unwrapped.args, sqlFromRedirects(bashCommand));
     const verified = remote.readOnly && !bashCommand.dynamic;
     remoteShells += 1;
     remoteReadOnly &&= verified;
@@ -339,6 +614,7 @@ export function describeActionFacts(
       `write_location: local only: the local shell writes ${writes.join(", ")} on this machine; the remote command writes nothing`,
     );
   }
+  lines.push(...sqlFacts(analysis.commands));
   const readOnly = writes.length === 0 &&
     analysis.commands.length > 0 &&
     analysis.commands.every((c) => commandIsReadOnly(c, true));

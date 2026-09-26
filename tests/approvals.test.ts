@@ -90,6 +90,48 @@ test("approvalSignature describes the pattern with numbers and option values eli
 	);
 });
 
+test("approvalSignature shows redirects, whitespace, tildes, and nested quotes as written", () => {
+	const describe = (command: string) => approvalSignature(bash(command))?.description;
+	// The file descriptor is part of the redirect: 2> is not >.
+	assert.equal(describe("ss -lntp 2>/dev/null | head -30"), "ss -lntp 2> /dev/null | head <n>");
+	assert.equal(describe("make build 2>&1 | tail -n 5"), "make build 2>&1 | tail -n <n>");
+	// Whitespace inside an argument is kept.
+	assert.equal(describe("grep -n '^  db:' compose.yml"), "grep -n '^  db:' compose.yml");
+	// A leading ~ expands in the shell, so it is shown bare.
+	assert.equal(describe("ls ~/litellm/"), "ls ~/litellm/");
+	// `;` reads as a separator, not a word.
+	assert.equal(describe("hostname; uptime"), "hostname; uptime");
+	// A remote command containing single quotes is shown in double quotes.
+	assert.equal(
+		describe(`ssh web-1 "grep -n 'a  b' ~/app.log"`),
+		`ssh web-1 "grep -n 'a  b' ~/app.log"`,
+	);
+});
+
+test("similar approvals are offered only for patterns short enough to recur", () => {
+	const recurs = (command: string) => approvalSignature(bash(command))?.recurs;
+	for (const command of [
+		"ssh web-1 'sudo systemctl restart nginx'",
+		"tail -n 50 /Volumes/Data/projects/example-service/logs/application.log",
+		"ssh web-1 'hostname; whoami; ls ~/app/ | head -20' 2>&1 | head -30",
+		"journalctl -u nginx --since=10m | tail -n 100 | wc -l",
+		"ssh web-1 'curl -s -D - -o /dev/null http://localhost:4000/metrics'",
+	]) {
+		assert.equal(recurs(command), true, command);
+	}
+	for (const command of [
+		// Too many substantive commands (the output trimmers do not count).
+		"ssh web-1 'ss -lntp 2>/dev/null | head -30; echo ---PSQL---; which psql; echo ---; grep -n -i -m5 DATABASE_URL ~/app/compose.yml'",
+		// A long literal payload: a regex, a script, or SQL.
+		"curl -s http://localhost:4000/metrics/ | grep -E '^litellm_deployment_(total|success|failure)_requests_total'",
+		"psql -c 'select model, count(*) from spend_logs where start_time > now() group by 1'",
+		// A path over the path limit.
+		`cat /srv/${"deep/".repeat(22)}file.log`,
+	]) {
+		assert.equal(recurs(command), false, command);
+	}
+});
+
 test("approvalSignature offers no pattern for actions it cannot pin down", () => {
 	for (const command of [
 		"ls $(pwd)",
