@@ -11,7 +11,7 @@ For each Pi `tool_call` event, the extension does this:
 3. If the agent turn was cancelled, block the call.
 4. Block a matching `permissions.deny` rule.
 5. If a `permissions.ask` rule matches, ask the user.
-6. If the user declines or no UI is available, block the call.
+6. If the user declines, or there is no interactive terminal (`ctx.mode` is not `tui`, for example a pi-subagents child in RPC mode), block the call.
 7. Mark an accepted ask call for required classifier review.
 8. Run deterministic hard-deny checks.
 9. If no accepted ask rule requires review, let the extension-owned `automode_inspect` tool run locally.

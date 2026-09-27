@@ -29,6 +29,7 @@ async function harness(options: {
 	config?: Partial<EffectiveConfig>;
 	decisions?: ClassifyResult[];
 	hasUI?: boolean;
+	mode?: string;
 	answers?: Answer[];
 	llm?: boolean;
 } = {}) {
@@ -41,7 +42,10 @@ async function harness(options: {
 		classifyAction: async () => next(),
 		jevClassifyAction: async () => next(),
 	})(fake.pi);
-	const ctx = createFakeCtx(fake.entries, { hasUI: options.hasUI ?? true });
+	const ctx = createFakeCtx(fake.entries, {
+		hasUI: options.hasUI ?? true,
+		mode: options.mode ?? "tui",
+	});
 	const prompts: Prompt[] = [];
 	const answers = [...(options.answers ?? [])];
 	(ctx.ui as Record<string, unknown>).select = async (title: string, choices: string[]) => {
@@ -170,3 +174,39 @@ test("hard denies, classifier failures, headless runs, and the LLM backend never
 		assert.equal(result?.block, true, name);
 	}
 });
+
+test("subagents and other non-terminal modes block a soft deny instead of waiting for an answer", async () => {
+	// pi reports hasUI in RPC mode, but a subagent's RPC client never answers a
+	// dialog, so prompting would hang the subagent.
+	for (const mode of ["rpc", "json", "print"]) {
+		const h = await harness({ mode, answers: [ONCE] });
+		const result = await h.run(RESTART);
+		assert.equal(h.prompts.length, 0, mode);
+		assert.equal(result?.block, true, mode);
+		assert.match(result?.reason ?? "", /Not asked: no interactive terminal\./, mode);
+	}
+});
+
+test("permissions.ask blocks in non-terminal modes instead of waiting for an answer", async () => {
+	const fake = createFakePi();
+	const { parseToolPattern } = await import("../extensions/auto-mode.ts");
+	createPiAutomode({
+		loadConfig: () => baseConfig({ permissionAsk: [parseToolPattern("bash(ssh *)")!] }),
+		classifyAction: async () => ({ decision: "allow", tier: "none", reason: "ok" }),
+	})(fake.pi);
+	const ctx = createFakeCtx(fake.entries, { hasUI: true, mode: "rpc" });
+	let asked = 0;
+	ctx.ui.confirm = async () => {
+		asked += 1;
+		return true;
+	};
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+	const result = await fake.emit("tool_call", { toolName: "bash", input: { command: "ssh web-1 uptime" } }, ctx) as {
+		block?: boolean;
+		reason?: string;
+	};
+	assert.equal(asked, 0);
+	assert.equal(result.block, true);
+	assert.match(result.reason ?? "", /no interactive terminal/);
+});
+

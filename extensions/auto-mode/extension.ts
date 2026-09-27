@@ -147,6 +147,15 @@ export type PiAutomodeOptions = {
 
 type PersistableSettingKey = GlobalAutoModeSettingKey;
 
+/**
+ * True only when a person can answer a dialog. pi reports `hasUI` in RPC mode
+ * too, but an RPC client such as a pi-subagents child never answers, so a
+ * prompt there would block the agent forever.
+ */
+function canAskUser(ctx: ExtensionContext): boolean {
+  return ctx.hasUI && ctx.mode === "tui";
+}
+
 type LogCtx = {
   logger: Logger;
   decisionId: string;
@@ -603,7 +612,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         ) {
           continue;
         }
-        if (!ctx.hasUI) {
+        if (!canAskUser(ctx)) {
           const matchedCommand = matchedCommandSummary(
             matchingBashCommandText(pattern, bashAnalysis),
           );
@@ -614,7 +623,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             reason:
               `Matched permissions.ask (${pattern.raw})${
                 matchedCommand ? ` for command: ${matchedCommand}` : ""
-              } but no UI is available`,
+              } but no interactive terminal is available`,
             action: summary,
             kind: "permissions.ask",
           }, logCtx);
@@ -899,7 +908,15 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             logCtx,
           );
         }
-        if (ctx.hasUI) return await askSoftDeny(signature);
+        if (canAskUser(ctx)) return await askSoftDeny(signature);
+        state.classifierDenied += 1;
+        return block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason: `${decision.reason} Not asked: no interactive terminal.`,
+          action: summary,
+          kind: "classifier",
+        }, logCtx);
       }
 
       state.classifierDenied += 1;
