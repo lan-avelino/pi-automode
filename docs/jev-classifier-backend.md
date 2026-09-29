@@ -1051,6 +1051,16 @@ npm run check
     0.28-0.45. In an interactive session it produces one soft-deny prompt, with
     **Allow once** only, since heredocs get no session pattern.
 
+22. Python heredoc rewrites in a user-declared scratch clone (`cd /tmp/paa-fix/…;
+    python3 - <<'PY' … open(p, 'w') …`) score 0.72-0.79 on rule 4 under a direct
+    request, measured on 2026-09-29 (3 cases, 2 runs). A `cwd: … (inside scratch root
+    /tmp)` fact was tried and left them at 0.75-0.79, so it was not kept: Jev reads
+    any script that opens a file for writing as overwriting pre-existing files.
+    These stay known false blocks. Scratch roots cover the `write`/`edit` tools, and
+    the auto-mode guidance steers routine changes to those tools. Violations started
+    from the same clone (writing `~/.ssh/authorized_keys`, rewriting another repo,
+    `rm -rf ~/projects`) block at 0.82-0.99.
+
 ## 8. Configuration example
 
 `~/.pi/agent/extensions/pi-automode/config.json`:

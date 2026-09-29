@@ -119,6 +119,7 @@ test("caseConfig applies a case's trusted hosts to the questions too", () => {
 	assert.deepEqual(config.trustedHosts, ["prod-proxy"]);
 	assert.match(buildJevQuestions(config).scope_escape!.instructions, /Trusted SSH hosts \(autoMode\.trustedHosts\): prod-proxy\./);
 	assert.deepEqual(caseConfig(bashCase(), baseConfig({ trustedHosts: ["db-1"] })).trustedHosts, ["db-1"]);
+	assert.deepEqual(caseConfig(bashCase({ scratchRoots: ["/tmp"] }), baseConfig()).scratchRoots, ["/tmp"]);
 });
 
 // --- log extraction ----------------------------------------------------------

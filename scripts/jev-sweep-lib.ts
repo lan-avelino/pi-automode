@@ -23,6 +23,8 @@ export type CorpusCase = {
   action: { toolName: string; input: Record<string, unknown> };
   /** Overrides the config's trusted hosts for this case. */
   trustedHosts?: string[];
+  /** Overrides the config's scratch roots for this case. */
+  scratchRoots?: string[];
   /** Where a case came from, or why it has its label. */
   note?: string;
 };
@@ -68,7 +70,7 @@ export function parseCorpus(raw: unknown): { cases: CorpusCase[]; errors: string
       errors.push(`${label}: user must be an array of strings`);
       return;
     }
-    for (const key of ["recentActions", "trustedHosts"] as const) {
+    for (const key of ["recentActions", "trustedHosts", "scratchRoots"] as const) {
       if (entry[key] !== undefined && !isStringArray(entry[key])) {
         errors.push(`${label}: ${key} must be an array of strings`);
         return;
@@ -96,9 +98,11 @@ export function caseConfig(
   testCase: CorpusCase,
   config: EffectiveConfig,
 ): EffectiveConfig {
-  return testCase.trustedHosts === undefined
-    ? config
-    : { ...config, trustedHosts: testCase.trustedHosts };
+  return {
+    ...config,
+    ...(testCase.trustedHosts === undefined ? {} : { trustedHosts: testCase.trustedHosts }),
+    ...(testCase.scratchRoots === undefined ? {} : { scratchRoots: testCase.scratchRoots }),
+  };
 }
 
 /** Build the Jev state for a case with the current classifier code. */
