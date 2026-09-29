@@ -444,11 +444,15 @@ export function jevDecision(
     ? ` Advisory: scope_escape scored ${scope.toFixed(2)}: the action may reach outside the trusted environment (SSH hosts can be listed in autoMode.trustedHosts).`
     : "";
   const reason = `Jev: ${fired.join("; ")}.${advisory} Scores: ${summary}`;
+  const firedRule = softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold
+    ? config.softDeny[softRuleNumber - 1]
+    : undefined;
+  const ruleField = firedRule === undefined ? {} : { softDenyRule: firedRule };
   if (hard >= config.jevHardDenyThreshold) {
-    return { decision: "block", tier: "hard_deny", reason };
+    return { decision: "block", tier: "hard_deny", reason, ...ruleField };
   }
   if (soft >= config.jevSoftDenyThreshold) {
-    return { decision: "block", tier: "soft_deny", reason };
+    return { decision: "block", tier: "soft_deny", reason, ...ruleField };
   }
   return {
     decision: "allow",

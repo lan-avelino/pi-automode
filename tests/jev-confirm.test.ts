@@ -276,3 +276,46 @@ test("session folder approvals are cleared when a session starts", async () => {
 	}
 });
 
+
+// --- decline hint --------------------------------------------------------------
+
+import { DEFAULT_SOFT_DENY } from "../extensions/auto-mode.ts";
+
+const OVERWRITE_RULE = DEFAULT_SOFT_DENY[3]!;
+const RULE4_BLOCK: ClassifyResult = {
+	decision: "block",
+	tier: "soft_deny",
+	reason: "Jev: soft-deny rule 4 scored 0.78 (threshold 0.55). Scores: …",
+	softDenyRule: OVERWRITE_RULE,
+};
+const SCRIPT = "cd /tmp/paa-fix/skills && python3 - <<'PY'\ns = open('a.js').read()\nopen('a.js', 'w').write(s.replace('x', 'y'))\nPY";
+const HINT = /Hint: .*edit and write tools .*\/tmp/;
+
+test("a declined overwrite-rule block on a script in a scratch root tells the agent to use the edit tools", async () => {
+	const declined = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { scratchRoots: ["/tmp"] } });
+	assert.match((await declined.run(SCRIPT))?.reason ?? "", HINT);
+	// A subagent that could not ask gets the same hint.
+	const headless = await harness({ decisions: [RULE4_BLOCK], mode: "rpc", config: { scratchRoots: ["/tmp"] } });
+	assert.match((await headless.run(SCRIPT))?.reason ?? "", HINT);
+	// So does a script in the project when in-tree edits are allowed.
+	const inTree = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { allowInsideWorkingDirectory: true } });
+	assert.match((await inTree.run("python3 fix.py src/a.js"))?.reason ?? "", /Hint: .*\/tmp\/project/);
+});
+
+test("the decline hint appears only for that rule, that tool, and an allowed location", async () => {
+	const cases: Array<[string, Parameters<typeof harness>[0], string]> = [
+		["another rule", { decisions: [{ ...RULE4_BLOCK, softDenyRule: DEFAULT_SOFT_DENY[5]! }], config: { scratchRoots: ["/tmp"] } }, SCRIPT],
+		["intent only", { decisions: [{ ...RULE4_BLOCK, softDenyRule: undefined }], config: { scratchRoots: ["/tmp"] } }, SCRIPT],
+		["no allowed location", { decisions: [RULE4_BLOCK] }, SCRIPT],
+		["script outside the roots", { decisions: [RULE4_BLOCK], config: { scratchRoots: ["/tmp"] } }, "cd /Volumes/work/repo && python3 fix.py"],
+		["cd out of the project", { decisions: [RULE4_BLOCK], config: { allowInsideWorkingDirectory: true } }, "cd /Volumes/work/repo && python3 fix.py"],
+	];
+	for (const [name, options, command] of cases) {
+		const h = await harness({ ...options, answers: [DENY] });
+		const reason = (await h.run(command))?.reason ?? "";
+		assert.doesNotMatch(reason, /Hint:/, name);
+	}
+	// An edit-tool block gets no hint; it is already the edit tool.
+	const edit = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { scratchRoots: ["/tmp"] } });
+	assert.doesNotMatch((await edit.run("/Volumes/work/a.js", "edit"))?.reason ?? "", /Hint:/);
+});

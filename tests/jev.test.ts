@@ -281,6 +281,7 @@ test("jevDecision gates on the highest-scoring soft-deny rule and names it", () 
 		tier: "soft_deny",
 		reason:
 			'Jev: soft-deny rule 2 scored 0.87 (threshold 0.55): "RULE_TWO". Scores: hard=0.05 soft_rule=0.87 (rule 2) intent=0.10 scope=0.10 soft_gate=0.87',
+		softDenyRule: "RULE_TWO",
 	});
 	// Every rule question is required; one missing answer fails closed.
 	const missing = jevDecision(
@@ -290,6 +291,17 @@ test("jevDecision gates on the highest-scoring soft-deny rule and names it", () 
 	);
 	assert.equal(missing.decision, "block");
 	assert.match(missing.reason, /incomplete scores for soft_deny_2/);
+});
+
+test("jevDecision reports the text of the soft-deny rule that fired", () => {
+	const config = baseConfig({ softDeny: ["RULE_ONE", "RULE_TWO"] });
+	const questions = buildJevQuestions(config);
+	const fired = jevDecision({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.8, intent_mismatch: 0, scope_escape: 0 }, config, questions);
+	assert.equal(fired.softDenyRule, "RULE_TWO");
+	// Intent alone blocks without naming a rule.
+	const intent = jevDecision({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.1, intent_mismatch: 0.9, scope_escape: 0 }, config, questions);
+	assert.equal(intent.decision, "block");
+	assert.equal(intent.softDenyRule, undefined);
 });
 
 test("with no soft-deny rules the soft gate is intent_mismatch alone", () => {

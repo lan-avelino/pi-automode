@@ -73,6 +73,8 @@ Protected paths inside a scratch root still reach the classifier, matched relati
 
 A Jev soft-deny prompt for a `write` or `edit` also offers **Allow edits under FOLDER for this session**, where FOLDER is the git repository containing the file, or else the file's folder. Choosing it makes that folder a scratch root until the session starts again, with the same exceptions. It is listed by `/automode approvals` and removed by `/automode approvals clear`. The option is not offered when the folder would be an invalid scratch root, such as the home directory.
 
+If you decline a Jev soft deny for a `bash` script on the file-overwrite rule, and the script works under a scratch root, a session folder, or the project folder with `allowInsideWorkingDirectory`, the block message tells the agent that the edit and write tools are allowed there, so it can redo the change with them. Blocks on any other rule, other tools, and scripts elsewhere get no hint.
+
 Each entry must be an absolute or `~/` path. `/`, `~`, and any directory that contains the home directory are rejected with a diagnostic, because they would switch off review for nearly everything. Entries merge across global, project-local, and inline config; shared project `.pi/automode.json` cannot add scratch roots.
 
 ## Trusted hosts

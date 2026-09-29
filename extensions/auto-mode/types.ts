@@ -185,6 +185,8 @@ export type ClassificationDecision = {
   decision: "allow" | "block";
   tier: "hard_deny" | "soft_deny" | "allow" | "explicit_intent" | "none";
   reason: string;
+  /** Jev only: the text of the soft-deny rule whose question crossed the threshold. */
+  softDenyRule?: string;
 };
 
 /** One classifier attempt: the raw model response (or error) and parsed decision. */

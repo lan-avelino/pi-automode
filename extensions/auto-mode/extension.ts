@@ -879,6 +879,24 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
+      // When a script is blocked as "overwriting existing files" but the files
+      // are where the edit tools are already allowed, say so, so the agent can
+      // redo the change with them instead of repeating the script.
+      const declineHint = (): string => {
+        if (event.toolName !== "bash" || typeof input.command !== "string") return "";
+        if (decision.softDenyRule !== DEFAULT_SOFT_DENY[3]) return "";
+        const source = input.command;
+        const mentions = (location: string) =>
+          new RegExp(`${location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=/|\\s|$|["';])`).test(source);
+        const locations = [...cfg.scratchRoots, ...sessionEditRoots].filter(mentions);
+        const leavesProject = /(^|[\s;&|(])cd\s+["']?[/~]/.test(source) && !mentions(ctx.cwd);
+        if (cfg.allowInsideWorkingDirectory && !leavesProject) locations.push(ctx.cwd);
+        if (locations.length === 0) return "";
+        return ` Hint: this was flagged as overwriting existing files, but the edit and write tools are allowed without review under ${
+          [...new Set(locations)].join(", ")
+        } (protected files excepted). Make this change with them instead of a script.`;
+      };
+
       const askSoftDeny = async (
         signature: ApprovalSignature | undefined,
       ): Promise<ReturnType<typeof block> | undefined> => {
@@ -954,7 +972,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         return block(ctx, {
           timestamp: Date.now(),
           toolName: event.toolName,
-          reason: `${decision.reason} ${outcome}`,
+          reason: `${decision.reason} ${outcome}${declineHint()}`,
           action: summary,
           kind: "classifier",
         }, logCtx);
@@ -989,7 +1007,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         return block(ctx, {
           timestamp: Date.now(),
           toolName: event.toolName,
-          reason: `${decision.reason} Not asked: no interactive terminal.`,
+          reason: `${decision.reason} Not asked: no interactive terminal.${declineHint()}`,
           action: summary,
           kind: "classifier",
         }, logCtx);
