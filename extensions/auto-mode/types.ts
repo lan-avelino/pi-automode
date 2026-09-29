@@ -76,6 +76,8 @@ export type AutoModeSettings = {
   environment?: unknown;
   /** SSH host names the classifier treats as part of the trusted environment. User-owned sources only. */
   trustedHosts?: unknown;
+  /** Absolute or `~/` directories where write/edit skip the classifier. User-owned sources only. */
+  scratchRoots?: unknown;
   allow?: unknown;
   protectedPaths?: unknown;
   soft_deny?: unknown;
@@ -133,6 +135,8 @@ export type EffectiveConfig = {
   environment: string[];
   /** Lowercase SSH host names from user-owned config sources. */
   trustedHosts: string[];
+  /** Absolute scratch-root directories, `~` expanded. */
+  scratchRoots: string[];
   allow: string[];
   protectedPaths: string[];
   softDeny: string[];
@@ -174,7 +178,8 @@ export type DecisionKind =
   | "permissions.allow"
   | "classifier.confirmed"
   | "read-only"
-  | "inside-working-directory";
+  | "inside-working-directory"
+  | "scratch-root";
 
 export type ClassificationDecision = {
   decision: "allow" | "block";

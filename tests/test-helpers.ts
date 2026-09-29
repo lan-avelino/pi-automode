@@ -173,6 +173,7 @@ export function baseConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveC
 		maxToolTranscriptTokens: 4000,
 		environment: [],
 		trustedHosts: [],
+		scratchRoots: [],
 		allow: [],
 		protectedPaths: [...DEFAULT_PROTECTED_PATHS],
 		softDeny: [],

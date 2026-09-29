@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { HOME } from "./constants.ts";
 import {
   DEFAULT_ALLOW,
   DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
@@ -303,6 +304,7 @@ export function validateSettingsFile(
         "maxToolTranscriptTokens",
         "environment",
         "trustedHosts",
+        "scratchRoots",
         "allow",
         "protectedPaths",
         "soft_deny",
@@ -464,6 +466,7 @@ export function validateSettingsFile(
         diagnostics,
       );
       validateTrustedHostsSetting(autoMode.trustedHosts, source, diagnostics);
+      validateScratchRootsSetting(autoMode.scratchRoots, source, diagnostics);
       validateStringArraySetting(
         autoMode.allow,
         source,
@@ -585,6 +588,43 @@ const TRUSTED_HOST_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/i;
 
 export function isValidTrustedHost(value: unknown): value is string {
   return typeof value === "string" && TRUSTED_HOST_PATTERN.test(value);
+}
+
+/**
+ * A scratch root in absolute form, or undefined when it is not an absolute or
+ * `~/` path, or is so broad that it would switch off review for the home
+ * directory: `/`, `~`, or any ancestor of home.
+ */
+export function scratchRootPath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  const expanded = trimmed === "~" || trimmed.startsWith("~/")
+    ? resolve(HOME, trimmed.slice(2))
+    : trimmed;
+  if (!expanded.startsWith("/")) return undefined;
+  const root = resolve(expanded);
+  const home = resolve(HOME);
+  if (root === "/" || home === root || home.startsWith(`${root}/`)) return undefined;
+  return root;
+}
+
+function validateScratchRootsSetting(
+  value: unknown,
+  source: string,
+  diagnostics: string[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    diagnostics.push(`${source}: autoMode.scratchRoots must be an array of strings`);
+    return;
+  }
+  for (const [index, entry] of value.entries()) {
+    if (scratchRootPath(entry) === undefined) {
+      diagnostics.push(
+        `${source}: autoMode.scratchRoots[${index}] must be an absolute or ~/ directory that does not contain the home directory; it is ignored`,
+      );
+    }
+  }
 }
 
 function validateTrustedHostsSetting(
@@ -850,6 +890,7 @@ export function buildEffectiveConfigFromSources(
     maxToolTranscriptTokens: DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
     environment: [...DEFAULT_ENVIRONMENT],
     trustedHosts: [],
+    scratchRoots: [],
     allow: [...DEFAULT_ALLOW],
     protectedPaths: [...DEFAULT_PROTECTED_PATHS],
     softDeny: [...DEFAULT_SOFT_DENY],
@@ -874,6 +915,7 @@ export function buildEffectiveConfigFromSources(
   // Trusted hosts widen what the classifier treats as in scope, so they come
   // only from user-owned sources, like every other autoMode setting.
   const trustedHosts = new Set<string>();
+  const scratchRoots = new Set<string>();
   const allow = createRuleAccumulator(DEFAULT_ALLOW);
   const protectedPaths = createRuleAccumulator(DEFAULT_PROTECTED_PATHS);
   const deniedPaths = createRuleAccumulator(DEFAULT_DENIED_PATHS);
@@ -887,6 +929,13 @@ export function buildEffectiveConfigFromSources(
     if (Array.isArray(hosts)) {
       for (const host of hosts) {
         if (isValidTrustedHost(host)) trustedHosts.add(host.toLowerCase());
+      }
+    }
+    const roots = settings.autoMode?.scratchRoots;
+    if (Array.isArray(roots)) {
+      for (const entry of roots) {
+        const root = scratchRootPath(entry);
+        if (root !== undefined) scratchRoots.add(root);
       }
     }
     applyRuleSetting(allow, settings.autoMode?.allow);
@@ -910,6 +959,7 @@ export function buildEffectiveConfigFromSources(
     ...config,
     environment: finalizeRuleSetting(environment),
     trustedHosts: [...trustedHosts],
+    scratchRoots: [...scratchRoots],
     allow: finalizeRuleSetting(allow),
     protectedPaths: finalizeRuleSetting(protectedPaths),
     deniedPaths: finalizeRuleSetting(deniedPaths),

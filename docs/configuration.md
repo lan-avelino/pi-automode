@@ -57,6 +57,22 @@ Only numbers in value positions may differ: a number after a flag (`-n 50`), a c
 
 A session approval only replaces the soft-deny prompt. Permission rules, deterministic hard-deny checks, and a Jev `hard_deny` still apply. Approvals live in memory, are cleared when a session starts, and can be listed or cleared with `/automode approvals` and `/automode approvals clear`.
 
+## Scratch roots
+
+`scratchRoots` lists directories where the agent's `write` and `edit` calls skip the classifier, for example a clone the session creates under `/tmp`:
+
+```json
+{
+  "autoMode": {
+    "scratchRoots": ["/tmp", "~/scratch"]
+  }
+}
+```
+
+Protected paths inside a scratch root still reach the classifier, matched relative to the root and by name at any depth (`.git`, `build.gradle`). Denied paths, permission rules, accepted `permissions.ask` rules, and the deterministic hard-deny and safety-control checks still apply. `bash` commands are classified as usual, even when they write inside a scratch root.
+
+Each entry must be an absolute or `~/` path. `/`, `~`, and any directory that contains the home directory are rejected with a diagnostic, because they would switch off review for nearly everything. Entries merge across global, project-local, and inline config; shared project `.pi/automode.json` cannot add scratch roots.
+
 ## Trusted hosts
 
 `trustedHosts` lists SSH host names or aliases that the classifier should treat as part of the trusted environment:

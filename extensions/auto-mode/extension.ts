@@ -688,7 +688,8 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         !cfg.classifyReadOnlyTools &&
         READ_ONLY_TOOLS.has(event.toolName);
       if (
-        (cfg.deniedPaths.length > 0 || cfg.allowInsideWorkingDirectory) &&
+        (cfg.deniedPaths.length > 0 || cfg.allowInsideWorkingDirectory ||
+          cfg.scratchRoots.length > 0) &&
         PATH_BEARING_TOOLS.has(event.toolName)
       ) {
         const inputPath = extractInputPath(event.toolName, input);
@@ -759,6 +760,31 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             // Outside the working directory, protected writes, and accepted
             // ask rules must not use the read-only fast path.
             readOnlyFastPath = false;
+          }
+          // Scratch roots are user-declared throwaway directories, such as a
+          // clone the session made under /tmp. Writes there skip the classifier,
+          // except protected paths (matched at any depth) and accepted ask rules.
+          if (
+            (event.toolName === "write" || event.toolName === "edit") &&
+            cfg.scratchRoots.length > 0 &&
+            !askRequiresClassifier
+          ) {
+            const root = cfg.scratchRoots
+              .map((entry) => resolvePathForPolicy(entry) ?? entry)
+              .find((entry) => isInside(policyPath, entry));
+            if (
+              root !== undefined &&
+              !isProtectedPath(policyPath, root, cfg.protectedPaths)
+            ) {
+              return allow(
+                ctx,
+                "scratch-root",
+                `Path inside scratch root ${root}: ${policyPath}`,
+                event.toolName,
+                summary,
+                logCtx,
+              );
+            }
           }
         }
       }

@@ -1,12 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
 import {
 	DEFAULT_PROTECTED_PATHS,
 	buildEffectiveConfigFromSources,
+	parseToolPattern,
 	createPiAutomode,
 	deterministicHardDeny,
 	matchesProtectedPath,
@@ -993,4 +994,66 @@ test("cross-project write to protected path triggers classifier", async () => {
 		rmSync(projectA, { recursive: true, force: true });
 		rmSync(projectB, { recursive: true, force: true });
 	}
+});
+
+// --- scratch roots -----------------------------------------------------------
+
+test("scratchRoots merges user-owned scopes, expands ~, and rejects roots that are too broad", async () => {
+	const { homedir } = await import("node:os");
+	const home = homedir();
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { scratchRoots: ["/tmp", "~/scratch", "/", "~", "relative/dir", dirname(home)] } }],
+		projectSharedSettings: [{ autoMode: { scratchRoots: ["/srv/checked-in"] } }],
+		projectLocalSettings: [{ autoMode: { scratchRoots: ["/tmp"] } }],
+	});
+	assert.deepEqual(config.scratchRoots, ["/tmp", `${home}/scratch`]);
+	const diagnostics = validateSettingsFile(
+		{ autoMode: { scratchRoots: ["/tmp", "/", "~", "relative/dir", dirname(home)] } },
+		"inline",
+	);
+	for (const index of [1, 2, 3, 4]) {
+		assert.ok(diagnostics.some((line) => line.includes(`autoMode.scratchRoots[${index}]`)), String(index));
+	}
+	assert.ok(!diagnostics.some((line) => line.includes("autoMode.scratchRoots[0]")));
+	assert.ok(!diagnostics.some((line) => line.includes("unknown autoMode key")));
+});
+
+test("a write or edit inside a scratch root skips the classifier unless the path is protected", async () => {
+	const harness = await setupHookTest({
+		config: baseConfig({ scratchRoots: ["/tmp/scratch-root-test"], protectedPaths: [".git", "build.gradle"] }),
+		classifier: async () => ({ decision: "allow", tier: "allow", reason: "ok" }),
+	});
+	const write = (path: string) =>
+		harness.emit("tool_call", { toolName: "write", input: { path, content: "x\n" } }, harness.ctx);
+
+	assert.equal(await write("/tmp/scratch-root-test/clone/src/app.js"), undefined);
+	await harness.emit("tool_call", {
+		toolName: "edit",
+		input: { path: "/tmp/scratch-root-test/clone/src/app.js", edits: [{ oldText: "x", newText: "y" }] },
+	}, harness.ctx);
+	assert.equal(harness.classifierCalls, 0);
+
+	// Protected paths inside the root, paths outside it, and bash still reach the classifier.
+	await write("/tmp/scratch-root-test/clone/.git/hooks/pre-commit");
+	await write("/tmp/scratch-root-test/clone/app/build.gradle");
+	await write("/tmp/scratch-root-test-other/file.js");
+	await harness.emit("tool_call", {
+		toolName: "bash",
+		input: { command: "echo hi > /tmp/scratch-root-test/clone/x.txt" },
+	}, harness.ctx);
+	assert.equal(harness.classifierCalls, 4);
+});
+
+test("an accepted permissions.ask rule still reaches the classifier inside a scratch root", async () => {
+	const ask = parseToolPattern("write(*)");
+	assert.ok(ask);
+	const harness = await setupHookTest({
+		config: baseConfig({ scratchRoots: ["/tmp/scratch-root-test"], permissionAsk: [ask] }),
+		classifier: async () => ({ decision: "allow", tier: "allow", reason: "ok" }),
+	});
+	await harness.emit("tool_call", {
+		toolName: "write",
+		input: { path: "/tmp/scratch-root-test/a.txt", content: "x\n" },
+	}, harness.ctx);
+	assert.equal(harness.classifierCalls, 1);
 });
