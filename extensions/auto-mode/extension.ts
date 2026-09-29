@@ -1,5 +1,5 @@
-import { realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
@@ -31,6 +31,7 @@ import {
   type GlobalConfigPreparation,
   loadEffectiveConfigWithDiagnostics,
   prepareGlobalConfig,
+  scratchRootPath,
   writeGlobalAutoModeSetting,
 } from "./config.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
@@ -152,6 +153,20 @@ type PersistableSettingKey = GlobalAutoModeSettingKey;
  * too, but an RPC client such as a pi-subagents child never answers, so a
  * prompt there would block the agent forever.
  */
+/**
+ * The folder offered by "Allow edits under … for this session": the git
+ * repository containing the file, or else the file's own folder. Undefined when
+ * that folder is not a valid scratch root, such as the home directory.
+ */
+function sessionEditFolder(path: string): string | undefined {
+  const start = dirname(path);
+  for (let dir = start; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) return scratchRootPath(dir);
+    if (dirname(dir) === dir) break;
+  }
+  return scratchRootPath(start);
+}
+
 function canAskUser(ctx: ExtensionContext): boolean {
   return ctx.hasUI && ctx.mode === "tui";
 }
@@ -259,6 +274,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
     // Parser-derived patterns the user chose to allow for this session after a
     // Jev soft deny. In memory only and cleared at session start.
     const sessionApprovals = new Map<string, string>();
+    // Folders the user chose "Allow edits under … for this session" for. They
+    // act as scratch roots until the session starts again.
+    const sessionEditRoots = new Set<string>();
     let state: AutoModeState = {
       checkedActions: 0,
       blockedActions: 0,
@@ -478,6 +496,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       configDiagnostics = loadResult.diagnostics;
       state = restoreState(ctx);
       sessionApprovals.clear();
+      sessionEditRoots.clear();
       if (
         ctx.hasUI &&
         globalConfig.notification &&
@@ -689,7 +708,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         READ_ONLY_TOOLS.has(event.toolName);
       if (
         (cfg.deniedPaths.length > 0 || cfg.allowInsideWorkingDirectory ||
-          cfg.scratchRoots.length > 0) &&
+          cfg.scratchRoots.length > 0 || sessionEditRoots.size > 0) &&
         PATH_BEARING_TOOLS.has(event.toolName)
       ) {
         const inputPath = extractInputPath(event.toolName, input);
@@ -766,10 +785,10 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           // except protected paths (matched at any depth) and accepted ask rules.
           if (
             (event.toolName === "write" || event.toolName === "edit") &&
-            cfg.scratchRoots.length > 0 &&
+            (cfg.scratchRoots.length > 0 || sessionEditRoots.size > 0) &&
             !askRequiresClassifier
           ) {
-            const root = cfg.scratchRoots
+            const root = [...cfg.scratchRoots, ...sessionEditRoots]
               .map((entry) => resolvePathForPolicy(entry) ?? entry)
               .find((entry) => isInside(policyPath, entry));
             if (
@@ -869,18 +888,49 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         const allowSimilar = signature?.recurs
           ? `Allow similar for this session: ${signature.description}`
           : undefined;
+        // For an edit, offer its repository or folder for the rest of the
+        // session, so a run of edits in one clone asks once.
+        const editPath = event.toolName === "write" || event.toolName === "edit"
+          ? extractInputPath(event.toolName, input)
+          : undefined;
+        const resolvedEditPath = editPath === undefined
+          ? undefined
+          : resolveToolInputPath(event.toolName, ctx.cwd, editPath) ?? editPath;
+        const editFolder = resolvedEditPath === undefined
+          ? undefined
+          : sessionEditFolder(resolvePathForPolicy(resolvedEditPath) ?? resolvedEditPath);
+        const allowFolder = editFolder === undefined
+          ? undefined
+          : `Allow edits under ${editFolder} for this session`;
         const deny = "Deny";
         let choice: string | undefined;
         let outcome = "The user declined it.";
         try {
           choice = await ctx.ui.select(
             `Auto mode soft deny\n\n${decision.reason}\n\nAction:\n${summary}`,
-            allowSimilar ? [allowOnce, allowSimilar, deny] : [allowOnce, deny],
+            [
+              allowOnce,
+              ...(allowSimilar ? [allowSimilar] : []),
+              ...(allowFolder ? [allowFolder] : []),
+              deny,
+            ],
             { signal: ctx.signal },
           );
         } catch {
           // A cancelled or failed prompt is not an approval.
           outcome = "The approval prompt was cancelled or failed.";
+        }
+        if (allowFolder && choice === allowFolder) {
+          sessionEditRoots.add(editFolder!);
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `User approved edits under ${editFolder} for this session: ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
         }
         if (choice === allowOnce || (allowSimilar && choice === allowSimilar)) {
           if (signature && choice === allowSimilar) {
@@ -1074,15 +1124,19 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
       if (command === "approvals") {
         if (rest.join(" ").trim() === "clear") {
-          const count = sessionApprovals.size;
+          const count = sessionApprovals.size + sessionEditRoots.size;
           sessionApprovals.clear();
+          sessionEditRoots.clear();
           ctx.ui.notify(
             `Cleared ${count} session approval${count === 1 ? "" : "s"}.`,
             "info",
           );
           return;
         }
-        const patterns = [...sessionApprovals.values()];
+        const patterns = [
+          ...sessionApprovals.values(),
+          ...[...sessionEditRoots].map((root) => `edits under ${root}`),
+        ];
         ctx.ui.notify(
           patterns.length === 0
             ? "No session approvals. Choosing \"Allow similar for this session\" on a Jev soft-deny prompt adds one."

@@ -78,3 +78,10 @@ test("statusLine: classifier segment shows when only denials have happened", () 
 });
 
 // --- observability logging -------------------------------------------------
+
+test("auto mode guidance steers routine file changes to the edit and write tools", async () => {
+	const { AUTO_MODE_GUIDANCE } = await import("../extensions/auto-mode.ts");
+	assert.match(AUTO_MODE_GUIDANCE, /Make ordinary file changes with the edit and write tools/);
+	// Scripts stay available for the cases they are good at.
+	assert.match(AUTO_MODE_GUIDANCE, /computed, spans many files, or is a temporary mutation test/);
+});

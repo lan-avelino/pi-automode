@@ -59,7 +59,11 @@ async function harness(options: {
 	const run = async (command: string, toolName = "bash") =>
 		await fake.emit("tool_call", {
 			toolName,
-			input: toolName === "bash" ? { command } : { url: command },
+			input: toolName === "bash"
+				? { command }
+				: toolName === "edit"
+				? { path: command, edits: [{ oldText: "a", newText: "b" }] }
+				: { url: command },
 		}, ctx) as { block?: boolean; reason?: string } | undefined;
 	return { fake, ctx, prompts, run };
 }
@@ -208,5 +212,67 @@ test("permissions.ask blocks in non-terminal modes instead of waiting for an ans
 	assert.equal(asked, 0);
 	assert.equal(result.block, true);
 	assert.match(result.reason ?? "", /no interactive terminal/);
+});
+
+// --- session folder approvals ------------------------------------------------
+
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const folderOption = (prompt: Prompt) =>
+	prompt.options.find((option) => option.startsWith("Allow edits under "));
+
+test("an edit soft deny offers the repository folder for the rest of the session", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "pi-automode-folder-"));
+	mkdirSync(join(repo, ".git"));
+	mkdirSync(join(repo, "src"));
+	try {
+		const h = await harness({ answers: [folderOption, DENY, DENY] });
+		assert.equal(await h.run(join(repo, "src/app.js"), "edit"), undefined);
+		const prompt = h.prompts[0]!;
+		assert.ok(folderOption(prompt)?.endsWith("for this session"), prompt.options.join(" | "));
+		assert.match(folderOption(prompt)!, /pi-automode-folder-/);
+		// Later edits anywhere in the repository no longer prompt.
+		assert.equal(await h.run(join(repo, "README.md"), "edit"), undefined);
+		assert.equal(await h.run(join(repo, "src/deep/x.js"), "edit"), undefined);
+		assert.equal(h.prompts.length, 1);
+		// Protected paths inside it, and folders outside it, still prompt.
+		assert.equal((await h.run(join(repo, ".git/config"), "edit"))?.block, true);
+		assert.equal((await h.run(join(tmpdir(), "elsewhere.js"), "edit"))?.block, true);
+		assert.equal(h.prompts.length, 3);
+
+		await h.fake.commands.get("automode")?.handler("approvals", h.ctx);
+		assert.match(h.ctx.notifications.at(-1)?.message ?? "", /edits under .*pi-automode-folder-/);
+		await h.fake.commands.get("automode")?.handler("approvals clear", h.ctx);
+		assert.equal((await h.run(join(repo, "README.md"), "edit"))?.block, true);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
+});
+
+test("the folder option is not offered for bash or for a folder containing home", async () => {
+	const { homedir } = await import("node:os");
+	const bash = await harness({ answers: [DENY] });
+	await bash.run(RESTART);
+	assert.equal(folderOption(bash.prompts[0]!), undefined);
+
+	// A file directly in the home directory has no safe folder to offer.
+	const home = await harness({ answers: [DENY] });
+	await home.run(join(homedir(), "pi-automode-not-a-real-file.txt"), "edit");
+	assert.equal(folderOption(home.prompts[0]!), undefined);
+});
+
+test("session folder approvals are cleared when a session starts", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "pi-automode-folder-"));
+	try {
+		const h = await harness({ answers: [folderOption, DENY] });
+		assert.equal(await h.run(join(repo, "a.js"), "edit"), undefined);
+		await h.fake.emit("session_start", { type: "session_start" }, h.ctx);
+		assert.equal((await h.run(join(repo, "b.js"), "edit"))?.block, true);
+		assert.equal(h.prompts.length, 2);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
 });
 
