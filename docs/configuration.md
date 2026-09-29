@@ -112,6 +112,8 @@ This tier takes precedence over `classifyReadOnlyTools`. If both configuration f
 
 Protected in-tree targets do not use this allow tier. Writes and edits to `.git/hooks`, `.pi` controls, shell profiles, and configuration files still reach the classifier.
 
+`protectedPaths` entries without `/` match that name at any depth, entries with `/` are relative to the project root, and `*` matches within one path segment; see [Defaults and rule-list behavior](defaults.md#protectedpaths).
+
 `deniedPaths` is a list of path glob patterns. The default list is `[]`. A matching pattern blocks a file-tool call before classifier review or an allow tier.
 
 Patterns support `~`, `$HOME`, and `${HOME}` expansion. The `*` wildcard matches all characters, including `/`. Thus, `**/id_rsa` matches a private key at any depth.

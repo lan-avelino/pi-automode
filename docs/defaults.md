@@ -51,6 +51,12 @@ These are exceptions to `soft_deny`, not to `hard_deny`.
 
 The value `allowInsideWorkingDirectory: true` sends non-protected in-tree file access to the deterministic allow tier. Writes and edits to protected paths still reach the classifier. Classifier `allow` rules cannot override a classifier hard-deny decision.
 
+Matching is case-insensitive and works on whole path segments:
+
+- An entry without `/` matches that name at any depth: `build.gradle` protects `app/build.gradle`, and `.git` protects a nested repository's `.git/hooks`. A matching directory protects everything under it.
+- An entry with `/` is relative to the project root: `.config/git` and `src/main/webapp/WEB-INF`.
+- `*` matches any characters within one segment, never across `/`: `*.xcodeproj`, `vite.config.*`, `docker-compose*.yml`, `gradle/*.toml`. Other characters, including `.` and `+`, are literal.
+
 Protected directories: `.git`, `.config/git`, `.vscode`, `.idea`, `.husky`, `.cargo`, `.devcontainer`, `.yarn`, `.mvn`, `.pi`.
 
 Protected files include:

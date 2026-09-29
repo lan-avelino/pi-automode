@@ -1122,6 +1122,94 @@ test("defaultJevClassifyAction sends the full action without truncation", async 
 	}
 });
 
+test("defaultJevClassifyAction retries a timeout or server error once", async () => {
+	const originalFetch = globalThis.fetch;
+	try {
+		const ctx = createFakeCtx([], {
+			modelRegistry: { getApiKeyForProvider: async () => undefined },
+		});
+		for (const first of [
+			() => {
+				throw new Error("The operation was aborted due to timeout");
+			},
+			() => new Response(JSON.stringify({ message: "upstream overloaded" }), { status: 503 }),
+			() => new Response(JSON.stringify({ message: "rate limited" }), { status: 429 }),
+		]) {
+			clearJevCache();
+			let calls = 0;
+			globalThis.fetch = (async () => {
+				calls += 1;
+				if (calls === 1) return first();
+				return new Response(
+					JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }),
+					{ status: 200 },
+				);
+			}) as typeof fetch;
+			const result = await defaultJevClassifyAction(
+				ctx as never,
+				jevTestConfig(),
+				'{"toolName":"bash","input":{"command":"ls"}}',
+				"",
+				JEV_KEY_DEPS,
+			);
+			assert.equal(calls, 2);
+			assert.equal(result.decision, "allow", result.reason);
+			// Both attempts are logged: the failure, then the decision.
+			assert.equal(result.io?.attempts.length, 2);
+			assert.ok(result.io?.attempts[0]?.error);
+			assert.equal(result.io?.attempts[1]?.parsed?.decision, "allow");
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("defaultJevClassifyAction does not retry client errors, bad output, or a cancelled turn", async () => {
+	const originalFetch = globalThis.fetch;
+	try {
+		for (const [name, respond, ctxOverrides] of [
+			["401", () => new Response(JSON.stringify({ message: "invalid api key" }), { status: 401 }), {}],
+			["unreadable", () => new Response("not json", { status: 200 }), {}],
+			[
+				"missing answers",
+				() => new Response(JSON.stringify({ answers: { hard_deny: { type: "noul", noul: 0.1 } } }), { status: 200 }),
+				{},
+			],
+			[
+				"cancelled",
+				() => {
+					throw new Error("This operation was aborted");
+				},
+				{ signal: AbortSignal.abort() },
+			],
+		] as const) {
+			clearJevCache();
+			let calls = 0;
+			globalThis.fetch = (async () => {
+				calls += 1;
+				return respond();
+			}) as typeof fetch;
+			const result = await defaultJevClassifyAction(
+				createFakeCtx([], {
+					modelRegistry: { getApiKeyForProvider: async () => undefined },
+					...ctxOverrides,
+				}) as never,
+				jevTestConfig(),
+				'{"toolName":"bash","input":{"command":"ls"}}',
+				"",
+				JEV_KEY_DEPS,
+			);
+			assert.equal(calls, 1, name);
+			assert.equal(result.decision, "block", name);
+			assert.doesNotMatch(result.reason, /after 2 attempts/, name);
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
 test("defaultJevClassifyAction fails closed on transport and parse errors", async () => {
 	clearJevCache();
 	const originalFetch = globalThis.fetch;
@@ -1142,8 +1230,10 @@ test("defaultJevClassifyAction fails closed on transport and parse errors", asyn
 		);
 		assert.equal(transport.decision, "block");
 		assert.match(transport.reason, /fails closed/);
-		// Transport failures log one error attempt, like the LLM path.
-		assert.equal(transport.io?.attempts.length, 1);
+		assert.match(transport.reason, /after 2 attempts/);
+		// A transport failure is retried once; each attempt is logged.
+		assert.equal(transport.io?.attempts.length, 2);
+		assert.deepEqual(transport.io?.attempts.map((a) => a.attempt), [1, 2]);
 		assert.equal(transport.io?.attempts[0]?.stage, "detailed");
 		assert.match(String(transport.io?.attempts[0]?.error), /connection refused/);
 		assert.equal(transport.io?.attempts[0]?.parsed, undefined);

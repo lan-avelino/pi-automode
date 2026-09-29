@@ -862,10 +862,14 @@ npm run check
     log: denial history, the `decision` log line, and the agent-facing message
     never carried a tier. The score summary still shows that a Jev allow overrode a
     soft-deny rule.
-12. Jev does not retry a malformed or transport-failed response. The LLM path
-    retries only an invalid decision response (not a transport failure); a thrown
-    transport error blocks immediately for both backends. This is fail-closed, so it
-    costs availability, not safety.
+12. Jev retries a transient failure once: a timeout, a network error, HTTP 429, or a
+    5xx, each with a fresh `jevTimeoutMs`. Live sessions on 2026-09-28 saw six 12 s
+    timeouts clustered in three windows while typical calls took 0.4-0.6 s, and each
+    one needed a manual "try again". A client error (4xx other than 429), unreadable
+    or incomplete output, and a turn the user cancelled are not retried. Every attempt
+    is logged, and if both fail the action is blocked with "(after 2 attempts)". The
+    LLM path retries only an invalid decision response. Retrying costs latency (up to
+    two timeouts), never safety.
 13. `jevTimeoutMs` defaults to 12000, below the LLM path's 20000, so Jev blocks
     more often on slow endpoints. Raise it if that matters.
 14. An out-of-range `noul` probability is treated as a contract violation: the

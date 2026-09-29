@@ -862,6 +862,63 @@ test("protected-path matching is case-insensitive and preserves path boundaries"
 	assert.equal(matchesProtectedPath(".github/config", [".git"]), false);
 });
 
+test("a protected name without a slash matches at any depth, on whole path segments", () => {
+	assert.equal(matchesProtectedPath("app/build.gradle", ["build.gradle"]), true);
+	assert.equal(matchesProtectedPath("frontend/package.json", ["package.json"]), true);
+	assert.equal(matchesProtectedPath("modules/core/pom.xml", ["pom.xml"]), true);
+	// A directory name protects everything under it, at any depth.
+	assert.equal(matchesProtectedPath("vendor/lib/.git/hooks/pre-commit", DEFAULT_PROTECTED_PATHS), true);
+	assert.equal(matchesProtectedPath("app/buildSrc/src/Plugin.kt", ["buildSrc"]), true);
+	// Whole segments only.
+	assert.equal(matchesProtectedPath("docs/build.gradle.md", ["build.gradle"]), false);
+	assert.equal(matchesProtectedPath("src/.github-notes/x", [".github"]), false);
+});
+
+test("a * in a protected path matches within one path segment", () => {
+	assert.equal(matchesProtectedPath("ios/MyApp.xcodeproj/project.pbxproj", ["*.xcodeproj"]), true);
+	assert.equal(matchesProtectedPath("Config/Release.xcconfig", ["*.xcconfig"]), true);
+	assert.equal(matchesProtectedPath("frontend/vite.config.ts", ["vite.config.*"]), true);
+	assert.equal(matchesProtectedPath("deploy/docker-compose.prod.yml", ["docker-compose*.yml"]), true);
+	assert.equal(matchesProtectedPath("src/vite.config", ["vite.config.*"]), false);
+	assert.equal(matchesProtectedPath("src/main.ts", ["*.xcconfig"]), false);
+	// Other regular-expression characters are literal.
+	assert.equal(matchesProtectedPath("a+b.txt", ["a+b.txt"]), true);
+	assert.equal(matchesProtectedPath("aab.txt", ["a+b.txt"]), false);
+	assert.equal(matchesProtectedPath("aXtxt", ["a.txt"]), false);
+});
+
+test("a protected path with a slash stays relative to the project root", () => {
+	assert.equal(matchesProtectedPath(".config/git/ignore", DEFAULT_PROTECTED_PATHS), true);
+	assert.equal(matchesProtectedPath("sub/.config/git/ignore", [".config/git"]), false);
+	assert.equal(matchesProtectedPath("src/main/webapp/WEB-INF/web.xml", ["src/main/webapp/WEB-INF"]), true);
+	// A * in a rooted pattern still stays within its segment.
+	assert.equal(matchesProtectedPath("gradle/libs.versions.toml", ["gradle/*.toml"]), true);
+	assert.equal(matchesProtectedPath("gradle/x/libs.toml", ["gradle/*.toml"]), false);
+});
+
+test("allowInsideWorkingDirectory still classifies a nested protected write", async () => {
+	const harness = await setupHookTest({
+		config: baseConfig({
+			allowInsideWorkingDirectory: true,
+			protectedPaths: ["build.gradle", "*.xcodeproj"],
+		}),
+		classifier: async () => ({ decision: "allow", tier: "allow", reason: "ok" }),
+	});
+	for (const path of [
+		"/tmp/project/app/build.gradle",
+		"/tmp/project/ios/App.xcodeproj/project.pbxproj",
+	]) {
+		await harness.emit("tool_call", { toolName: "write", input: { path, content: "x\n" } }, harness.ctx);
+	}
+	assert.equal(harness.classifierCalls, 2);
+	// An ordinary in-tree edit is still allowed without the classifier.
+	await harness.emit("tool_call", {
+		toolName: "write",
+		input: { path: "/tmp/project/app/src/Main.java", content: "x\n" },
+	}, harness.ctx);
+	assert.equal(harness.classifierCalls, 2);
+});
+
 test("protected-path matching normalizes canonically equivalent Unicode", () => {
 	assert.equal(
 		matchesProtectedPath(".CONFIG/CAFÉ/settings", [".config/cafe\u0301"]),

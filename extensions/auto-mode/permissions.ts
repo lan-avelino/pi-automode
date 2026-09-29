@@ -436,7 +436,11 @@ export function matchesToolPattern(
   if (toolName === "bash" && bashAnalysis) {
     if (bashAnalysis.errors.length > 0) return overflowPolicy === "match";
     const candidates = overflowPolicy === "match"
-      ? [bashAnalysis.source, ...bashAnalysis.commands.map((command) => command.text)]
+      ? [
+        bashAnalysis.source,
+        ...bashAnalysis.commands.map((command) => command.text),
+        ...effectiveCommandTexts(bashAnalysis),
+      ]
       : [bashAnalysis.source];
     const argumentPattern = normalizedBashArgumentPattern(pattern);
     return candidates.some((candidate) =>
@@ -459,6 +463,20 @@ export function matchesToolPattern(
   );
 }
 
+/**
+ * Each command as it actually runs: `VAR=value` assignments and transparent
+ * `env`/`command`/`exec` wrappers stripped. Used only for deny and ask rules,
+ * so a prefix cannot hide a command from them; allow rules stay literal, since
+ * a prefix such as `LD_PRELOAD=` changes what the command does.
+ */
+function effectiveCommandTexts(bashAnalysis: BashAnalysis): string[] {
+  return bashAnalysis.commands.flatMap((command) => {
+    const effective = command.effectiveCommand;
+    if (!effective.name || effective.unresolvedTransparentDispatch) return [];
+    return [[effective.name, ...effective.argTexts].join(" ")];
+  });
+}
+
 /** Return the normalized Bash command that matched a scoped permission rule. */
 export function matchingBashCommandText(
   pattern: ToolPattern,
@@ -473,6 +491,12 @@ export function matchingBashCommandText(
     matchesBashArgumentPattern(argumentPattern, candidate.text, overflowPolicy)
   );
   if (command) return command.text;
+  if (overflowPolicy === "match") {
+    const effective = effectiveCommandTexts(bashAnalysis).find((text) =>
+      matchesBashArgumentPattern(argumentPattern, text, overflowPolicy)
+    );
+    if (effective) return effective;
+  }
   return matchesBashArgumentPattern(argumentPattern, bashAnalysis.source, overflowPolicy)
     ? bashAnalysis.source
     : undefined;

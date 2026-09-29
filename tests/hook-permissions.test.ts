@@ -1293,3 +1293,42 @@ test("tool_call broad permissions.allow cannot bypass deterministic denies under
 		else process.env.TMPDIR = previousTmpdir;
 	}
 });
+
+test("an env-assignment or env-wrapper prefix cannot hide a command from deny and ask rules", async () => {
+	const deny = parseToolPattern("bash(git push --force*)");
+	const ask = parseToolPattern("bash(git credential*)");
+	const allow = parseToolPattern("bash(git status*)");
+	assert.ok(deny && ask && allow);
+	const ctx = createFakeCtx();
+	let asked = 0;
+	ctx.ui.confirm = async () => {
+		asked += 1;
+		return false;
+	};
+	const harness = await setupHookTest({
+		config: baseConfig({ permissionDeny: [deny], permissionAsk: [ask], permissionAllow: [allow] }),
+		ctx,
+	});
+	for (const command of [
+		"GIT_TRACE=0 git push --force origin main",
+		"env GIT_TRACE=0 git push --force origin main",
+		"cd /tmp && A=1 B=2 git push --force origin main",
+	]) {
+		const result = await harness.emit("tool_call", { toolName: "bash", input: { command } }, harness.ctx) as {
+			block?: boolean;
+			reason?: string;
+		};
+		assert.equal(result.block, true, command);
+		assert.match(result.reason ?? "", /permissions\.deny/, command);
+	}
+	const credential = await harness.emit("tool_call", {
+		toolName: "bash",
+		input: { command: "x=$(printf 'a' | GIT_TERMINAL_PROMPT=0 git credential fill)" },
+	}, harness.ctx) as { block?: boolean };
+	assert.equal(asked, 1);
+	assert.equal(credential.block, true);
+	// Allow rules stay literal: a prefix such as LD_PRELOAD= must not ride on one.
+	const before = harness.classifierCalls;
+	await harness.emit("tool_call", { toolName: "bash", input: { command: "LD_PRELOAD=/tmp/x.so git status" } }, harness.ctx);
+	assert.equal(harness.classifierCalls, before + 1);
+});

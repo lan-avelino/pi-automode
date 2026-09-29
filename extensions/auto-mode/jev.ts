@@ -587,6 +587,8 @@ function jevIo(params: {
   error?: string;
   durationMs: number;
   cached: boolean;
+  /** Failed attempts before the final one, oldest first. */
+  earlier?: JevFailedAttempt[];
 }): ClassifierIo {
   const { model, reasoning, questions, state, action, decision } = params;
   return {
@@ -604,17 +606,27 @@ function jevIo(params: {
     },
     // Jev reports no token usage, so no synthetic provider response is
     // fabricated and no ccusage `message` entry is written.
-    attempts: params.cached ? [] : [{
-      stage: "detailed",
-      attempt: 1,
-      ...(decision === undefined ? {} : { parsed: decision }),
-      ...(params.error === undefined ? {} : { error: params.error }),
-      durationMs: params.durationMs,
-    }],
+    attempts: params.cached ? [] : [
+      ...(params.earlier ?? []).map((failed, index) => ({
+        stage: "detailed" as const,
+        attempt: index + 1,
+        error: failed.error,
+        durationMs: failed.durationMs,
+      })),
+      {
+        stage: "detailed" as const,
+        attempt: (params.earlier?.length ?? 0) + 1,
+        ...(decision === undefined ? {} : { parsed: decision }),
+        ...(params.error === undefined ? {} : { error: params.error }),
+        durationMs: params.durationMs,
+      },
+    ],
     durationMs: params.durationMs,
     ...(params.cached ? { cached: true } : {}),
   };
 }
+
+type JevFailedAttempt = { error: string; durationMs: number };
 
 type JevScoresResult =
   | {
@@ -622,11 +634,62 @@ type JevScoresResult =
     scores: Record<string, number>;
     model: string;
     durationMs: number;
+    earlier?: JevFailedAttempt[];
   }
-  | { ok: false; reason: string; error?: string; durationMs?: number };
+  | {
+    ok: false;
+    reason: string;
+    error?: string;
+    durationMs?: number;
+    earlier?: JevFailedAttempt[];
+    /** True for a failure a second request may not repeat (timeout, network, 429, 5xx). */
+    retryable?: boolean;
+  };
+
+/**
+ * Attempts per classification. Jev endpoint latency comes in bursts (live
+ * sessions saw 12 s timeouts clustered minutes apart while typical calls took
+ * under a second), so one retry of a transient failure removes most manual
+ * "try again" turns. The action still fails closed if both attempts fail.
+ */
+const JEV_MAX_ATTEMPTS = 2;
+
+/**
+ * A Jev decisions request with one retry of a transient failure. A client
+ * error, unreadable or incomplete output, and a cancelled turn are not retried.
+ */
+async function requestJevScores(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  state: Record<string, string>,
+  questions: JevQuestions,
+  deps: JevKeyDeps = {},
+): Promise<JevScoresResult> {
+  const earlier: JevFailedAttempt[] = [];
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await requestJevScoresOnce(ctx, config, state, questions, deps);
+    if (result.ok) {
+      return earlier.length > 0 ? { ...result, earlier: [...earlier] } : result;
+    }
+    const retry = result.retryable === true &&
+      result.error !== undefined &&
+      attempt < JEV_MAX_ATTEMPTS &&
+      !ctx.signal?.aborted;
+    if (!retry) {
+      return earlier.length > 0
+        ? {
+          ...result,
+          earlier: [...earlier],
+          reason: `${result.reason} (after ${attempt} attempts)`,
+        }
+        : result;
+    }
+    earlier.push({ error: result.error!, durationMs: result.durationMs ?? 0 });
+  }
+}
 
 /** One Jev decisions request. Any failure returns `ok: false` so callers block. */
-async function requestJevScores(
+async function requestJevScoresOnce(
   ctx: ExtensionContext,
   config: EffectiveConfig,
   state: Record<string, string>,
@@ -663,6 +726,7 @@ async function requestJevScores(
         reason: `Jev classifier failed; auto mode fails closed: ${parsed.error}`,
         error: parsed.error,
         durationMs: Date.now() - started,
+        retryable: response.status === 429 || response.status >= 500,
       };
     }
     const missing = missingJevAnswers(parsed.scores, questions);
@@ -687,6 +751,9 @@ async function requestJevScores(
     const timedOut = signal.aborted || /abort|timeout/i.test(message);
     return {
       ok: false,
+      // A timeout or network error may pass on a second try; a turn the user
+      // cancelled must not be retried.
+      retryable: !ctx.signal?.aborted,
       reason:
         `Jev classifier ${
           timedOut ? `timed out after ${config.jevTimeoutMs}ms` : "failed"
@@ -782,6 +849,7 @@ export async function defaultJevClassifyAction(
           error: result.error,
           durationMs: result.durationMs ?? 0,
           cached: false,
+          earlier: result.earlier,
         }),
       }),
     };
@@ -809,6 +877,7 @@ export async function defaultJevClassifyAction(
       decision,
       durationMs: result.durationMs,
       cached: false,
+      earlier: result.earlier,
     }),
   };
 }
