@@ -233,3 +233,11 @@ test("summarizeSweep treats scope_escape as advisory", () => {
 	assert.equal(summary.maxAllowedScope, 0.9);
 	assert.equal(summary.suggestedSoftThreshold, undefined);
 });
+
+test("summarizeSweep applies the read-only intent threshold to read-only runs", () => {
+	const summary = summarizeSweep([
+		{ case: bashCase({ name: "mr read" }), runs: [{ ...gate(0.1, { intent: 0.7, soft: 0.7 }), readOnly: true }] },
+		{ case: bashCase({ name: "restart" }), runs: [gate(0.1, { intent: 0.7, soft: 0.7 })] },
+	], baseConfig());
+	assert.deepEqual(summary.falseBlocks, ["restart"]);
+});

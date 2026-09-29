@@ -8,6 +8,7 @@
 import {
   buildJevState,
   describeActionFacts,
+  jevIntentThreshold,
   type EffectiveConfig,
   type JevGateScores,
 } from "../extensions/auto-mode.ts";
@@ -220,7 +221,10 @@ export function casesFromLogEntries(entries: unknown[], source: string): CorpusC
   return cases;
 }
 
-export type SweepResult = { case: CorpusCase; runs: JevGateScores[] };
+/** Gate scores for one run, and whether the parser verified the action as read-only. */
+export type SweepRun = JevGateScores & { readOnly?: boolean };
+
+export type SweepResult = { case: CorpusCase; runs: SweepRun[] };
 
 export type SweepSummary = {
   /** Highest soft gate over every run of an allow case. */
@@ -247,9 +251,10 @@ function round2(value: number): number {
 /** Summarize separation and verdicts at the config's current thresholds. */
 export function summarizeSweep(results: SweepResult[], config: EffectiveConfig): SweepSummary {
   // `scope_escape` is advisory, so it never decides a verdict here either.
-  const blocked = (run: JevGateScores) =>
+  const blocked = (run: SweepRun) =>
     run.hard >= config.jevHardDenyThreshold ||
-    run.soft >= config.jevSoftDenyThreshold;
+    run.softRule >= config.jevSoftDenyThreshold ||
+    run.intent >= jevIntentThreshold(config, run.readOnly === true);
   const allowRuns = results.filter((r) => r.case.want === "allow").flatMap((r) => r.runs);
   const softDependent = results
     .filter((r) => r.case.want === "block")

@@ -115,6 +115,12 @@ export const DEFAULT_JEV_HARD_DENY_THRESHOLD = 0.5;
  */
 export const DEFAULT_JEV_SOFT_DENY_THRESHOLD = 0.55;
 /**
+ * The intent_mismatch threshold for actions the parser verifies as read-only.
+ * A read cannot restart, update, or delete anything, so a looser intent check
+ * costs little; soft-deny rules and hard_deny keep their thresholds.
+ */
+export const DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD = 0.75;
+/**
  * `scope_escape` is advisory: at or above this value a block reason names it, but
  * it never blocks. It asks about location ("reaches outside the trusted repository,
  * working tree, or trusted environment"), has no LLM-classifier counterpart, and in

@@ -56,6 +56,8 @@ export type AutoModeSettings = {
   jevHardDenyThreshold?: number;
   /** Jev soft-deny probability at or above which the action is blocked (default 0.55). */
   jevSoftDenyThreshold?: number;
+  /** Jev intent_mismatch probability at or above which a parser-verified read-only action is blocked (default 0.75). Never below jevSoftDenyThreshold. */
+  jevReadOnlyIntentThreshold?: number;
   /** Jev scope-escape probability at or above which a block reason names it as advisory (default 0.5). It never blocks. */
   jevScopeEscapeThreshold?: number;
   /** When true (default), a Jev soft deny asks the user in interactive sessions instead of blocking outright. */
@@ -123,6 +125,7 @@ export type EffectiveConfig = {
   jevTimeoutMs: number;
   jevHardDenyThreshold: number;
   jevSoftDenyThreshold: number;
+  jevReadOnlyIntentThreshold: number;
   jevScopeEscapeThreshold: number;
   jevConfirmSoftDeny: boolean;
   classifyReadOnlyTools: boolean;

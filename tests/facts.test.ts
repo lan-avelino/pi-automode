@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { describeActionFacts } from "../extensions/auto-mode.ts";
+import { describeActionFacts, mentionsCredentials } from "../extensions/auto-mode.ts";
 
 function bash(command: string): string {
 	return JSON.stringify({ toolName: "bash", input: { command } });
@@ -51,8 +51,6 @@ test("describeActionFacts never marks a writing remote command read-only", () =>
 		"ssh prod-proxy 'rm -rf ~/proxy'",
 		"ssh prod-proxy 'ls > listing.txt'",
 		"ssh prod-proxy 'docker compose restart'",
-		// Second blocked action in session 01a0dc0c: sed is not on the read-only list.
-		"ssh prod-proxy 'cd ~/proxy && grep -n master_key config.yaml | sed \"s/:.*/: <redacted>/\"'",
 		// Nested remote shells are not followed.
 		"ssh prod-proxy 'ssh other-host ls'",
 		// Unsafe forms of otherwise read-only commands.
@@ -65,6 +63,14 @@ test("describeActionFacts never marks a writing remote command read-only", () =>
 		assert.match(facts.remote_shell!, /read_only=unverified$/, command);
 		assert.equal(facts.read_only, "unverified", command);
 	}
+});
+
+test("a read-only search for a secret is read-only but names a credential", () => {
+	// Second blocked action in session 01a0dc0c. sed substitutions only print, so
+	// it is read-only; the credential guard keeps it on the normal intent threshold.
+	const command = bash("ssh prod-proxy 'cd ~/proxy && grep -n master_key config.yaml | sed \"s/:.*/: <redacted>/\"'");
+	assert.equal(factMap(describeActionFacts(command, ["prod-proxy"])).read_only, "true");
+	assert.equal(mentionsCredentials(command), true);
 });
 
 test("describeActionFacts does not verify ssh forms that run or expose more", () => {
@@ -260,3 +266,141 @@ test("a verified read-only SQL call through sudo and docker exec counts as read-
 	}
 });
 
+
+// --- python HTTP reads -------------------------------------------------------
+
+function python(body: string, opener = "python3 - <<'PY'"): string {
+	return bash(`cd /tmp/paa-fix\n${opener}\n${body}\nPY`);
+}
+
+// The MR lookup that prompted in session 01a0d6e5 at 13:47.
+const MR_READ = [
+	"import json, urllib.request, os",
+	'hdr = {"PRIVATE-TOKEN": os.environ[\'PRIVATE_TOKEN\']}',
+	'P = "http://gitserver.mnl.azeus.com/api/v4/projects/719"',
+	'd = json.load(urllib.request.urlopen(urllib.request.Request(f"{P}/merge_requests/116", headers=hdr), timeout=60))',
+	'print(f"  MR !116: {d[\'title\']}")',
+	'c = json.load(urllib.request.urlopen(urllib.request.Request(f"{P}/merge_requests/116/commits", headers=hdr), timeout=60))',
+	"lines = (d['description'] or '').splitlines()",
+	"for i, l in enumerate(lines[:48], 1):",
+	'    print(f"{i:>4}: {l}")',
+].join("\n");
+
+test("describeActionFacts verifies a python script that only sends GET requests", () => {
+	const facts = factMap(describeActionFacts(python(MR_READ), []));
+	assert.equal(facts.python_http, "requests=GET only hosts=gitserver.mnl.azeus.com read_only=true");
+	assert.equal(facts.read_only, "true");
+});
+
+test("describeActionFacts does not verify python that writes, sends a body, or runs code", () => {
+	const writes = [
+		// A PUT with a body, as the MR description updates did.
+		MR_READ.replace("headers=hdr), timeout", 'data=json.dumps({"description": "x"}).encode(), headers=hdr, method="PUT"), timeout'),
+		// A positional body makes urlopen send a POST.
+		MR_READ.replace("headers=hdr), timeout=60)", 'headers=hdr), b"x", timeout=60)'),
+		MR_READ.replace("headers=hdr)", "hdr, b\"x\")"),
+		`${MR_READ}\nopen('/tmp/out.md', 'w').write(d['description'])`,
+		`${MR_READ}\nimport subprocess\nsubprocess.run(['rm', '-rf', 'x'])`,
+		`${MR_READ}\nos.system('rm -rf x')`,
+		`${MR_READ}\nf = os.remove\nf('x')`,
+		`${MR_READ}\ngetattr(os, 'sys' + 'tem')('x')`,
+		`${MR_READ}\n[os.remove][0]('x')`,
+		`${MR_READ}\nexec("import shutil")`,
+		`${MR_READ}\nimport requests`,
+		`${MR_READ}\n__import__('os').remove('x')`,
+		`${MR_READ}\nprint(f"{os.remove('x')}")`,
+	];
+	for (const body of writes) {
+		const facts = factMap(describeActionFacts(python(body), []));
+		assert.equal(facts.read_only, "unverified", body);
+		assert.match(facts.python_http ?? "read_only=unverified", /read_only=unverified/, body);
+	}
+	// An unquoted heredoc lets the shell expand the script first.
+	assert.equal(factMap(describeActionFacts(python(MR_READ, "python3 - <<PY"), [])).read_only, "unverified");
+	// A script file, `-c`, or a redirect out is not a verified stdin script.
+	assert.equal(factMap(describeActionFacts(python(MR_READ, "python3 - > /tmp/o <<'PY'"), [])).read_only, "unverified");
+	assert.equal(factMap(describeActionFacts(bash("python3 fetch.py"), [])).read_only, "unverified");
+	// Without an HTTP call there is no python_http line; an allowlisted script still only reads.
+	const plain = factMap(describeActionFacts(python("print(1)"), []));
+	assert.equal(plain.python_http, undefined);
+	assert.equal(plain.read_only, "true");
+});
+
+test("mentionsCredentials flags reads that name a secret, not env references or auth headers", () => {
+	for (const command of [
+		`ssh -o BatchMode=yes loki-litellm 'grep -n "master_key" ~/litellm/config.yaml | head -5'`,
+		"cat .env",
+		"grep -r API_KEY src/",
+		"grep password config/app.yml",
+		"cat ~/.ssh/id_rsa.pub",
+		"jq .token ~/.pi/agent/auth.json",
+		"grep -rn secret .",
+	]) {
+		assert.equal(mentionsCredentials(bash(command)), true, command);
+	}
+	for (const command of [
+		`python3 - <<'PY'\nhdr = {"PRIVATE-TOKEN": os.environ['PRIVATE_TOKEN']}\nPY`,
+		'curl -s -H "Authorization: Bearer $GITLAB_TOKEN" https://gitserver/api/v4/projects',
+		'curl -s -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" http://gitserver.mnl.azeus.com/api/v4/merge_requests/1',
+		"curl -s http://localhost:4000/metrics",
+		"grep -n tokenize src/lexer.ts",
+	]) {
+		assert.equal(mentionsCredentials(bash(command)), false, command);
+	}
+});
+
+test("describeActionFacts verifies read-only git subcommands only", () => {
+	for (const command of [
+		"git status --porcelain",
+		"git diff --stat origin/master...HEAD | sed 's/^/  /'",
+		"git log --oneline -5",
+		"git show 65979e4 --stat",
+		"git rev-parse HEAD | cut -c1-8",
+		"git -C /tmp/paa-fix diff --name-only",
+		"git branch --show-current",
+		"git ls-files code-lab",
+		"git blame -L 10,20 src/a.js",
+	]) {
+		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "true", command);
+	}
+	for (const command of [
+		"git commit -m x",
+		"git push origin HEAD",
+		"git checkout origin/master -- file",
+		"git diff --output=/tmp/x.diff",
+		"git diff --ext-diff",
+		"git -c core.pager='rm -rf ~' log",
+		"git -c alias.x='!rm -rf ~' x",
+		"git branch -D feature",
+		"git branch new-branch",
+		"git log --exec='touch x'",
+		"git --git-dir=/other/.git log",
+		"git diff origin/master...HEAD > /tmp/net.diff",
+	]) {
+		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "unverified", command);
+	}
+});
+
+test("describeActionFacts verifies sed only for substitutions and line printing", () => {
+	for (const command of [
+		"git diff --stat | sed 's/^/  /'",
+		"sed -n '10,20p' src/a.js",
+		"sed -n '$p' log.txt",
+		"sed -E 's|/tmp/[^ ]+|<tmp>|g; s/x/y/' notes.txt",
+		"cut -c1-8 ids.txt | tr a-z A-Z | uniq | nl",
+	]) {
+		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "true", command);
+	}
+	for (const command of [
+		"sed -i '' 's/a/b/' file.js",
+		"sed --in-place 's/a/b/' file.js",
+		"sed 's/a/b/w /tmp/out' file.js",
+		"sed 's/a/b/e' file.js",
+		"sed -n '1w /tmp/out' file.js",
+		"sed -f script.sed file.js",
+		"sed '1d' file.js > file.js",
+		"sed 'e rm -rf ~' file",
+	]) {
+		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "unverified", command);
+	}
+});

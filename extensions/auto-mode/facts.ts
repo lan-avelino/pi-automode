@@ -15,6 +15,7 @@ import { analyzeBash, type BashCommandAnalysis } from "./bash.ts";
 const READ_ONLY_COMMANDS = new Set([
   "cat",
   "cd",
+  "cut",
   "date",
   "df",
   "du",
@@ -29,6 +30,7 @@ const READ_ONLY_COMMANDS = new Set([
   "id",
   "jq",
   "ls",
+  "nl",
   "nproc",
   "ps",
   "pwd",
@@ -36,8 +38,10 @@ const READ_ONLY_COMMANDS = new Set([
   "sort",
   "stat",
   "tail",
+  "tr",
   "true",
   "uname",
+  "uniq",
   "uptime",
   "wc",
   "which",
@@ -530,11 +534,203 @@ function analyzeSsh(args: string[], stdin: SqlText[] = []): RemoteShell {
   return { host, commands, readOnly };
 }
 
+/** A sed line address: a number or `$`, optionally a range. */
+const SED_ADDRESS = String.raw`(?:\d+|\$)(?:,(?:\d+|\$))?`;
+/** `ADDRp`, or `s` with any delimiter and only the g, p, i, I, and number flags. */
+const SED_SAFE_COMMAND = new RegExp(
+  String.raw`^\s*(?:(?:${SED_ADDRESS})?p|(?:${SED_ADDRESS})?s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1[gpiI0-9]*)\s*$`,
+);
+
+/**
+ * True when sed only prints: no in-place edit or script file, and every command
+ * is a substitution or a print. The `w`, `W`, `e`, and `r` commands and flags
+ * write files or run programs, so they never match.
+ */
+function sedIsReadOnly(args: string[]): boolean {
+  const scripts: string[] = [];
+  let sawScript = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === "-n" || arg === "-E" || arg === "-r" || arg === "--quiet" || arg === "--silent") continue;
+    if (arg === "-e") {
+      const script = args[i + 1];
+      if (script === undefined) return false;
+      scripts.push(script);
+      sawScript = true;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) return false;
+    if (!sawScript) {
+      scripts.push(arg);
+      sawScript = true;
+    }
+  }
+  return scripts.length > 0 &&
+    scripts.every((script) => script.split(/[;\n]/).every((command) => SED_SAFE_COMMAND.test(command)));
+}
+
+/** git subcommands that only read the repository. */
+const GIT_READ_SUBCOMMANDS = new Set([
+  "blame", "branch", "cat-file", "describe", "diff", "log", "ls-files", "merge-base",
+  "rev-parse", "shortlog", "show", "status",
+]);
+/** `git branch` flags that only list; anything else may create, rename, or delete. */
+const GIT_BRANCH_LIST_FLAGS = new Set(["-a", "-r", "-v", "-vv", "--all", "--list", "--remotes", "--show-current", "--verbose"]);
+
+/**
+ * True for `git [-C DIR] SUBCOMMAND ...` with a read-only subcommand. Other
+ * global options are refused: `-c` can set a pager or alias that runs a
+ * command, and `--git-dir` reaches another repository. Options that write a
+ * file or run a program are refused too.
+ */
+function gitIsReadOnly(args: string[]): boolean {
+  let rest = args;
+  if (rest[0] === "-C") {
+    if (rest.length < 2) return false;
+    rest = rest.slice(2);
+  }
+  const [subcommand, ...options] = rest;
+  if (!subcommand || !GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+  if (options.some((arg) => /^--(output|ext-diff|exec|textconv|open-files-in-pager)\b/.test(arg) || arg === "-O")) {
+    return false;
+  }
+  if (subcommand === "branch") return options.every((arg) => GIT_BRANCH_LIST_FLAGS.has(arg));
+  return true;
+}
+
+/** Modules a verified python script may import. */
+const PYTHON_IMPORTS = new Set(["json", "os", "re", "sys", "textwrap", "urllib.request"]);
+/** Module functions a verified python script may call. */
+const PYTHON_MODULE_CALLS = new Set([
+  "json.dumps", "json.load", "json.loads", "os.environ.get", "os.getenv",
+  "re.compile", "re.findall", "re.match", "re.search", "re.sub", "sys.exit",
+  "textwrap.indent", "textwrap.shorten", "urllib.request.Request", "urllib.request.urlopen",
+]);
+/** Builtins a verified python script may call. `open`, `exec`, and `eval` are not here. */
+const PYTHON_BUILTINS = new Set([
+  "all", "any", "bool", "dict", "enumerate", "filter", "float", "int", "isinstance", "len",
+  "list", "map", "max", "min", "print", "range", "repr", "reversed", "round", "set", "sorted",
+  "str", "sum", "tuple", "zip",
+]);
+/** Methods of strings, lists, dicts, and regex matches, which only return values. */
+const PYTHON_METHODS = new Set([
+  "count", "decode", "encode", "endswith", "find", "findall", "format", "get", "group", "items",
+  "join", "keys", "lower", "lstrip", "match", "replace", "rstrip", "search", "split",
+  "splitlines", "startswith", "strip", "upper", "values",
+]);
+/** Keywords that may precede a parenthesis without being a call. */
+const PYTHON_KEYWORDS = new Set([
+  "and", "elif", "else", "for", "if", "in", "is", "not", "or", "return", "while", "with",
+]);
+const PYTHON_INTERPRETER = /^python(3(\.\d+)?)?$/;
+
+/** The top-level arguments of the call whose `(` is at `open`, or undefined if unbalanced. */
+function pythonCallArgs(source: string, open: number): string[] | undefined {
+  const args: string[] = [];
+  let depth = 0;
+  let quote: string | undefined;
+  let start = open + 1;
+  for (let i = open; i < source.length; i += 1) {
+    const char = source[i]!;
+    if (quote) {
+      if (char === "\\") i += 1;
+      else if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+    else if ("([{".includes(char)) depth += 1;
+    else if (")]}".includes(char)) {
+      depth -= 1;
+      if (depth === 0) {
+        args.push(source.slice(start, i).trim());
+        return args.filter((arg) => arg !== "");
+      }
+    } else if (char === "," && depth === 1) {
+      args.push(source.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when a python script can only read: it imports and calls nothing off
+ * the allowlists, and every HTTP call is a `urllib` GET with no body. The scan
+ * covers string literals too, so an f-string expression is checked like code.
+ */
+function pythonScriptReadOnly(script: string): boolean {
+  // Dunder access, chained calls, `file=`, and decorators reach code the call scan cannot name.
+  if (/__|[)\]]\s*\(|\bfile\s*=|^\s*@|\bdata\s*=|\bmethod\s*=/m.test(script)) return false;
+  const importStatements = script.match(/^[ \t]*import[ \t]+[^\n]+$/gm) ?? [];
+  if ((script.match(/\bimport\b/g) ?? []).length !== importStatements.length) return false;
+  for (const statement of importStatements) {
+    for (const part of statement.replace(/^\s*import\s+/, "").split(",")) {
+      const name = part.trim().split(/\s+as\s+/)[0] ?? "";
+      if (!PYTHON_IMPORTS.has(name)) return false;
+    }
+  }
+  for (const match of script.matchAll(/(\.?[A-Za-z_][\w.]*)\s*\(/g)) {
+    // A leading dot is a method on an expression, such as `(text or '').splitlines()`.
+    const name = match[1]!.startsWith(".") ? `(value)${match[1]}` : match[1]!;
+    const segments = name.split(".");
+    const allowed = segments.length === 1
+      ? PYTHON_BUILTINS.has(name) || PYTHON_KEYWORDS.has(name)
+      : PYTHON_MODULE_CALLS.has(name) ||
+        (!PYTHON_IMPORTS.has(segments[0]!) && segments[0] !== "urllib" &&
+          PYTHON_METHODS.has(segments[segments.length - 1]!));
+    if (!allowed) return false;
+    // A second positional argument is a request body; only headers and a timeout may follow.
+    const keywords = name === "urllib.request.Request"
+      ? ["headers"]
+      : name === "urllib.request.urlopen"
+      ? ["timeout"]
+      : undefined;
+    if (keywords) {
+      const args = pythonCallArgs(script, match.index! + match[0].length - 1);
+      if (!args || args.length === 0) return false;
+      for (const arg of args.slice(1)) {
+        const keyword = /^(\w+)\s*=/.exec(arg)?.[1];
+        if (!keyword || !keywords.includes(keyword)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** The script a `python3 -` call reads from a quoted heredoc, or undefined for any other form. */
+function pythonStdinScript(command: BashCommandAnalysis): string | undefined {
+  const { name, args } = unwrapTimeout(command.effectiveCommand.name, command.effectiveCommand.args);
+  if (!name || !PYTHON_INTERPRETER.test(name)) return undefined;
+  if (!(args.length === 0 || (args.length === 1 && args[0] === "-"))) return undefined;
+  const heredocs = command.redirects.filter((redirect) => redirect.heredoc);
+  if (heredocs.length !== 1 || command.redirects.length !== 1) return undefined;
+  // An unquoted heredoc lets the shell rewrite the script before python sees it.
+  if (!heredocs[0]!.heredocQuoted) return undefined;
+  return heredocs[0]!.heredocContent ?? "";
+}
+
+function pythonHttpFacts(commands: BashCommandAnalysis[]): string[] {
+  return commands.flatMap((command) => {
+    const script = pythonStdinScript(command);
+    if (script === undefined || !/\burlopen\s*\(/.test(script)) return [];
+    const readOnly = !command.dynamic && pythonScriptReadOnly(script);
+    const hosts = [...new Set([...script.matchAll(/https?:\/\/([A-Za-z0-9.-]+)/g)].map((m) => m[1]!))];
+    return [
+      `python_http: requests=${readOnly ? "GET only" : "unverified"} hosts=${
+        hosts.join(",") || "(unknown)"
+      } read_only=${readOnly ? "true" : "unverified"}`,
+    ];
+  });
+}
+
 function commandIsReadOnly(
   command: BashCommandAnalysis,
   allowRemoteShell: boolean,
   stdin: SqlText[] = [],
 ): boolean {
+  const script = pythonStdinScript(command);
+  if (script !== undefined) return !command.dynamic && pythonScriptReadOnly(script);
   if (command.dynamic || command.effectiveCommand.unresolvedTransparentDispatch) {
     return false;
   }
@@ -548,7 +744,35 @@ function commandIsReadOnly(
   }
   if (sqlCallIsReadOnly(command, stdin)) return true;
   if (name === "curl") return curlIsReadOnly(args);
+  if (name === "git") return gitIsReadOnly(args);
+  if (name === "sed") return sedIsReadOnly(args);
   return READ_ONLY_COMMANDS.has(name) && !hasUnsafeArgument(name, args);
+}
+
+/** Words that name a secret, as a search term, key, or file. */
+const CREDENTIAL_TERMS =
+  /master[_-]?key|api[_-]?key|secret|passw|passphrase|credential|private[_-]?key|\btoken\b|_token\b|\bauth\.json\b|\.env\b|id_rsa|id_ed25519|\.pem\b|\.netrc\b/i;
+
+/**
+ * True when a serialized action names a credential. Environment references
+ * (`$VAR`, `${VAR}`, `os.environ['VAR']`, `os.getenv('VAR')`) and auth header
+ * names only pass a secret along, so they are removed first. Used to keep
+ * reads that go looking for a secret on the normal intent threshold.
+ */
+export function mentionsCredentials(action: string): boolean {
+  let text: string;
+  try {
+    const parsed = JSON.parse(action) as ActionShape;
+    text = typeof parsed?.input?.command === "string" ? parsed.input.command : action;
+  } catch {
+    text = action;
+  }
+  const stripped = text
+    .replace(/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/g, "")
+    .replace(/os\.environ(\.get)?\s*[[(]\s*['"][^'"]*['"]\s*[\])]/g, "")
+    .replace(/os\.getenv\s*\(\s*['"][^'"]*['"]/g, "")
+    .replace(/['"]?\b(PRIVATE-TOKEN|JOB-TOKEN|Authorization|X-[A-Za-z-]*Token)\b['"]?\s*:\s*(Bearer\b)?/gi, "");
+  return CREDENTIAL_TERMS.test(stripped);
 }
 
 /**
@@ -615,6 +839,7 @@ export function describeActionFacts(
     );
   }
   lines.push(...sqlFacts(analysis.commands));
+  lines.push(...pythonHttpFacts(analysis.commands));
   const readOnly = writes.length === 0 &&
     analysis.commands.length > 0 &&
     analysis.commands.every((c) => commandIsReadOnly(c, true));

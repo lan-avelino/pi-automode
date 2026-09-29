@@ -24,7 +24,7 @@ import {
   classifierCacheSessionId,
   classifierEnvironment,
 } from "./classifier.ts";
-import { describeActionFacts } from "./facts.ts";
+import { describeActionFacts, mentionsCredentials } from "./facts.ts";
 import type {
   ClassificationDecision,
   ClassifierIo,
@@ -383,6 +383,31 @@ export function jevGateScores(
 }
 
 /**
+ * The intent_mismatch threshold for an action. A parser-verified read-only
+ * action uses `jevReadOnlyIntentThreshold`, which never goes below the soft
+ * threshold: reading past what the user asked cannot restart, update, or delete
+ * anything. Soft-deny rules and hard_deny are unchanged.
+ */
+export function jevIntentThreshold(config: EffectiveConfig, readOnly: boolean): number {
+  return readOnly
+    ? Math.max(config.jevSoftDenyThreshold, config.jevReadOnlyIntentThreshold)
+    : config.jevSoftDenyThreshold;
+}
+
+/** True when the parser facts verify the action as read-only. */
+export function factsReadOnly(facts: string): boolean {
+  return /^read_only: true$/m.test(facts);
+}
+
+/**
+ * True when an action gets the read-only intent threshold: the parser verifies
+ * it as read-only and it does not go looking for a credential.
+ */
+export function relaxedIntentRead(action: string, facts: string): boolean {
+  return factsReadOnly(facts) && !mentionsCredentials(action);
+}
+
+/**
  * Map per-question probabilities onto pi-automode's decision + tier. Missing
  * scores fail closed, so a caller that skips `missingJevAnswers` cannot turn
  * incomplete output into an allow.
@@ -391,6 +416,7 @@ export function jevDecision(
   scores: Record<string, number>,
   config: EffectiveConfig,
   questions: JevQuestions,
+  options: { readOnly?: boolean } = {},
 ): ClassificationDecision {
   const missing = missingJevAnswers(scores, questions);
   if (missing.length > 0) {
@@ -405,6 +431,7 @@ export function jevDecision(
     scores,
     questions,
   );
+  const intentThreshold = jevIntentThreshold(config, options.readOnly === true);
   // Label the components and the gating value separately: a block driven by
   // `intent_mismatch` would otherwise report the smaller rule score under a
   // bare "soft" label.
@@ -433,10 +460,11 @@ export function jevDecision(
       }`,
     );
   }
-  if (intent >= config.jevSoftDenyThreshold) {
-    fired.push(
-      `${scored("intent_mismatch", intent, config.jevSoftDenyThreshold)}: the action may go beyond what the user asked`,
-    );
+  if (intent >= intentThreshold) {
+    const label = intentThreshold === config.jevSoftDenyThreshold
+      ? scored("intent_mismatch", intent, intentThreshold)
+      : `intent_mismatch scored ${intent.toFixed(2)} (read-only threshold ${intentThreshold.toFixed(2)})`;
+    fired.push(`${label}: the action may go beyond what the user asked`);
   }
   // `scope_escape` is advisory: it never blocks (caveat 20). At or above its
   // threshold it is still named, so the user sees why the action looked risky.
@@ -451,7 +479,7 @@ export function jevDecision(
   if (hard >= config.jevHardDenyThreshold) {
     return { decision: "block", tier: "hard_deny", reason, ...ruleField };
   }
-  if (soft >= config.jevSoftDenyThreshold) {
+  if (softRule >= config.jevSoftDenyThreshold || intent >= intentThreshold) {
     return { decision: "block", tier: "soft_deny", reason, ...ruleField };
   }
   return {
@@ -569,6 +597,7 @@ export function jevStatusText(
     `credential: ${credential}`,
     `hard deny threshold: ${config.jevHardDenyThreshold}`,
     `soft deny threshold: ${config.jevSoftDenyThreshold}`,
+    `read-only intent threshold: ${jevIntentThreshold(config, true)} (verified read-only actions that name no credential)`,
     `scope escape threshold: ${config.jevScopeEscapeThreshold} (advisory; scope_escape never blocks)`,
     `confirm soft deny: ${config.jevConfirmSoftDeny ? "on (asks in interactive sessions)" : "off"}`,
     `timeout: ${config.jevTimeoutMs}ms`,
@@ -807,6 +836,7 @@ export async function defaultJevClassifyAction(
       hard: config.jevHardDenyThreshold,
       soft: config.jevSoftDenyThreshold,
       scope: config.jevScopeEscapeThreshold,
+      readOnlyIntent: config.jevReadOnlyIntentThreshold,
     }))
     .digest("hex");
 
@@ -859,7 +889,9 @@ export async function defaultJevClassifyAction(
     };
   }
 
-  const decision = jevDecision(result.scores, config, questions);
+  const decision = jevDecision(result.scores, config, questions, {
+    readOnly: relaxedIntentRead(action, state.facts ?? ""),
+  });
   CACHE.delete(cacheKey);
   CACHE.set(cacheKey, { decision, model: result.model });
   while (CACHE.size > CACHE_LIMIT) {
@@ -939,7 +971,9 @@ export async function probeJevClassifier(
       label: probe.label,
       action: probe.action,
       scores: result.scores,
-      decision: jevDecision(result.scores, config, questions),
+      decision: jevDecision(result.scores, config, questions, {
+        readOnly: relaxedIntentRead(probe.action, state.facts ?? ""),
+      }),
     });
   }
   return { ok: true, model, probes };

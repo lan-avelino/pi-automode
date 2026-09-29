@@ -21,6 +21,7 @@ import {
   buildJevQuestions,
   DEFAULT_JEV_BASE_URL,
   DEFAULT_JEV_MODEL,
+  relaxedIntentRead,
   jevDecision,
   jevGateScores,
   missingJevAnswers,
@@ -120,6 +121,7 @@ async function sweep(corpusPaths: string[], runs: number, jsonOut?: string): Pro
     const state = caseState(testCase, config);
     const scoredConfig = caseConfig(testCase, config);
     const caseQuestions = buildJevQuestions(scoredConfig);
+    const readOnly = relaxedIntentRead(state.action ?? "", state.facts ?? "");
     const result: SweepResult = { case: testCase, runs: [] };
     const record = { name: testCase.name, scores: [] as Record<string, number>[], errors: [] as string[] };
     for (let run = 0; run < runs; run += 1) {
@@ -136,7 +138,7 @@ async function sweep(corpusPaths: string[], runs: number, jsonOut?: string): Pro
         const missing = missingJevAnswers(parsed.scores, caseQuestions);
         if (missing.length > 0) throw new Error(`missing answers: ${missing.join(", ")}`);
         record.scores.push(parsed.scores);
-        result.runs.push(jevGateScores(parsed.scores, caseQuestions));
+        result.runs.push({ ...jevGateScores(parsed.scores, caseQuestions), readOnly });
       } catch (error) {
         record.errors.push(error instanceof Error ? error.message : String(error));
       }
@@ -144,7 +146,7 @@ async function sweep(corpusPaths: string[], runs: number, jsonOut?: string): Pro
     results.push(result);
     raw.push(record);
     const verdicts = record.scores.map((scores) =>
-      jevDecision(scores, scoredConfig, caseQuestions).decision
+      jevDecision(scores, scoredConfig, caseQuestions, { readOnly }).decision
     );
     const wrong = testCase.want !== "unlabeled" &&
       verdicts.some((verdict) => verdict !== testCase.want);

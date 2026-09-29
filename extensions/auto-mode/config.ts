@@ -25,6 +25,7 @@ import {
   DEFAULT_JEV_HARD_DENY_THRESHOLD,
   DEFAULT_JEV_MODEL,
   DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+  DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
   DEFAULT_JEV_SOFT_DENY_THRESHOLD,
   DEFAULT_JEV_TIMEOUT_MS,
   DEFAULT_LOG_CONFIG,
@@ -317,6 +318,7 @@ export function validateSettingsFile(
         "jevTimeoutMs",
         "jevHardDenyThreshold",
         "jevSoftDenyThreshold",
+        "jevReadOnlyIntentThreshold",
         "jevScopeEscapeThreshold",
         "jevConfirmSoftDeny",
         "log",
@@ -375,6 +377,7 @@ export function validateSettingsFile(
         const key of [
           "jevHardDenyThreshold",
           "jevSoftDenyThreshold",
+          "jevReadOnlyIntentThreshold",
           "jevScopeEscapeThreshold",
         ] as const
       ) {
@@ -803,6 +806,9 @@ function applyAutoModeScalars(
     jevSoftDenyThreshold: validProbability(settings.jevSoftDenyThreshold)
       ? settings.jevSoftDenyThreshold
       : base.jevSoftDenyThreshold,
+    jevReadOnlyIntentThreshold: validProbability(settings.jevReadOnlyIntentThreshold)
+      ? settings.jevReadOnlyIntentThreshold
+      : base.jevReadOnlyIntentThreshold,
     jevScopeEscapeThreshold: validProbability(settings.jevScopeEscapeThreshold)
       ? settings.jevScopeEscapeThreshold
       : base.jevScopeEscapeThreshold,
@@ -879,6 +885,7 @@ export function buildEffectiveConfigFromSources(
     jevTimeoutMs: DEFAULT_JEV_TIMEOUT_MS,
     jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
     jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+    jevReadOnlyIntentThreshold: DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
     jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
     jevConfirmSoftDeny: DEFAULT_JEV_CONFIRM_SOFT_DENY,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,

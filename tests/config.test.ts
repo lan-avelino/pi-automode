@@ -23,6 +23,7 @@ import {
 	DEFAULT_JEV_HARD_DENY_THRESHOLD,
 	DEFAULT_JEV_MODEL,
 	DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+	DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
 	DEFAULT_JEV_SOFT_DENY_THRESHOLD,
 	DEFAULT_JEV_TIMEOUT_MS,
 	DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
@@ -1493,4 +1494,24 @@ test("config diagnostics warn when a custom Jev endpoint uses the default key en
 		}
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("jevReadOnlyIntentThreshold defaults, validates, and overrides like the other thresholds", () => {
+	assert.equal(buildEffectiveConfigFromSources().jevReadOnlyIntentThreshold, DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD);
+	assert.deepEqual(validateSettingsFile({ autoMode: { jevReadOnlyIntentThreshold: 0.8 } }), []);
+	assert.ok(
+		validateSettingsFile({ autoMode: { jevReadOnlyIntentThreshold: 2 } }).some((d) =>
+			/jevReadOnlyIntentThreshold must be a number from 0 through 1/.test(d)
+		),
+	);
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: 0.8 } }],
+		projectLocalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: 0.65 } }],
+	});
+	assert.equal(config.jevReadOnlyIntentThreshold, 0.65);
+	assert.equal(
+		buildEffectiveConfigFromSources({ globalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: -1 } }] })
+			.jevReadOnlyIntentThreshold,
+		DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
+	);
 });

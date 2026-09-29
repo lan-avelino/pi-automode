@@ -100,15 +100,23 @@ function truncateToTokenCap(
   };
 }
 
+/**
+ * User turns come from the whole branch, tool calls from the model's context.
+ *
+ * Compaction drops earlier entries from the model's context. A standing
+ * instruction such as "commit and push once the reviewer says clean" then
+ * disappeared too, and every later commit looked unauthorized. The compaction
+ * summary is agent-written, so it never stands in for the user's turns.
+ */
 function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
     buildContextEntries?: () => ReturnType<typeof ctx.sessionManager.getBranch>;
   };
-  const contextEntries = sessionManager.buildContextEntries?.() ??
-    sessionManager.getBranch();
+  const branch = sessionManager.getBranch();
+  const inContext = new Set(sessionManager.buildContextEntries?.() ?? branch);
 
-  for (const [index, entry] of contextEntries.entries()) {
+  for (const [index, entry] of branch.entries()) {
     if (entry.type !== "message") continue;
     const message = entry.message as { role?: string; content?: unknown };
     if (message.role === "user") {
@@ -116,7 +124,7 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
       if (text) entries.push({ index, order: 0, kind: "user", text });
       continue;
     }
-    if (message.role !== "assistant") continue;
+    if (message.role !== "assistant" || !inContext.has(entry)) continue;
 
     for (const [order, toolCall] of collectAssistantToolCalls(
       message.content,

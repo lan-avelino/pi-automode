@@ -1533,6 +1533,7 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 	assert.match(text, /^hard deny threshold: 0\.5$/m);
 	assert.match(text, /^soft deny threshold: 0\.55$/m);
 	assert.match(text, /^scope escape threshold: 0\.5 \(advisory; scope_escape never blocks\)$/m);
+	assert.match(text, /^read-only intent threshold: 0\.75 \(verified read-only actions that name no credential\)$/m);
 	assert.match(text, /warning: autoMode\.jevBaseUrl/);
 	// A custom host with the default variable names the actual fix, not the
 	// variable the gate withholds.
@@ -1665,4 +1666,86 @@ test("/automode model without an argument does not open the LLM picker in Jev mo
 	assert.equal(last?.type, "info");
 	assert.match(last?.message ?? "", /Jev classifier model: ~typesafe\/jev-latest/);
 	assert.match(last?.message ?? "", /does not apply to the Jev backend/);
+});
+
+// --- read-only intent threshold ----------------------------------------------
+
+test("a verified read-only action is blocked on intent only at the read-only threshold", () => {
+	const config = baseConfig();
+	assert.equal(config.jevReadOnlyIntentThreshold, 0.75);
+	const scores = (intent: number, rule = 0.1) => ({
+		hard_deny: 0.1,
+		soft_deny_1: rule,
+		intent_mismatch: intent,
+		scope_escape: 0.7,
+	});
+	// The GitLab MR reads from session 01a0d6e5 scored intent 0.53-0.73.
+	assert.equal(jevDecision(scores(0.73), config, baseQuestions(), { readOnly: true }).decision, "allow");
+	assert.equal(jevDecision(scores(0.73), config, baseQuestions()).decision, "block");
+	const high = jevDecision(scores(0.75), config, baseQuestions(), { readOnly: true });
+	assert.equal(high.decision, "block");
+	assert.equal(high.tier, "soft_deny");
+	assert.match(high.reason, /intent_mismatch scored 0\.75 \(read-only threshold 0\.75\)/);
+	// Soft-deny rules and hard_deny keep their thresholds for read-only actions.
+	assert.equal(jevDecision(scores(0.1, 0.6), config, baseQuestions(), { readOnly: true }).decision, "block");
+	assert.equal(
+		jevDecision({ ...scores(0.1), hard_deny: 0.6 }, config, baseQuestions(), { readOnly: true }).tier,
+		"hard_deny",
+	);
+	// The read-only threshold never makes intent stricter than the soft threshold.
+	const strict = baseConfig({ jevReadOnlyIntentThreshold: 0.3 });
+	assert.equal(jevDecision(scores(0.5), strict, baseQuestions(), { readOnly: true }).decision, "allow");
+});
+
+test("defaultJevClassifyAction applies the read-only threshold only when the parser verifies read_only", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers({ hard_deny: 0.1, intent_mismatch: 0.7 }) }),
+			{ status: 200 },
+		)) as typeof fetch;
+	try {
+		const run = (command: string) =>
+			defaultJevClassifyAction(
+				createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+				jevTestConfig(),
+				JSON.stringify({ toolName: "bash", input: { command } }),
+				"",
+				JEV_KEY_DEPS,
+			);
+		assert.equal((await run("curl -s http://localhost:4000/metrics")).decision, "allow");
+		assert.equal((await run("sudo systemctl restart nginx")).decision, "block");
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("a read-only action that names a credential keeps the normal intent threshold", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers({ hard_deny: 0.35, intent_mismatch: 0.7 }) }),
+			{ status: 200 },
+		)) as typeof fetch;
+	try {
+		// Blocked in session 01a0dc65 on intent 0.70 alone, under "check TTFT in Loki".
+		const result = await defaultJevClassifyAction(
+			createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+			jevTestConfig(),
+			JSON.stringify({
+				toolName: "bash",
+				input: { command: `ssh -o BatchMode=yes loki-litellm 'grep -n "master_key" ~/litellm/config.yaml | head -5'` },
+			}),
+			"",
+			JEV_KEY_DEPS,
+		);
+		assert.equal(result.decision, "block");
+		assert.match(result.reason, /intent_mismatch scored 0\.70 \(threshold 0\.55\)/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
 });
