@@ -277,6 +277,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
     // Folders the user chose "Allow edits under … for this session" for. They
     // act as scratch roots until the session starts again.
     const sessionEditRoots = new Set<string>();
+    // pi shows one extension dialog at a time: opening a second replaces the
+    // first, whose promise then never settles. Parallel tool calls (such as a
+    // codemode Promise.all) would hang on the hidden dialog, so dialogs from
+    // this extension wait for the previous one to close.
+    let dialogQueue: Promise<unknown> = Promise.resolve();
+    const oneDialogAtATime = <T>(open: () => Promise<T>): Promise<T> => {
+      const result = dialogQueue.then(open);
+      dialogQueue = result.catch(() => undefined);
+      return result;
+    };
     let state: AutoModeState = {
       checkedActions: 0,
       blockedActions: 0,
@@ -647,10 +657,12 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             kind: "permissions.ask",
           }, logCtx);
         }
-        const allowed = await ctx.ui.confirm(
-          "Auto mode permission ask",
-          `Rule: ${pattern.raw}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
-          { signal: ctx.signal },
+        const allowed = await oneDialogAtATime(() =>
+          ctx.ui.confirm(
+            "Auto mode permission ask",
+            `Rule: ${pattern.raw}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
+            { signal: ctx.signal },
+          )
         );
         if (!allowed) {
           const matchedCommand = matchedCommandSummary(
@@ -924,15 +936,17 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         let choice: string | undefined;
         let outcome = "The user declined it.";
         try {
-          choice = await ctx.ui.select(
-            `Auto mode soft deny\n\n${decision.reason}\n\nAction:\n${summary}`,
-            [
-              allowOnce,
-              ...(allowSimilar ? [allowSimilar] : []),
-              ...(allowFolder ? [allowFolder] : []),
-              deny,
-            ],
-            { signal: ctx.signal },
+          choice = await oneDialogAtATime(() =>
+            ctx.ui.select(
+              `Auto mode soft deny\n\n${decision.reason}\n\nAction:\n${summary}`,
+              [
+                allowOnce,
+                ...(allowSimilar ? [allowSimilar] : []),
+                ...(allowFolder ? [allowFolder] : []),
+                deny,
+              ],
+              { signal: ctx.signal },
+            )
           );
         } catch {
           // A cancelled or failed prompt is not an approval.
