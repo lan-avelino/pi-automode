@@ -20,6 +20,8 @@ All notable changes to this project are documented in this file.
 
 ## Bug fixes
 
+- **Command text can no longer forge Jev facts** — A newline or other line break in a path, command name, or `ssh` host could add a line to Jev's `facts`, such as `read_only: true`, which also lifted the action to the looser read-only intent threshold. Control characters and Unicode line separators in fact values are now escaped, and only the parser's final `read_only` line counts.
+
 - **Compaction no longer drops the user's earlier turns from the classifier** — After pi compacts a session, the classifier transcript now keeps the user's turns from the whole branch. Tool calls still come from the compacted context, and the agent-written compaction summary is never treated as the user's. Before, a standing instruction such as "commit and push once the reviewer says clean" vanished at compaction, and later commits were flagged as unauthorized.
 
 - **Env prefixes no longer hide commands from deny and ask rules** — `permissions.deny` and `permissions.ask` Bash patterns now also match each command with `VAR=value` assignments and `env`/`command`/`exec` wrappers stripped, so `GIT_TRACE=0 git push --force` and `env X=1 git credential fill` are caught. `permissions.allow` stays literal, because a prefix such as `LD_PRELOAD=` changes what a command does.
