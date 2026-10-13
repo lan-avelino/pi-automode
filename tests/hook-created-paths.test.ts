@@ -117,7 +117,7 @@ test("while a claimed folder removal runs, calls that may change files wait (T11
 	assert.equal(removal.result?.block, undefined);
 	const write = await env.start("write", { path: "/tmp/s/x", content: "x" });
 	assert.equal(write.result?.block, true);
-	assert.match(write.result?.reason ?? "", /removing a session-created folder/);
+	assert.match(write.result?.reason ?? "", /changing a session-created path/);
 	const read = await env.start("read", { path: "/home/thesis.md" });
 	assert.equal(read.result?.block, undefined);
 	// A later extension blocked the removal: it still reaches tool_execution_end.
@@ -133,6 +133,19 @@ test("a claimed folder removal waits for a running call that may change files", 
 	const move = await env.start("bash", { command: "mv /home/thesis.md /tmp/s/" });
 	assert.equal(move.result?.block, undefined);
 	const removal = await env.start("bash", { command: "rm -rf /tmp/s" });
+	assert.equal(removal.result?.block, true);
+	assert.match(removal.result?.reason ?? "", /Another action is still running/);
+});
+
+test("a claimed file refresh waits for a running call that may change files (T26)", async () => {
+	const env = await setup();
+	await env.bash("echo a > /tmp/r.diff", () => env.fs.write("/tmp/r.diff"));
+	env.fs.tick();
+	// Parallel mode: both preflights run before either call executes.
+	const swap = await env.start("bash", { command: "mv /home/thesis.md /tmp/r.diff" });
+	assert.equal(swap.result?.block, undefined);
+	const removal = await env.start("bash", { command: "rm -f /tmp/r.diff" });
+	assert.equal(lastFacts(env.seen).length, 1);
 	assert.equal(removal.result?.block, true);
 	assert.match(removal.result?.reason ?? "", /Another action is still running/);
 });

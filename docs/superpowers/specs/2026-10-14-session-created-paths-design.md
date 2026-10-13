@@ -133,7 +133,7 @@ A path can be recorded or claimed only if it is:
 | `git worktree list` | none | `--porcelain` only |
 | `rm` | removes operands | `-r`, `-R`, `-f`, `-d`, `-v` (combinable), `--recursive`, `--force`, `--dir`, `--verbose` |
 | `mkdir` | creates operands | `-p`, `-v`, `--parents`, `--verbose` |
-| `ln -s` | creates LINK (a symlink) | the option set must include `-s` or `--symbolic`; otherwise only `-f`, `-n`, `-v` and their long forms; exactly TARGET and LINK |
+| `ln -s` | creates LINK (a symlink) | the option set must include `-s` or `--symbolic`; otherwise only `-f`, `-n`, `-v` and their long forms, and `-f` only together with `-n`; exactly TARGET and LINK |
 | `echo` | none | any arguments |
 | `printf` | none | any arguments except `-v` |
 | any command `commandIsReadOnly` accepts | none | as today, including `cd` and read-only `git` |
@@ -152,7 +152,7 @@ A path can be recorded or claimed only if it is:
 
 Read-only operands such as `ls /tmp` do not count.
 
-**Removal rule.** For a plan to claim anything, every `rm` operand, `git worktree remove` operand, and write target that exists when claims are computed must hold a valid claim. If one does not, the action gets no claims. A missing operand deletes nothing at that moment. Inside a guarded action, only fresh content can appear before it runs. Recording does not depend on this rule.
+**Removal rule.** For a plan to claim anything, every `rm` operand, `git worktree remove` operand, and write target that exists when claims are computed must hold a valid claim. If one does not, the action gets no claims. A missing operand deletes nothing at that moment. Inside a guarded action, only fresh content can appear before it runs. `ln -fn` replaces an existing LINK, so a LINK that exists when claims are computed must lie strictly inside a folder the action removes under a valid claim, and must not be a folder (the link would go inside it). Recording does not depend on this rule.
 
 ## Recording
 
@@ -236,9 +236,9 @@ These run just before pi-automode returns "allow", after any dialog.
 
 1. **Second check.** pi-automode repeats every claim's checks, including the walk. If a claim fails and Jev saw claim lines for this call, the action is blocked: "A session-created path changed while this action was reviewed; run it again." If Jev never saw them (a deterministic allow), the failed claims are only dropped from recording.
 2. **Running calls.** pi-automode keeps a map of allowed calls that have not reached `tool_execution_end`. Read-only calls are left out: the read-only built-in tools, and bash actions whose facts end in `read_only: true`. A running call is either *guarded* (its plan and paths are known) or *other*.
-   - A call that removes a recorded folder, with claims shown to Jev, is blocked if any running call conflicts. A conflict is either an *other* call, or a guarded call with an overlapping path (equal, inside, or above). Calls whose id is a prefix of this one, such as a codemode parent, are ignored. Reason: "Another action is still running; run this again after it finishes."
-   - While such a removal is running, a new call that is not read-only is blocked unless it is guarded with no overlapping path. Reason: "Another action is removing a session-created folder; run this after it finishes."
-   - The checks and the registration of the call run synchronously, with no `await` between them.
+   - A call with claims shown to Jev protects every path in its plan, including missing operands. It is blocked if any running call conflicts. A conflict is either an *other* call, or a guarded call with an overlapping path (equal, inside, or above a protected path). Calls whose id is a prefix of this one, such as a codemode parent, are ignored. Reason: "Another action is still running; run this again after it finishes."
+   - While such a call is running, a new call that is not read-only is blocked unless it is guarded with no overlapping path. Reason: "Another action is changing a session-created path; run this after it finishes."
+   - The second check is the last `await` before admission; the checks and the registration of the call run synchronously after it.
 
 ## Jev wording
 
@@ -276,6 +276,8 @@ Each threat has a test showing that no claim, record, or unsafe allow results.
 | T22 | `git worktree remove --force ~/old-wt; git diff > /tmp/claimed.diff` | removal rule |
 | T23 | `bash -c '…'`, `eval`, `sleep 9 && mv … &` in a claiming action | guard |
 | T24 | a folder removal whose remover never runs | `tool_execution_end` lifts the block |
+| T25 | `ln -sfn /x ~/thesis.md; echo y > /tmp/claimed.diff`, or `ln -sf /x /tmp/s/out` where `out` links to a user folder | removal rule for links; `-f` needs `-n` |
+| T26 | parallel calls: `mv ~/thesis.md /tmp/claimed.diff` is checked first, then `rm -f /tmp/claimed.diff` with a claim | running calls: every claimed call protects its paths, not only folder removals |
 
 ## Known gaps
 

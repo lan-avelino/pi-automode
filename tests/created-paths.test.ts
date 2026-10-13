@@ -53,7 +53,8 @@ test("planAction reads each table row and its options", () => {
 	assert.deepEqual(planAction("git worktree add --lock -f /tmp/w")?.creations, [
 		{ path: "/tmp/w", how: "git worktree add" },
 	]);
-	assert.deepEqual(planAction("ln --symbolic --force ../x /tmp/w/link")?.links, ["/tmp/w/link"]);
+	assert.deepEqual(planAction("ln --symbolic --force --no-dereference ../x /tmp/w/link")?.links, ["/tmp/w/link"]);
+	assert.deepEqual(planAction("ln -s ../x /tmp/w/link")?.links, ["/tmp/w/link"]);
 	assert.deepEqual(planAction("git worktree list --porcelain"), {
 		creations: [],
 		removals: [],
@@ -98,6 +99,13 @@ test("planAction refuses actions whose effects it cannot read", () => {
 		// T13: hard links.
 		"ln ~/thesis /tmp/x && rm ~/thesis && echo > /tmp/x",
 		"ln -f /tmp/a /tmp/b",
+		// A forced link without -n follows a symlink to a folder and replaces
+		// a file inside it.
+		"ln -sf ../x /tmp/w/link",
+		"ln --symbolic --force ../x /tmp/w/link",
+		// Operands after `--` are names, not options.
+		"ln -sf -- -n /tmp/w/link",
+		"ln -- -s /tmp/x",
 		// T14: options outside the tables.
 		"git -c core.hooksPath=/tmp/h worktree add /tmp/w",
 		"git --git-dir=/x worktree add /tmp/w",
@@ -326,10 +334,35 @@ test("one unclaimed removal or existing write target cancels every claim (T18, T
 	assert.equal((await env.paths.claimsFor(planAction("rm -rf /tmp/gone; echo y > /tmp/r.diff")!)).lines.length, 1);
 });
 
+test("a link may replace only an entry inside a folder the action removes under a claim (T25)", async () => {
+	const env = setup();
+	await run(env, "echo a > /tmp/r.diff", () => env.fs.write("/tmp/r.diff"));
+	await run(env, "mkdir /tmp/s", () => {
+		env.fs.mkdir("/tmp/s").mkdir("/tmp/s/dir").write("/tmp/s/file");
+		env.fs.symlink("/tmp/s/out", "/home/u");
+	});
+	env.fs.tick();
+	for (const command of [
+		// Replaces a user file next to a claimed write.
+		"ln -sfn /x /home/u/thesis.md; echo y > /tmp/r.diff",
+		// Inside the claimed folder, but the folder is not removed.
+		"ln -sfn /x /tmp/s/file; echo y > /tmp/r.diff",
+		// A real folder: even -n puts the link inside it.
+		"ln -sfn /x /tmp/s/dir; rm -rf /tmp/s",
+	]) {
+		assert.deepEqual((await env.paths.claimsFor(planAction(command)!)).lines, [], command);
+	}
+	// Replacing the agent's own entries in a folder it removes keeps the claim.
+	for (const link of ["/tmp/s/file", "/tmp/s/out", "/tmp/s/new"]) {
+		const command = `ln -sfn /x ${link}; rm -rf /tmp/s`;
+		assert.equal((await env.paths.claimsFor(planAction(command)!)).lines.length, 1, command);
+	}
+});
+
 test("a link through another spelling of /tmp cannot reroute a claimed write (T21)", async () => {
 	const env = setup();
 	await run(env, "echo a > /tmp/claimed.diff", () => env.fs.write("/tmp/claimed.diff"));
-	const command = "ln -sf /home/u/thesis.md /private/tmp/claimed.diff && echo x > /tmp/claimed.diff";
+	const command = "ln -sfn /home/u/thesis.md /private/tmp/claimed.diff && echo x > /tmp/claimed.diff";
 	assert.ok(planAction(command), "the strings differ, so only the real paths show the clash");
 	assert.deepEqual((await env.paths.claimsFor(planAction(command)!)).lines, []);
 });
@@ -380,17 +413,17 @@ test("the record keeps the newest entries within its cap and clear() empties it"
 
 test("a folder removal waits for running calls that could change files (T11)", () => {
 	const { paths } = setup();
-	const removal = { readOnly: false, paths: ["/private/tmp/s"], removesFolders: ["/private/tmp/s"] };
+	const removal = { readOnly: false, paths: ["/private/tmp/s"], protects: ["/private/tmp/s"] };
 	// The `mv` was checked first and has not finished.
 	assert.equal(paths.admit("mv", { readOnly: false }), undefined);
 	assert.match(paths.admit("rm", removal) ?? "", /Another action is still running/);
 	paths.release("mv");
 	assert.equal(paths.admit("rm", removal), undefined);
 	// Now the removal runs: later calls that may change files wait for it.
-	assert.match(paths.admit("mv2", { readOnly: false }) ?? "", /removing a session-created folder/);
+	assert.match(paths.admit("mv2", { readOnly: false }) ?? "", /changing a session-created path/);
 	assert.match(
 		paths.admit("inside", { readOnly: false, paths: ["/private/tmp/s/x"] }) ?? "",
-		/removing a session-created folder/,
+		/changing a session-created path/,
 	);
 	assert.equal(paths.admit("read", { readOnly: true }), undefined);
 	assert.equal(paths.admit("other-worktree", { readOnly: false, paths: ["/private/tmp/paa-r2"] }), undefined);
@@ -398,24 +431,38 @@ test("a folder removal waits for running calls that could change files (T11)", (
 	assert.equal(paths.admit("mv2", { readOnly: false }), undefined);
 });
 
+test("a claimed file refresh waits for running calls that could change it (T26)", () => {
+	const { paths } = setup();
+	const refresh = { readOnly: false, paths: ["/private/tmp/r.diff", "/private/tmp/gone"], protects: ["/private/tmp/r.diff", "/private/tmp/gone"] };
+	assert.equal(paths.admit("swap", { readOnly: false }), undefined);
+	assert.match(paths.admit("rm", refresh) ?? "", /Another action is still running/);
+	paths.release("swap");
+	assert.equal(paths.admit("rm", refresh), undefined);
+	// A guarded call that recreates the missing operand waits too.
+	assert.match(
+		paths.admit("mkdir", { readOnly: false, paths: ["/private/tmp/gone"] }) ?? "",
+		/changing a session-created path/,
+	);
+});
+
 test("two guarded refreshes of different worktrees run together", () => {
 	const { paths } = setup();
 	const refresh = (name: string) => ({
 		readOnly: false,
 		paths: [`/private/tmp/${name}`, `/private/tmp/${name}.diff`],
-		removesFolders: [`/private/tmp/${name}`],
+		protects: [`/private/tmp/${name}`],
 	});
 	assert.equal(paths.admit("p/1", refresh("paa-r2")), undefined);
 	assert.equal(paths.admit("p/2", refresh("paa-r1")), undefined);
-	assert.match(paths.admit("p/3", refresh("paa-r1")) ?? "", /still running|removing/);
+	assert.match(paths.admit("p/3", refresh("paa-r1")) ?? "", /still running|changing a session-created path/);
 });
 
 test("a codemode parent does not block its own nested removal, and agent_end clears running calls", () => {
 	const { paths } = setup();
 	assert.equal(paths.admit("parent", { readOnly: false }), undefined);
-	const removal = { readOnly: false, paths: ["/private/tmp/s"], removesFolders: ["/private/tmp/s"] };
+	const removal = { readOnly: false, paths: ["/private/tmp/s"], protects: ["/private/tmp/s"] };
 	assert.equal(paths.admit("parent/1", removal), undefined);
-	assert.match(paths.admit("sibling", { readOnly: false }) ?? "", /removing/);
+	assert.match(paths.admit("sibling", { readOnly: false }) ?? "", /changing a session-created path/);
 	paths.endTurn();
 	assert.equal(paths.admit("sibling", { readOnly: false }), undefined);
 });
