@@ -427,7 +427,7 @@ function hasUnsafeArgument(name: string, args: string[]): boolean {
   return unsafe ? args.some(unsafe) : false;
 }
 
-function isWriteRedirect(
+export function isWriteRedirect(
   redirect: BashCommandAnalysis["redirects"][number],
 ): boolean {
   if (redirect.heredoc) return false;
@@ -724,7 +724,7 @@ function pythonHttpFacts(commands: BashCommandAnalysis[]): string[] {
   });
 }
 
-function commandIsReadOnly(
+export function commandIsReadOnly(
   command: BashCommandAnalysis,
   allowRemoteShell: boolean,
   stdin: SqlText[] = [],
@@ -783,6 +783,7 @@ export function mentionsCredentials(action: string): boolean {
 export function describeActionFacts(
   action: string,
   trustedHosts: string[],
+  extraLines: string[] = [],
 ): string {
   let parsed: ActionShape;
   try {
@@ -840,6 +841,7 @@ export function describeActionFacts(
   }
   lines.push(...sqlFacts(analysis.commands));
   lines.push(...pythonHttpFacts(analysis.commands));
+  lines.push(...extraLines);
   const readOnly = writes.length === 0 &&
     analysis.commands.length > 0 &&
     analysis.commands.every((c) => commandIsReadOnly(c, true));

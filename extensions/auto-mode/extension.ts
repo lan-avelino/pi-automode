@@ -5,6 +5,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -34,9 +35,19 @@ import {
   scratchRootPath,
   writeGlobalAutoModeSetting,
 } from "./config.ts";
+import {
+  CreatedPaths,
+  type CreatedPathsFs,
+  NODE_CREATED_PATHS_FS,
+  type ClaimSet,
+  birthTimesUsable as probeBirthTimes,
+  planAction,
+} from "./created-paths.ts";
+import { describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
 import {
   defaultJevClassifyAction,
+  factsReadOnly,
   jevCredentialDiagnostics,
   jevStatusText,
   probeJevClassifier,
@@ -144,6 +155,12 @@ export type PiAutomodeOptions = {
   now?: () => Date;
   /** Override Bash analysis in tests. Runtime code uses unbash. */
   analyzeBash?: typeof analyzeBash;
+  /** Override the filesystem of the session-created path record in tests. */
+  createdPathsFs?: CreatedPathsFs;
+  /** Override the session-created path record's clock in tests. */
+  createdPathsNow?: () => Date;
+  /** Override the birth-time probe in tests. */
+  birthTimesUsable?: () => Promise<boolean>;
 };
 
 type PersistableSettingKey = GlobalAutoModeSettingKey;
@@ -497,7 +514,22 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return undefined;
     }
 
+    // Paths the agent created this session, for Jev's created_this_session
+    // facts. Memory only: the agent can write session entries, so nothing is
+    // restored from them. Off until birth times are known to be real.
+    const createdPaths = new CreatedPaths({
+      fs: options.createdPathsFs ?? NODE_CREATED_PATHS_FS,
+      now: options.createdPathsNow,
+    });
+    void (options.birthTimesUsable ?? probeBirthTimes)().then(
+      (usable) => createdPaths.setUsable(usable),
+      () => createdPaths.setUsable(false),
+    );
+    /** Claims computed for a call in progress, read by the classifier call. */
+    const callClaims = new Map<string, { claims: ClaimSet; shownToJev: boolean }>();
+
     pi.on("session_start", (_event, ctx) => {
+      createdPaths.clear();
       loadResult = loadConfigWithDiagnostics(
         ctx.cwd,
         projectIsTrusted(ctx),
@@ -530,7 +562,30 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return { systemPrompt: `${event.systemPrompt}\n\n${AUTO_MODE_GUIDANCE}` };
     });
 
-    pi.on("tool_call", async (event, ctx) => {
+    const makeLogCtx = (cfg: EffectiveConfig, ctx: ExtensionContext): LogCtx => ({
+      logger: createLogger({
+        enabled: cfg.log.enabled,
+        classifierIo: cfg.log.classifierIo,
+        sessionFile: ctx.sessionManager.getSessionFile?.(),
+        sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
+        sessionCwd: ctx.cwd,
+        sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
+        logRoot: options.logRoot,
+        now: now(),
+      }),
+      decisionId: newDecisionId(),
+      classifierModel: cfg.classifierBackend === "jev"
+        ? cfg.jevModel
+        : cfg.classifierModel,
+      reasoning: cfg.classifierBackend === "jev"
+        ? { mode: "backend", backend: "jev", model: cfg.jevModel }
+        : classifierReasoningForConfig(cfg.classifierReasoningLevel),
+    });
+
+    const decideToolCall = async (
+      event: ToolCallEvent,
+      ctx: ExtensionContext,
+    ): Promise<{ block: true; reason: string } | undefined> => {
       // Enforcement order:
       // 1. permission deny/ask rules,
       // 2. deterministic hard-deny checks that never consult the model,
@@ -544,25 +599,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
 
       const input = event.input as Record<string, unknown>;
       const summary = actionSummary(event.toolName, input);
-      const logCtx: LogCtx = {
-        logger: createLogger({
-          enabled: cfg.log.enabled,
-          classifierIo: cfg.log.classifierIo,
-          sessionFile: ctx.sessionManager.getSessionFile?.(),
-          sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
-          sessionCwd: ctx.cwd,
-          sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
-          logRoot: options.logRoot,
-          now: now(),
-        }),
-        decisionId: newDecisionId(),
-        classifierModel: cfg.classifierBackend === "jev"
-          ? cfg.jevModel
-          : cfg.classifierModel,
-        reasoning: cfg.classifierBackend === "jev"
-          ? { mode: "backend", backend: "jev", model: cfg.jevModel }
-          : classifierReasoningForConfig(cfg.classifierReasoningLevel),
-      };
+      const logCtx = makeLogCtx(cfg, ctx);
 
       if (ctx.signal?.aborted) {
         state.checkedActions += 1;
@@ -872,11 +909,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
+      // Session-created path claims, computed by the tool_call wrapper.
+      const pending = callClaims.get(event.toolCallId);
+      const extraFacts = pending?.claims.lines ?? [];
+      if (pending && extraFacts.length > 0) pending.shownToJev = true;
       const decision = await selectClassify(cfg)(
         ctx,
         cfg,
         serializeClassifierAction(event.toolName, input),
         loadedContext,
+        ...(extraFacts.length > 0 ? [{ extraFacts }] as const : []),
       );
       logClassifierIo(decision, logCtx);
       if (decision.decision === "allow") {
@@ -1035,6 +1077,75 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         action: summary,
         kind: "classifier",
       }, logCtx);
+    };
+
+    // The tool_call hook: the decision above, plus session-created paths on
+    // the Jev backend. Claims are computed before the decision so Jev sees
+    // them, checked again after it (a dialog can take minutes), and the call
+    // joins the running set before it is allowed. See created-paths.ts.
+    pi.on("tool_call", async (event, ctx) => {
+      const cfg = effectiveConfig();
+      const id = event.toolCallId;
+      if (!cfg.enabled || cfg.classifierBackend !== "jev" || typeof id !== "string") {
+        return decideToolCall(event, ctx);
+      }
+      const input = event.input as Record<string, unknown>;
+      const plan = event.toolName === "bash" && typeof input.command === "string"
+        ? planAction(input.command)
+        : undefined;
+      const call = {
+        claims: plan ? await createdPaths.claimsFor(plan, ctx.signal) : { claims: [], lines: [] },
+        shownToJev: false,
+      };
+      callClaims.set(id, call);
+      let result: Awaited<ReturnType<typeof decideToolCall>>;
+      try {
+        result = await decideToolCall(event, ctx);
+      } finally {
+        callClaims.delete(id);
+      }
+      if (result?.block) return result;
+
+      const finalBlock = (reason: string) =>
+        block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason,
+          action: actionSummary(event.toolName, input),
+          kind: "classifier",
+        }, makeLogCtx(cfg, ctx));
+      const claimsHold = await createdPaths.recheck(call.claims, ctx.signal);
+      if (!claimsHold && call.shownToJev) {
+        return finalBlock("A session-created path changed while this action was reviewed; run it again.");
+      }
+      const claims = claimsHold ? call.claims : { claims: [], lines: [] };
+      const readOnly = READ_ONLY_TOOLS.has(event.toolName) ||
+        (event.toolName === "bash" &&
+          factsReadOnly(describeActionFacts(serializeClassifierAction(event.toolName, input), cfg.trustedHosts)));
+      const paths = plan ? await createdPaths.runningPaths(plan) : undefined;
+      const waitReason = createdPaths.admit(id, {
+        readOnly,
+        ...(paths ? { paths } : {}),
+        removesFolders: call.shownToJev
+          ? claims.claims.filter((claim) => claim.folderRemoval).map((claim) => claim.canonical)
+          : [],
+      });
+      if (waitReason) return finalBlock(waitReason);
+      if (plan) await createdPaths.prepare(id, plan, input, claims);
+      return result;
+    });
+
+    pi.on("tool_result", async (event) => {
+      await createdPaths.complete(event.toolCallId, event.input);
+      return undefined;
+    });
+
+    pi.on("tool_execution_end", (event) => {
+      createdPaths.release(event.toolCallId);
+    });
+
+    pi.on("agent_end", () => {
+      createdPaths.endTurn();
     });
 
     pi.registerTool({
