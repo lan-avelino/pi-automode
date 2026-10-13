@@ -248,9 +248,16 @@ export type ConfigLoadResult = {
   diagnostics: string[];
 };
 
+/** Per-call extras for a classifier. The LLM backend ignores them. */
+export type ClassifyExtras = {
+  /** Fact lines from pi-automode's own records, such as session-created paths. */
+  extraFacts?: string[];
+};
+
 export type ClassifyAction = (
   ctx: ExtensionContext,
   config: EffectiveConfig,
   action: string,
   loadedContext: string,
+  extras?: ClassifyExtras,
 ) => Promise<ClassifyResult>;

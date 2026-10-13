@@ -114,6 +114,30 @@ test("caseState builds the same state fields the classifier sends", () => {
 	assert.match(fromConfig.facts!, /host=db-1 trusted=true/);
 });
 
+test("caseState renders a case's createdPaths as created_this_session facts", () => {
+	const state = caseState(
+		bashCase({
+			action: { toolName: "bash", input: { command: "git worktree remove --force /tmp/w; git diff > /tmp/w.diff" } },
+			createdPaths: [
+				{ path: "/tmp/w", kind: "folder", how: "git worktree add", at: "2026-10-13 13:33" },
+				{ path: "/tmp/w.diff", kind: "file", how: "redirect", at: "2026-10-13 14:51" },
+			],
+		}),
+		baseConfig(),
+	);
+	const lines = state.facts!.split("\n");
+	assert.equal(lines.at(-1), "read_only: unverified");
+	assert.equal(
+		lines.at(-3),
+		"created_this_session: /tmp/w (folder; absent before and present after the agent's git worktree add at 2026-10-13 13:33; every entry inside was created after the folder)",
+	);
+	assert.match(lines.at(-2)!, /^created_this_session: \/tmp\/w\.diff \(file; .* redirect at 2026-10-13 14:51; size and change time match/);
+	const { errors } = parseCorpus({
+		cases: [{ ...bashCase(), createdPaths: [{ path: "/tmp/w", kind: "link", how: "mkdir", at: "x" }] }],
+	});
+	assert.equal(errors.length, 1);
+});
+
 test("caseConfig applies a case's trusted hosts to the questions too", () => {
 	const config = caseConfig(bashCase({ trustedHosts: ["prod-proxy"] }), baseConfig());
 	assert.deepEqual(config.trustedHosts, ["prod-proxy"]);

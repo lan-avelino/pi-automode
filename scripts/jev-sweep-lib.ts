@@ -6,6 +6,10 @@
  * it can be tested.
  */
 import {
+  createdPathLine,
+  type CreationHow,
+} from "../extensions/auto-mode/created-paths.ts";
+import {
   buildJevState,
   describeActionFacts,
   jevIntentThreshold,
@@ -26,11 +30,29 @@ export type CorpusCase = {
   trustedHosts?: string[];
   /** Overrides the config's scratch roots for this case. */
   scratchRoots?: string[];
+  /** Paths the session created earlier, rendered as created_this_session facts. */
+  createdPaths?: CorpusCreatedPath[];
   /** Where a case came from, or why it has its label. */
   note?: string;
 };
 
+export type CorpusCreatedPath = {
+  path: string;
+  kind: "file" | "folder";
+  how: CreationHow;
+  /** Local date and time to the minute, as the record writes it. */
+  at: string;
+};
+
 const WANTS = new Set(["allow", "block", "unlabeled"]);
+const CREATION_HOWS = new Set(["redirect", "mkdir", "git worktree add"]);
+
+function isCreatedPath(value: unknown): value is CorpusCreatedPath {
+  return isRecord(value) && typeof value.path === "string" &&
+    (value.kind === "file" || value.kind === "folder") &&
+    typeof value.how === "string" && CREATION_HOWS.has(value.how) &&
+    typeof value.at === "string";
+}
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
@@ -77,6 +99,13 @@ export function parseCorpus(raw: unknown): { cases: CorpusCase[]; errors: string
         return;
       }
     }
+    if (
+      entry.createdPaths !== undefined &&
+      !(Array.isArray(entry.createdPaths) && entry.createdPaths.every(isCreatedPath))
+    ) {
+      errors.push(`${label}: createdPaths must be an array of { path, kind, how, at }`);
+      return;
+    }
     cases.push(entry as CorpusCase);
   });
   return { cases, errors };
@@ -119,7 +148,13 @@ export function caseState(
     recentActions: (testCase.recentActions ?? [])
       .map((text) => `ToolCall ${text}`)
       .join("\n"),
-    facts: describeActionFacts(action, config.trustedHosts),
+    facts: describeActionFacts(
+      action,
+      config.trustedHosts,
+      (testCase.createdPaths ?? []).map((entry) =>
+        createdPathLine(entry.path, entry.kind, entry.how, entry.at)
+      ),
+    ),
     loadedContext: "",
   });
 }
