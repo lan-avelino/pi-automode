@@ -115,8 +115,11 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
     const operands = strictOperands(args, OPTIONS[name]);
     if (!operands || operands.length === 0) return undefined;
     if (name === "ln") {
+      // Only options count: after `--`, `-n` is a file name.
+      const end = args.indexOf("--");
+      const options = (end < 0 ? args : args.slice(0, end)).filter((arg) => arg.startsWith("-"));
       const has = (short: string, long: string) =>
-        args.some((arg) => arg === long || new RegExp(`^-[a-z]*${short}`).test(arg));
+        options.some((arg) => arg === long || new RegExp(`^-[a-z]*${short}`).test(arg));
       const symbolic = has("s", "--symbolic");
       if (has("f", "--force") && !has("n", "--no-dereference")) return undefined;
       if (!symbolic || operands.length !== 2 || !isPlainAbsolutePath(operands[1]!)) {

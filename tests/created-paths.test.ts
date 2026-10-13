@@ -103,6 +103,9 @@ test("planAction refuses actions whose effects it cannot read", () => {
 		// a file inside it.
 		"ln -sf ../x /tmp/w/link",
 		"ln --symbolic --force ../x /tmp/w/link",
+		// Operands after `--` are names, not options.
+		"ln -sf -- -n /tmp/w/link",
+		"ln -- -s /tmp/x",
 		// T14: options outside the tables.
 		"git -c core.hooksPath=/tmp/h worktree add /tmp/w",
 		"git --git-dir=/x worktree add /tmp/w",
