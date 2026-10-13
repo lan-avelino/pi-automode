@@ -404,3 +404,106 @@ test("describeActionFacts verifies sed only for substitutions and line printing"
 		assert.equal(factMap(describeActionFacts(bash(command), [])).read_only, "unverified", command);
 	}
 });
+
+// --- scratch roots -----------------------------------------------------------
+
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** A scratch root under the real temp dir, removed after `run`. */
+function withScratchRoot(run: (root: string) => void): void {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-automode-scratch-")));
+	try {
+		run(root);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+const scratch = (root: string) => ({ scratchRoots: [root], protectedPaths: [".git", ".pi"] });
+
+test("describeActionFacts names writes and removals under a scratch root", () => {
+	// The worktree refresh in session 01a0d6e5 that Jev flagged as overwriting
+	// pre-existing files. The session itself had made both paths under /tmp.
+	withScratchRoot((root) => {
+		const command =
+			`cd /work/repo && git worktree remove --force ${root}/paa-r1 2>/dev/null; ` +
+			`git worktree add -q --detach ${root}/paa-r1 d5a9065 && ` +
+			`git diff ee0c617..d5a9065 > ${root}/review2-delta.diff && ` +
+			`git diff origin/master..d5a9065 > ${root}/review2-net.diff`;
+		const facts = factMap(describeActionFacts(bash(command), [], scratch(root)));
+		assert.equal(facts.local_file_writes, `${root}/review2-delta.diff, ${root}/review2-net.diff`);
+		assert.equal(facts.scratch_roots, root);
+		assert.equal(facts.scratch_root_writes, `${root}/review2-delta.diff, ${root}/review2-net.diff`);
+		assert.equal(facts.scratch_root_removals, `${root}/paa-r1`);
+	});
+});
+
+test("describeActionFacts lists rm targets under a scratch root as removals", () => {
+	withScratchRoot((root) => {
+		const facts = factMap(
+			describeActionFacts(bash(`rm -rf -- ${root}/old-clone ${root}/out.txt`), [], scratch(root)),
+		);
+		assert.equal(facts.scratch_root_removals, `${root}/old-clone, ${root}/out.txt`);
+	});
+});
+
+test("describeActionFacts adds no scratch facts when nothing touches a scratch root", () => {
+	withScratchRoot((root) => {
+		const command = "git diff > /work/repo/out.diff; rm -rf /work/repo/build";
+		const withRoots = describeActionFacts(bash(command), [], scratch(root));
+		assert.equal(withRoots, describeActionFacts(bash(command), []));
+		assert.doesNotMatch(withRoots, /scratch_root/);
+	});
+});
+
+test("describeActionFacts lists only the paths that are under a scratch root", () => {
+	withScratchRoot((root) => {
+		const facts = factMap(describeActionFacts(
+			bash(`git diff > ${root}/a.diff; git diff > /work/repo/b.diff; rm -rf ${root}/x /work/repo/y`),
+			[],
+			scratch(root),
+		));
+		assert.equal(facts.scratch_root_writes, `${root}/a.diff`);
+		assert.equal(facts.scratch_root_removals, `${root}/x`);
+	});
+});
+
+test("describeActionFacts does not count paths that only look like they are under a scratch root", () => {
+	withScratchRoot((root) => {
+		mkdirSync(join(root, "repo", ".git"), { recursive: true });
+		symlinkSync("/etc", join(root, "escape"));
+		for (const command of [
+			// The root itself is not a path under it.
+			`rm -rf ${root}`,
+			`rm -rf ${root}/`,
+			// `..` leaves the root.
+			`git diff > ${root}/../outside.diff`,
+			// A symlink under the root that points outside it.
+			`echo x > ${root}/escape/hosts`,
+			// A protected path inside the root.
+			`echo x > ${root}/repo/.git/config`,
+			`rm -rf ${root}/repo/.git`,
+			// Relative and dynamic targets cannot be placed without the shell's cwd.
+			`cd ${root} && git diff > out.diff`,
+			`git diff > "${root}/$NAME"`,
+			`rm -rf ${root}/*`,
+		]) {
+			const facts = describeActionFacts(bash(command), [], scratch(root));
+			assert.doesNotMatch(facts, /scratch_root/, command);
+		}
+	});
+});
+
+test("describeActionFacts resolves symlinked scratch roots", () => {
+	withScratchRoot((root) => {
+		const real = join(root, "real");
+		mkdirSync(real);
+		const link = join(root, "link");
+		symlinkSync(real, link);
+		// Configured as the symlink (like /tmp on macOS), written through the real path.
+		const facts = factMap(describeActionFacts(bash(`git diff > ${real}/a.diff`), [], scratch(link)));
+		assert.equal(facts.scratch_root_writes, `${real}/a.diff`);
+	});
+});

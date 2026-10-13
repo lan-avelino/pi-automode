@@ -696,6 +696,45 @@ test("the Jev questions explain the state fields that are not user authorization
 	assert.match(questions.intent_mismatch!.instructions, /asked in user_request/);
 });
 
+test("the Jev questions explain the scratch root facts", () => {
+	for (const question of Object.values(buildJevQuestions(baseConfig()))) {
+		assert.match(question.instructions, /scratch_root_writes and scratch_root_removals list paths under autoMode\.scratchRoots/);
+	}
+});
+
+test("defaultJevClassifyAction reports writes under configured scratch roots in the facts", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	const bodies: string[] = [];
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		bodies.push(String(init?.body));
+		return new Response(
+			JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }),
+			{ status: 200 },
+		);
+	}) as typeof fetch;
+
+	try {
+		const command = "git diff main > /scratch-test-root/review.diff";
+		await defaultJevClassifyAction(
+			createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+			jevTestConfig({
+				jevBaseUrl: "https://classifier.test/api/v1",
+				scratchRoots: ["/scratch-test-root"],
+			}),
+			JSON.stringify({ toolName: "bash", input: { command } }),
+			"",
+			JEV_KEY_DEPS,
+		);
+		const state = (JSON.parse(bodies[0]!) as { state: Record<string, string> }).state;
+		assert.match(state.facts!, /^scratch_roots: \/scratch-test-root$/m);
+		assert.match(state.facts!, /^scratch_root_writes: \/scratch-test-root\/review\.diff$/m);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
 test("redactSecrets removes private key blocks and bearer tokens", () => {
 	const input =
 		"-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\nAuthorization: Bearer abcdefghijklmnop";

@@ -69,7 +69,7 @@ A session approval only replaces the soft-deny prompt. Permission rules, determi
 }
 ```
 
-Protected paths inside a scratch root still reach the classifier, matched relative to the root and by name at any depth (`.git`, `build.gradle`). Denied paths, permission rules, accepted `permissions.ask` rules, and the deterministic hard-deny and safety-control checks still apply. `bash` commands are classified as usual, even when they write inside a scratch root.
+Protected paths inside a scratch root still reach the classifier, matched relative to the root and by name at any depth (`.git`, `build.gradle`). Denied paths, permission rules, accepted `permissions.ask` rules, and the deterministic hard-deny and safety-control checks still apply. `bash` commands are classified as usual, even when they write inside a scratch root. Under the Jev backend, the classifier is told which of a command's redirect targets and `rm` or `git worktree remove` operands are absolute paths inside a scratch root, so throwaway files are less often mistaken for your own. This is evidence for the classifier, not an allow rule.
 
 A Jev soft-deny prompt for a `write` or `edit` also offers **Allow edits under FOLDER for this session**, where FOLDER is the git repository containing the file, or else the file's folder. Choosing it makes that folder a scratch root until the session starts again, with the same exceptions. It is listed by `/automode approvals` and removed by `/automode approvals clear`. The option is not offered when the folder would be an invalid scratch root, such as the home directory.
 

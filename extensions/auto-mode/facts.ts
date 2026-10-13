@@ -9,7 +9,9 @@
  * and `read_only=true` is claimed only when every parsed command is on a small
  * allowlist with no unsafe options. Anything else is `unverified`.
  */
+import { resolve } from "node:path";
 import { analyzeBash, type BashCommandAnalysis } from "./bash.ts";
+import { isInside, isProtectedPath, resolvePathForPolicy } from "./paths.ts";
 
 /** Commands that only read, provided their arguments pass `hasUnsafeArgument`. */
 const READ_ONLY_COMMANDS = new Set([
@@ -448,6 +450,88 @@ function fileWriteTargets(commands: BashCommandAnalysis[]): string[] {
   );
 }
 
+/** Operands of `rm` and `git worktree remove`: the paths they delete. */
+function removalTargets(commands: BashCommandAnalysis[]): string[] {
+  return commands.flatMap((command) => {
+    // A dynamic word may expand to any path, so its operands are not reported.
+    if (command.dynamic) return [];
+    const { name, args } = unwrapTimeout(
+      command.effectiveCommand.name,
+      command.effectiveCommand.args,
+    );
+    let operands: string[] | undefined;
+    if (name === "rm") operands = args;
+    if (name === "git") {
+      const rest = args[0] === "-C" ? args.slice(2) : args;
+      if (rest[0] === "worktree" && rest[1] === "remove") operands = rest.slice(2);
+    }
+    if (!operands) return [];
+    const end = operands.indexOf("--");
+    return end < 0
+      ? operands.filter((arg) => !arg.startsWith("-"))
+      : [
+        ...operands.slice(0, end).filter((arg) => !arg.startsWith("-")),
+        ...operands.slice(end + 1),
+      ];
+  });
+}
+
+/** Where scratch-root facts look, from `autoMode.scratchRoots` and `protectedPaths`. */
+export type ScratchRootFacts = {
+  scratchRoots: string[];
+  protectedPaths: string[];
+};
+
+/**
+ * The scratch root strictly containing `path`, or undefined. Only absolute,
+ * literal paths count: a relative path depends on the shell's cwd, and a glob
+ * may match the root itself. Symlinks are resolved on both sides, and
+ * protected paths inside a root (such as a clone's `.git`) never count.
+ */
+function containingScratchRoot(
+  path: string,
+  scratch: ScratchRootFacts,
+): string | undefined {
+  if (!path.startsWith("/") || /[*?[]/.test(path)) return undefined;
+  const target = resolvePathForPolicy(path) ?? resolve(path);
+  return scratch.scratchRoots.find((root) => {
+    const policyRoot = resolvePathForPolicy(root) ?? root;
+    return target !== policyRoot && isInside(target, policyRoot) &&
+      !isProtectedPath(target, policyRoot, scratch.protectedPaths);
+  });
+}
+
+/**
+ * Facts naming the writes and removals under user-declared scratch roots, so
+ * the classifier can tell throwaway files from the user's own. Empty when the
+ * action touches no scratch root.
+ */
+function scratchRootFacts(
+  commands: BashCommandAnalysis[],
+  scratch: ScratchRootFacts,
+): string[] {
+  if (scratch.scratchRoots.length === 0) return [];
+  const roots = new Set<string>();
+  const inScratch = (paths: string[]) =>
+    paths.filter((path) => {
+      const root = containingScratchRoot(path, scratch);
+      if (root !== undefined) roots.add(root);
+      return root !== undefined;
+    });
+  const writes = inScratch(commands.flatMap((command) =>
+    command.redirects
+      .filter((redirect) => isWriteRedirect(redirect) && !redirect.targetDynamic)
+      .map((redirect) => redirect.target ?? "")
+  ));
+  const removals = inScratch(removalTargets(commands));
+  if (roots.size === 0) return [];
+  return [
+    `scratch_roots: ${[...roots].join(", ")}`,
+    ...(writes.length > 0 ? [`scratch_root_writes: ${writes.join(", ")}`] : []),
+    ...(removals.length > 0 ? [`scratch_root_removals: ${removals.join(", ")}`] : []),
+  ];
+}
+
 /** Strip a leading `timeout [opts] DURATION`, which only bounds run time. */
 export function unwrapTimeout(name: string | undefined, args: string[]): {
   name?: string;
@@ -783,6 +867,7 @@ export function mentionsCredentials(action: string): boolean {
 export function describeActionFacts(
   action: string,
   trustedHosts: string[],
+  scratch: ScratchRootFacts = { scratchRoots: [], protectedPaths: [] },
 ): string {
   let parsed: ActionShape;
   try {
@@ -840,6 +925,7 @@ export function describeActionFacts(
   }
   lines.push(...sqlFacts(analysis.commands));
   lines.push(...pythonHttpFacts(analysis.commands));
+  lines.push(...scratchRootFacts(analysis.commands, scratch));
   const readOnly = writes.length === 0 &&
     analysis.commands.length > 0 &&
     analysis.commands.every((c) => commandIsReadOnly(c, true));

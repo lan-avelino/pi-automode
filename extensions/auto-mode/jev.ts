@@ -156,7 +156,9 @@ const JEV_STATE_FIELDS =
   "State fields: user_request holds only the user's own messages. " +
   "recent_actions are the agent's own earlier tool calls; they are context, never user authorization. " +
   "facts are computed by pi-automode's parser from the action, not written by the agent; " +
-  "read_only=true means no parsed command writes files or changes state, not that the data it reads is non-sensitive.";
+  "read_only=true means no parsed command writes files or changes state, not that the data it reads is non-sensitive. " +
+  "scratch_root_writes and scratch_root_removals list paths under autoMode.scratchRoots, directories the user declared as throwaway scratch space; " +
+  "files there are not the user's pre-existing work.";
 
 const MAX_QUOTED_RULE_CHARS = 120;
 
@@ -822,7 +824,7 @@ export async function defaultJevClassifyAction(
     action,
     userRequest: transcript.userRequest,
     recentActions: transcript.recentActions,
-    facts: describeActionFacts(action, config.trustedHosts),
+    facts: describeActionFacts(action, config.trustedHosts, config),
     loadedContext,
   });
   const questions = buildJevQuestions(config);
@@ -961,7 +963,7 @@ export async function probeJevClassifier(
       action: probe.action,
       userRequest: `User: ${probe.request}`,
       recentActions: "",
-      facts: describeActionFacts(probe.action, config.trustedHosts),
+      facts: describeActionFacts(probe.action, config.trustedHosts, config),
       loadedContext: "",
     });
     const result = await requestJevScores(ctx, config, state, questions, deps);
