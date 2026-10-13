@@ -705,7 +705,9 @@ test("the Jev questions explain the state fields that are not user authorization
 	const questions = buildJevQuestions(baseConfig());
 	for (const question of Object.values(questions)) {
 		assert.match(question.instructions, /recent_actions are the agent's own earlier tool calls/);
-		assert.match(question.instructions, /facts are computed by pi-automode's parser/);
+		assert.match(question.instructions, /facts are computed by pi-automode from the action and its own records/);
+		assert.match(question.instructions, /created_this_session means pi-automode saw the path absent before/);
+		assert.match(question.instructions, /evidence, not proof/);
 	}
 	assert.match(questions.intent_mismatch!.instructions, /asked in user_request/);
 });
@@ -1761,5 +1763,29 @@ test("a read-only action that names a credential keeps the normal intent thresho
 	} finally {
 		globalThis.fetch = originalFetch;
 		clearJevCache();
+	}
+});
+
+test("defaultJevClassifyAction sends extra facts before the read_only line", async () => {
+	clearJevCache();
+	const originalFetch = globalThis.fetch;
+	const bodies: string[] = [];
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		bodies.push(String(init?.body));
+		return new Response(JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }), { status: 200 });
+	}) as typeof fetch;
+	try {
+		const line = "created_this_session: /tmp/r.diff (file; …)";
+		await defaultJevClassifyAction(
+			createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+			jevTestConfig({ jevBaseUrl: "https://classifier.test/api/v1" }),
+			JSON.stringify({ toolName: "bash", input: { command: "git diff > /tmp/r.diff" } }),
+			"",
+			{ ...JEV_KEY_DEPS, extraFacts: [line] },
+		);
+		const facts = (JSON.parse(bodies[0]!) as { state: { facts: string } }).state.facts.split("\n");
+		assert.deepEqual(facts.slice(-2), [line, "read_only: unverified"]);
+	} finally {
+		globalThis.fetch = originalFetch;
 	}
 });
