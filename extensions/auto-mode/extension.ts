@@ -1114,6 +1114,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           action: actionSummary(event.toolName, input),
           kind: "classifier",
         }, makeLogCtx(cfg, ctx));
+      // The recheck is the last await before admit, so nothing changes the
+      // running set between the final check and admission.
+      const paths = plan ? await createdPaths.runningPaths(plan) : undefined;
       const claimsHold = await createdPaths.recheck(call.claims, ctx.signal);
       if (!claimsHold && call.shownToJev) {
         return finalBlock("A session-created path changed while this action was reviewed; run it again.");
@@ -1122,12 +1125,11 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       const readOnly = READ_ONLY_TOOLS.has(event.toolName) ||
         (event.toolName === "bash" &&
           factsReadOnly(describeActionFacts(serializeClassifierAction(event.toolName, input), cfg.trustedHosts)));
-      const paths = plan ? await createdPaths.runningPaths(plan) : undefined;
       const waitReason = createdPaths.admit(id, {
         readOnly,
         ...(paths ? { paths } : {}),
-        removesFolders: call.shownToJev
-          ? claims.claims.filter((claim) => claim.folderRemoval).map((claim) => claim.canonical)
+        protects: call.shownToJev && claims.claims.length > 0
+          ? paths ?? claims.claims.map((claim) => claim.canonical)
           : [],
       });
       if (waitReason) return finalBlock(waitReason);

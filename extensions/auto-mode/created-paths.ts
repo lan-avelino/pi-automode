@@ -62,7 +62,9 @@ function strictOperands(args: string[], allowed: RegExp): string[] | undefined {
  * Options each path-changing command may use. Options that take a value,
  * such as `mkdir -m MODE` or `ln -t DIR`, are left out: a value can name a
  * folder the operands do not show. `git worktree add -b/-B` is left out
- * because `-B` resets a branch the user may own.
+ * because `-B` resets a branch the user may own. `ln -f` also needs `-n`:
+ * without it, a link path that is a symlink to a folder is followed, and the
+ * entry inside that folder is replaced.
  */
 const OPTIONS = {
   rm: /^(-[rRfdv]+|--recursive|--force|--dir|--verbose)$/,
@@ -113,7 +115,10 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
     const operands = strictOperands(args, OPTIONS[name]);
     if (!operands || operands.length === 0) return undefined;
     if (name === "ln") {
-      const symbolic = args.some((arg) => arg === "--symbolic" || /^-[fnv]*s/.test(arg));
+      const has = (short: string, long: string) =>
+        args.some((arg) => arg === long || new RegExp(`^-[a-z]*${short}`).test(arg));
+      const symbolic = has("s", "--symbolic");
+      if (has("f", "--force") && !has("n", "--no-dereference")) return undefined;
       if (!symbolic || operands.length !== 2 || !isPlainAbsolutePath(operands[1]!)) {
         return undefined;
       }
@@ -372,14 +377,18 @@ function claimLine(claim: Claim): string {
 export type RunningCall = {
   readOnly: boolean;
   paths?: string[];
-  /** Recorded folders this call removes, with claims Jev saw. */
-  removesFolders?: string[];
+  /**
+   * Every path of a call whose claims Jev saw. Until it ends, no other call
+   * may change anything at, inside, or above them, so the claims and the
+   * missing operands stay as Jev was told.
+   */
+  protects?: string[];
 };
 
-/** True when `paths` is unknown or has a path at, inside, or above a folder. */
-function overlaps(folders: string[], paths: string[] | undefined): boolean {
+/** True when `paths` is unknown or has a path at, inside, or above a protected one. */
+function overlaps(protectedPaths: string[], paths: string[] | undefined): boolean {
   if (paths === undefined) return true;
-  return folders.some((folder) =>
+  return protectedPaths.some((folder) =>
     paths.some((path) =>
       pathKey(path) === pathKey(folder) || strictlyAbove(folder, path) || strictlyAbove(path, folder)
     )
@@ -439,10 +448,10 @@ export class CreatedPaths {
    * Call this synchronously right before allowing, with no `await` between
    * the final checks and this call, so two calls cannot both pass.
    *
-   * - A call that removes a recorded folder (with claims Jev saw) waits for
-   *   every running call that could change files, unless that call is
-   *   guarded and touches nothing at, inside, or above the folder.
-   * - While such a removal runs, a call that may change files waits the same
+   * - A call whose claims Jev saw waits for every running call that could
+   *   change files, unless that call is guarded and touches nothing at,
+   *   inside, or above the call's paths.
+   * - While such a call runs, a call that may change files waits the same
    *   way.
    *
    * Calls whose id is a prefix of this one, such as the codemode call that
@@ -451,11 +460,11 @@ export class CreatedPaths {
   admit(toolCallId: string, call: RunningCall): string | undefined {
     for (const [id, other] of this.running) {
       if (id === toolCallId || toolCallId.startsWith(`${id}/`)) continue;
-      if (call.removesFolders?.length && !other.readOnly && overlaps(call.removesFolders, other.paths)) {
+      if (call.protects?.length && !other.readOnly && overlaps(call.protects, other.paths)) {
         return "Another action is still running; run this again after it finishes.";
       }
-      if (other.removesFolders?.length && !call.readOnly && overlaps(other.removesFolders, call.paths)) {
-        return "Another action is removing a session-created folder; run this after it finishes.";
+      if (other.protects?.length && !call.readOnly && overlaps(other.protects, call.paths)) {
+        return "Another action is changing a session-created path; run this after it finishes.";
       }
     }
     if (!call.readOnly) this.running.set(toolCallId, call);
@@ -529,7 +538,10 @@ export class CreatedPaths {
   /**
    * Claims for an action's removals and existing write targets. Every one of
    * them must hold a valid claim, or the action gets none: a claim line next
-   * to an unclaimed deletion would read as cover for it.
+   * to an unclaimed deletion would read as cover for it. `ln -fn` replaces
+   * an existing link path, so one may exist only inside a folder the action
+   * removes under a claim, and must not be a folder (the link would go
+   * inside it).
    */
   async claimsFor(plan: ActionPlan, signal?: AbortSignal): Promise<ClaimSet> {
     if (!this.usable || this.records.size === 0) return NO_CLAIMS;
@@ -564,6 +576,19 @@ export class CreatedPaths {
           return NO_CLAIMS;
         }
         claims.push({ path: target.path, canonical: target.canonical, record, folderRemoval });
+      }
+      for (const link of canonical.links) {
+        let stat: StatLike;
+        try {
+          stat = await this.fs.lstat(link);
+        } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
+        if (stat.isDirectory()) return NO_CLAIMS;
+        if (!claims.some((claim) => claim.folderRemoval && strictlyAbove(claim.canonical, link))) {
+          return NO_CLAIMS;
+        }
       }
       return { claims, lines: claims.map(claimLine) };
     } catch {
