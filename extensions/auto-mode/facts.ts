@@ -844,5 +844,19 @@ export function describeActionFacts(
     analysis.commands.length > 0 &&
     analysis.commands.every((c) => commandIsReadOnly(c, true));
   lines.push(`read_only: ${readOnly ? "true" : "unverified"}`);
-  return lines.join("\n");
+  return lines.map(escapeLineBreaks).join("\n");
+}
+
+/**
+ * Escape control characters and Unicode line separators. Fact values come from
+ * command text, and a newline in a path or host would otherwise start a forged
+ * line such as `read_only: true`.
+ */
+function escapeLineBreaks(line: string): string {
+  return line.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, (char) => {
+    if (char === "\n") return "\\n";
+    if (char === "\r") return "\\r";
+    if (char === "\t") return "\\t";
+    return `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
 }

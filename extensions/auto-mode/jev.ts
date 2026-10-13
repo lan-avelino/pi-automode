@@ -394,9 +394,12 @@ export function jevIntentThreshold(config: EffectiveConfig, readOnly: boolean): 
     : config.jevSoftDenyThreshold;
 }
 
-/** True when the parser facts verify the action as read-only. */
+/**
+ * True when the parser facts verify the action as read-only. Only the last
+ * line counts: `describeActionFacts` always ends with its own verdict.
+ */
 export function factsReadOnly(facts: string): boolean {
-  return /^read_only: true$/m.test(facts);
+  return facts.split("\n").at(-1) === "read_only: true";
 }
 
 /**
