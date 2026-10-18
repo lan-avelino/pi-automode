@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DENIAL_HISTORY_LIMIT } from "./constants.ts";
+import { decisionLabel, decisionProfile, isDecisionBackend } from "./jev.ts";
 import type { AutoModeState, DenialRecord, EffectiveConfig } from "./types.ts";
 import { safeJson, truncateMiddle } from "./utils.ts";
 
@@ -23,22 +24,28 @@ export function statusLine(
   return `AM ${circle} a:${allowed} d:${state.blockedActions}${classifier}`;
 }
 
+/** The classifier and reasoning status lines, shared by /automode status and automode_inspect. */
+export function classifierStatusLines(config: EffectiveConfig): [string, string] {
+  const backend = config.classifierBackend;
+  if (isDecisionBackend(backend)) {
+    return [
+      `classifier: ${backend} (${decisionProfile(config, backend).model})`,
+      `classifier reasoning: not used by the ${decisionLabel(backend)} backend`,
+    ];
+  }
+  return [
+    `classifier: llm (${config.classifierModel ?? "current session model"})`,
+    `classifier reasoning: ${config.classifierReasoningLevel ?? "server default"}`,
+  ];
+}
+
 export function statusText(
   config: EffectiveConfig,
   state: AutoModeState,
 ): string {
   return [
     `enabled: ${(state.enabledOverride ?? config.enabled) ? "yes" : "no"}`,
-    `classifier: ${
-      config.classifierBackend === "jev"
-        ? `jev (${config.jevModel})`
-        : `llm (${config.classifierModel ?? "current session model"})`
-    }`,
-    `classifier reasoning: ${
-      config.classifierBackend === "jev"
-        ? "not used by the Jev backend"
-        : config.classifierReasoningLevel ?? "server default"
-    }`,
+    ...classifierStatusLines(config),
     `checked actions: ${state.checkedActions}`,
     `blocked actions: ${state.blockedActions}`,
     `classifier allowed: ${state.classifierAllowed}`,

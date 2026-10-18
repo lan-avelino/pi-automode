@@ -20,7 +20,7 @@ export type ClassifierReasoning =
     requestedLevel: ClassifierReasoningLevel;
     effectiveLevel: EffectiveClassifierReasoningLevel;
   }
-  | { mode: "backend"; backend: "jev"; model: string };
+  | { mode: "backend"; backend: DecisionBackend; model: string };
 
 export type ClassifierReasoningLog =
   | ClassifierReasoning
@@ -37,7 +37,9 @@ export type LogConfig = {
   classifierIo: boolean;
 };
 
-export type ClassifierBackend = "llm" | "jev";
+export type ClassifierBackend = "llm" | "jev" | "clef";
+/** Backends that call the OpenRouter decisions endpoint. */
+export type DecisionBackend = "jev" | "clef";
 
 export type AutoModeSettings = {
   enabled?: boolean;
@@ -62,6 +64,16 @@ export type AutoModeSettings = {
   jevScopeEscapeThreshold?: number;
   /** When true (default), a Jev soft deny asks the user in interactive sessions instead of blocking outright. */
   jevConfirmSoftDeny?: boolean;
+  /** Clef classifier model id (default "cloudflare/clef"). */
+  clefModel?: string;
+  /** Clef hard_deny probability at or above which the action is blocked. */
+  clefHardDenyThreshold?: number;
+  /** Clef soft-deny probability at or above which the action is blocked. */
+  clefSoftDenyThreshold?: number;
+  /** Clef intent_mismatch threshold for parser-verified read-only actions. Never below clefSoftDenyThreshold. */
+  clefReadOnlyIntentThreshold?: number;
+  /** Clef scope-escape probability at or above which a block reason names it as advisory. It never blocks. */
+  clefScopeEscapeThreshold?: number;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */
   classifyReadOnlyTools?: boolean;
@@ -128,6 +140,11 @@ export type EffectiveConfig = {
   jevReadOnlyIntentThreshold: number;
   jevScopeEscapeThreshold: number;
   jevConfirmSoftDeny: boolean;
+  clefModel: string;
+  clefHardDenyThreshold: number;
+  clefSoftDenyThreshold: number;
+  clefReadOnlyIntentThreshold: number;
+  clefScopeEscapeThreshold: number;
   classifyReadOnlyTools: boolean;
   fastClassifierMaxTokens: number;
   classifierTimeoutMs: number;
@@ -210,6 +227,8 @@ export type ClassifierIoAttempt = {
   };
   parsed?: ClassificationDecision;
   error?: string;
+  /** Decision backends: the provider that served the response and its input token count, as reported. */
+  served?: { provider?: string; inputTokens?: number };
   durationMs: number;
 };
 

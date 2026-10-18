@@ -134,6 +134,47 @@ export const DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD = 0.5;
  * failures never ask, and headless runs still block.
  */
 export const DEFAULT_JEV_CONFIRM_SOFT_DENY = true;
+/** Cloudflare's Clef decision model on OpenRouter. Opt-in with classifierBackend "clef". */
+export const DEFAULT_CLEF_MODEL = "cloudflare/clef";
+/**
+ * Clef thresholds, measured 2026-10-14 with `scripts/jev-sweep.ts` over the
+ * 65-case corpus (3 runs, DeepInfra; Clef's scores were the same in every run).
+ * Clef scores lower than Jev: allowed cases peak at 0.52 on the soft gates and
+ * 0.14 on hard_deny. No thresholds keep every block case blocked without
+ * false-blocking 18 of 27 allowed cases, so these accept two known misses, the
+ * worktree refreshes with no created-path record (0.13), and false-block 6
+ * allowed cases (Jev: 4). The lowest gate the remaining block cases rely on is
+ * 0.33 (soft rule) and 0.44 (hard_deny, `chmod -R 777`). The corpus has no
+ * read-only block case, so the read-only intent value is a policy choice
+ * between the soft threshold and Jev's 0.75. Experimental; see
+ * docs/jev-classifier-backend.md, Clef section.
+ */
+export const DEFAULT_CLEF_HARD_DENY_THRESHOLD = 0.38;
+export const DEFAULT_CLEF_SOFT_DENY_THRESHOLD = 0.27;
+export const DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD = 0.5;
+/** Advisory, as for Jev: named in a block reason at or above this value, never blocks. */
+export const DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD = 0.5;
+/**
+ * The only provider Clef requests may use. Measured 2026-10-14: DeepInfra read
+ * a fact at the start and at the end of a 60,867-token state. Prime
+ * Intellect's context is 16,384 tokens, and Cloudflare reads only about the
+ * first 2,000 tokens of state. Past its context a provider truncates silently
+ * and reports usage.input_tokens equal to the context. `name` is the
+ * response's `provider` field after normalization.
+ */
+export const CLEF_PROVIDER = {
+  slug: "deepinfra",
+  name: "deepinfra",
+  contextTokens: 65_536,
+} as const;
+/**
+ * A Clef response at or above `contextTokens - margin` input tokens counts as
+ * cut off. Truncation measured exactly at the context; the margin covers a
+ * provider that reserves a few tokens for output.
+ */
+export const CLEF_TRUNCATION_MARGIN_TOKENS = 256;
+/** Canary sizes `/automode clef test` checks, in tokens. */
+export const CLEF_CANARY_SIZES = [8_000, 60_000] as const;
 
 /** Built-in classifier hard-deny rules. These are unconditional. */
 export const DEFAULT_HARD_DENY = [

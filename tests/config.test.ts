@@ -18,6 +18,11 @@ import assert from "node:assert/strict";
 import {
 	DEFAULT_ALLOW,
 	DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
+	DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+	DEFAULT_CLEF_MODEL,
+	DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+	DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
+	DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
 	DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
 	DEFAULT_HARD_DENY,
 	DEFAULT_JEV_HARD_DENY_THRESHOLD,
@@ -1398,7 +1403,7 @@ test("validateSettingsFile rejects invalid Jev classifier settings", () => {
 		"inline",
 	);
 	for (const expected of [
-		/autoMode\.classifierBackend must be "llm" or "jev"/,
+		/autoMode\.classifierBackend must be "llm", "jev", or "clef"/,
 		/autoMode\.jevModel must be a provider\/model string/,
 		/autoMode\.jevBaseUrl must be a non-empty string/,
 		/autoMode\.jevApiKeyEnv must be a non-empty string/,
@@ -1514,4 +1519,110 @@ test("jevReadOnlyIntentThreshold defaults, validates, and overrides like the oth
 			.jevReadOnlyIntentThreshold,
 		DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
 	);
+});
+
+// --- Clef classifier backend -----------------------------------------------
+
+test("classifierBackend accepts clef, and the clef keys validate and merge", () => {
+	const accepted = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "clef",
+				clefModel: "cloudflare/clef",
+				clefHardDenyThreshold: 0.6,
+				clefSoftDenyThreshold: 0.5,
+				clefReadOnlyIntentThreshold: 0.7,
+				clefScopeEscapeThreshold: 0.5,
+			},
+		},
+		"inline",
+	);
+	assert.deepEqual(accepted, []);
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { classifierBackend: "clef", clefSoftDenyThreshold: 0.5 } }],
+		projectLocalSettings: [{ autoMode: { clefSoftDenyThreshold: 0.45 } }],
+	});
+	assert.equal(config.classifierBackend, "clef");
+	assert.equal(config.clefSoftDenyThreshold, 0.45);
+	assert.equal(config.clefModel, DEFAULT_CLEF_MODEL);
+});
+
+test("invalid clef settings are reported and ignored", () => {
+	const diagnostics = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "cloudflare",
+				clefModel: "clef",
+				clefSoftDenyThreshold: 1.5,
+				clefReadOnlyIntentThreshold: -1,
+			},
+		},
+		"inline",
+	);
+	for (const expected of [
+		/autoMode\.classifierBackend must be "llm", "jev", or "clef"/,
+		/autoMode\.clefModel must be a provider\/model string/,
+		/autoMode\.clefSoftDenyThreshold must be a number from 0 through 1/,
+		/autoMode\.clefReadOnlyIntentThreshold must be a number from 0 through 1/,
+	]) {
+		assert.ok(diagnostics.some((d) => expected.test(d)), String(expected));
+	}
+	assert.ok(!diagnostics.some((d) => /unknown autoMode key clef/.test(d)), diagnostics.join("; "));
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { clefModel: "clef", clefSoftDenyThreshold: 1.5 } }],
+	});
+	assert.equal(config.clefModel, DEFAULT_CLEF_MODEL);
+	assert.equal(config.clefSoftDenyThreshold, DEFAULT_CLEF_SOFT_DENY_THRESHOLD);
+});
+
+test("shared project config cannot select clef or change its settings", () => {
+	const config = buildEffectiveConfigFromSources({
+		projectSharedSettings: [{
+			autoMode: { classifierBackend: "clef", clefModel: "evil/model", clefSoftDenyThreshold: 0.99 },
+		}],
+	});
+	assert.equal(config.classifierBackend, "llm");
+	assert.equal(config.clefModel, DEFAULT_CLEF_MODEL);
+	assert.equal(config.clefSoftDenyThreshold, DEFAULT_CLEF_SOFT_DENY_THRESHOLD);
+});
+
+test("writeGlobalAutoModeSetting persists clefModel", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-clef-setting-"));
+	try {
+		const path = join(dir, "config.json");
+		writeGlobalAutoModeSetting("clefModel", "cloudflare/clef-2", path);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).autoMode.clefModel, "cloudflare/clef-2");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("config diagnostics warn about the key env on the Clef backend too", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-clef-keyenv-"));
+	const previousInlineSettings = process.env.PI_AUTOMODE_SETTINGS_JSON;
+	delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+	try {
+		const path = join(dir, "config.json");
+		writeFileSync(path, JSON.stringify({
+			autoMode: { classifierBackend: "clef", jevBaseUrl: "https://classifier.test/api/v1" },
+		}));
+		const loaded = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		assert.ok(loaded.diagnostics.some((d) => /jevApiKeyEnv/.test(d)), JSON.stringify(loaded.diagnostics));
+	} finally {
+		if (previousInlineSettings === undefined) delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+		else process.env.PI_AUTOMODE_SETTINGS_JSON = previousInlineSettings;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the Clef defaults are calibrated, not the fail-closed placeholders", () => {
+	for (const value of [
+		DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+		DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
+		DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+		DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
+	]) {
+		assert.notEqual(value, 0);
+	}
+	assert.ok(DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD >= DEFAULT_CLEF_SOFT_DENY_THRESHOLD);
 });

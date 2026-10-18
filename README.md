@@ -44,9 +44,11 @@ pi -e ./extensions/auto-mode.ts
 /automode config    # effective config, resolved log file path, + diagnostics
 /automode denials   # denial history for this session
 /automode approvals [clear] # list or clear this session's "allow similar" approvals
-/automode backend llm|jev # select the classifier backend and save it globally
+/automode backend llm|jev|clef # select the classifier backend and save it globally
 /automode jev       # report the Jev backend endpoint, credential source, and thresholds
 /automode jev test  # probe the live Jev endpoint in both directions
+/automode clef      # report the Clef backend model, provider policy, and thresholds
+/automode clef test # probe Clef in both directions and check it reads a long state in full
 /automode model     # open the LLM classifier model selector (LLM backend only)
 /automode model provider/model-id # save the active backend's classifier model to ~/.pi/agent/extensions/pi-automode/config.json
 ```
@@ -130,7 +132,7 @@ The value `allowInsideWorkingDirectory: true` allows file access inside the work
 
 ## Classifier backends
 
-The classifier stage supports two backends. The default is the LLM classifier (`"classifierBackend": "llm"`).
+The classifier stage supports three backends. The default is the LLM classifier (`"classifierBackend": "llm"`).
 
 The opt-in Jev backend (`"classifierBackend": "jev"`) replaces the classifier stage. It calls the Jev / SystemOne classifier through OpenRouter decisions API (`POST {model, state, questions}`). Every layer above the classifier stays authoritative and unchanged, including permission rules, deterministic hard-deny, `deniedPaths`, and the allow tiers.
 
@@ -166,6 +168,10 @@ Switch backends with `/automode backend llm` or `/automode backend jev`. This wr
 The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
 
 Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action, and it does not re-bound the rule lists for Jev. It keeps only the 12 most recent tool calls in the transcript and bounds each tool-call input to 1500 characters, because tool inputs are the agent's own actions rather than your authorization. A payload the endpoint rejects fails closed. If the endpoint instead accepts and silently truncates an oversized payload, Jev can classify a partial action and pi-automode cannot detect that; only the deterministic layers are unaffected by payload size.
+
+The opt-in, experimental Clef backend (`"classifierBackend": "clef"`) uses the same decisions client with Cloudflare's Clef model (`cloudflare/clef`), pinned to the DeepInfra provider, with its own `clefModel` and `clef*Threshold` settings. It shares `jevBaseUrl`, `jevApiKeyEnv`, `jevTimeoutMs`, and `jevConfirmSoftDeny` with Jev. A Clef response from another provider, or one whose input DeepInfra cut off at its 65,536-token context, blocks the action. While DeepInfra is down, or if your OpenRouter privacy settings exclude it, Clef-classified actions block. Clef scores lower than Jev; at its defaults it allows two corpus cases Jev blocks, refreshes of a worktree the agent has no created-path record for. `/automode clef test` probes Clef in both directions and checks that the provider reads the start and the end of an 8,000- and a 60,000-token state. See [configuration](docs/configuration.md#jev-and-clef-classifier-backends) and the Clef section of [Jev classifier backend](docs/jev-classifier-backend.md#clef).
+
+Switching the backend, or a decision backend's model, with `/automode backend`, `/automode model`, or `/automode reload` clears this session's "allow similar" approvals, since they answered the other model's soft denies. Folders approved for edits stay approved.
 
 The rest of this section describes the LLM backend.
 

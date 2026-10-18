@@ -27,6 +27,8 @@ const similar = (prompt: Prompt) =>
  */
 async function harness(options: {
 	config?: Partial<EffectiveConfig>;
+	/** Overrides `config`; read on every reload, so a test can change it mid-session. */
+	loadConfig?: () => EffectiveConfig;
 	decisions?: ClassifyResult[];
 	hasUI?: boolean;
 	mode?: string;
@@ -36,11 +38,14 @@ async function harness(options: {
 	const decisions = [...(options.decisions ?? [SOFT_BLOCK])];
 	const next = () => (decisions.length > 1 ? decisions.shift()! : decisions[0]!);
 	const fake = createFakePi();
+	const saved: Array<[string, string]> = [];
 	createPiAutomode({
-		loadConfig: () =>
-			baseConfig({ classifierBackend: options.llm ? "llm" : "jev", ...options.config }),
+		loadConfig: options.loadConfig ??
+			(() => baseConfig({ classifierBackend: options.llm ? "llm" : "jev", ...options.config })),
 		classifyAction: async () => next(),
 		jevClassifyAction: async () => next(),
+		// Never write the real global config from a test.
+		saveAutoModeSetting: (key, value) => saved.push([key, value]),
 	})(fake.pi);
 	const ctx = createFakeCtx(fake.entries, {
 		hasUI: options.hasUI ?? true,
@@ -65,7 +70,7 @@ async function harness(options: {
 				? { path: command, edits: [{ oldText: "a", newText: "b" }] }
 				: { url: command },
 		}, ctx) as { block?: boolean; reason?: string } | undefined;
-	return { fake, ctx, prompts, run };
+	return { fake, ctx, prompts, run, saved };
 }
 
 test("a Jev soft deny offers once, similar-for-session, and deny, with the reason and action", async () => {
@@ -81,6 +86,13 @@ test("a Jev soft deny offers once, similar-for-session, and deny, with the reaso
 		"Allow similar for this session: ssh prod-proxy 'sudo systemctl restart nginx' > /tmp/restart.log",
 		DENY,
 	]);
+});
+
+test("a Clef soft deny asks like a Jev one, and allow similar works", async () => {
+	const h = await harness({ config: { classifierBackend: "clef" }, answers: [similar, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	assert.equal(await h.run(RESTART), undefined);
+	assert.equal(h.prompts.length, 1);
 });
 
 test("allow once does not carry over to the next identical action", async () => {
@@ -318,4 +330,78 @@ test("the decline hint appears only for that rule, that tool, and an allowed loc
 	// An edit-tool block gets no hint; it is already the edit tool.
 	const edit = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { scratchRoots: ["/tmp"] } });
 	assert.doesNotMatch((await edit.run("/Volumes/work/a.js", "edit"))?.reason ?? "", /Hint:/);
+});
+
+test("a declined overwrite-rule block on the Clef backend gets the edit-tool hint", async () => {
+	const declined = await harness({
+		decisions: [RULE4_BLOCK],
+		answers: [DENY],
+		config: { classifierBackend: "clef", scratchRoots: ["/tmp"] },
+	});
+	assert.match((await declined.run(SCRIPT))?.reason ?? "", HINT);
+});
+
+// --- approvals across classifier changes ---------------------------------------
+
+const automode = (h: Awaited<ReturnType<typeof harness>>, args: string) =>
+	h.fake.commands.get("automode")!.handler(args, h.ctx);
+
+test("/automode backend clears session approvals when the classifier changes", async () => {
+	let current = baseConfig({ classifierBackend: "jev" });
+	const h = await harness({ loadConfig: () => current, answers: [similar, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	current = baseConfig({ classifierBackend: "clef" });
+	await automode(h, "backend clef");
+	assert.deepEqual(h.saved, [["classifierBackend", "clef"]]);
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /saved globally: clef; session approvals cleared/);
+	assert.equal((await h.run(RESTART))?.block, true);
+	assert.equal(h.prompts.length, 2);
+});
+
+test("/automode model clears session approvals when the decision model changes", async () => {
+	let current = baseConfig({ classifierBackend: "jev" });
+	const h = await harness({ loadConfig: () => current, answers: [similar, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	current = baseConfig({ classifierBackend: "jev", jevModel: "~typesafe/jev-2" });
+	await automode(h, "model ~typesafe/jev-2");
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /session approvals cleared/);
+	assert.equal((await h.run(RESTART))?.block, true);
+});
+
+test("/automode reload clears session approvals only when the classifier changes", async () => {
+	let current = baseConfig({ classifierBackend: "jev" });
+	const h = await harness({ loadConfig: () => current, answers: [similar, DENY] });
+	assert.equal(await h.run(RESTART), undefined);
+	await automode(h, "reload");
+	assert.doesNotMatch(h.ctx.notifications.at(-1)?.message ?? "", /approvals cleared/);
+	assert.equal(await h.run(RESTART), undefined);
+	assert.equal(h.prompts.length, 1);
+	current = baseConfig({ classifierBackend: "clef" });
+	await automode(h, "reload");
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /config reloaded; session approvals cleared/);
+	assert.equal((await h.run(RESTART))?.block, true);
+});
+
+test("session edit roots survive a backend change", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "pi-automode-folder-"));
+	mkdirSync(join(repo, ".git"));
+	try {
+		let current = baseConfig({ classifierBackend: "jev" });
+		const h = await harness({ loadConfig: () => current, answers: [folderOption] });
+		assert.equal(await h.run(join(repo, "a.js"), "edit"), undefined);
+		current = baseConfig({ classifierBackend: "clef" });
+		await automode(h, "backend clef");
+		assert.equal(await h.run(join(repo, "b.js"), "edit"), undefined);
+		assert.equal(h.prompts.length, 1);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
+});
+
+test("/automode backend reports the backend in effect when local config overrides it", async () => {
+	const h = await harness({ loadConfig: () => baseConfig({ classifierBackend: "jev" }) });
+	await automode(h, "backend clef");
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /saved globally: clef; current config uses jev/);
+	await automode(h, "backend nope");
+	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /Usage: \/automode backend <llm\|jev\|clef>/);
 });
