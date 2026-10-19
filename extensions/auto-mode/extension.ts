@@ -664,30 +664,30 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         }
       }
 
+      // One confirmation per tool call, however many ask rules match it.
+      const askMatches = cfg.permissionAsk.filter((pattern) =>
+        matchesToolPattern(
+          pattern,
+          event.toolName,
+          input,
+          ctx.cwd,
+          "match",
+          bashAnalysis,
+        )
+      );
       let askRequiresClassifier = false;
-      for (const pattern of cfg.permissionAsk) {
-        if (
-          !matchesToolPattern(
-            pattern,
-            event.toolName,
-            input,
-            ctx.cwd,
-            "match",
-            bashAnalysis,
-          )
-        ) {
-          continue;
-        }
+      if (askMatches.length > 0) {
+        const askRules = askMatches.map((pattern) => pattern.raw).join(", ");
+        const matchedCommand = matchedCommandSummary(
+          matchingBashCommandText(askMatches[0], bashAnalysis),
+        );
         if (!canAskUser(ctx)) {
-          const matchedCommand = matchedCommandSummary(
-            matchingBashCommandText(pattern, bashAnalysis),
-          );
           if (isOwnedInspection) state.checkedActions += 1;
           return block(ctx, {
             timestamp: Date.now(),
             toolName: event.toolName,
             reason:
-              `Matched permissions.ask (${pattern.raw})${
+              `Matched permissions.ask (${askRules})${
                 matchedCommand ? ` for command: ${matchedCommand}` : ""
               } but no interactive terminal is available`,
             action: summary,
@@ -697,19 +697,18 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         const allowed = await oneDialogAtATime(() =>
           ctx.ui.confirm(
             "Auto mode permission ask",
-            `Rule: ${pattern.raw}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
+            `${
+              askMatches.length === 1 ? "Rule" : "Rules"
+            }: ${askRules}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
             { signal: ctx.signal },
           )
         );
         if (!allowed) {
-          const matchedCommand = matchedCommandSummary(
-            matchingBashCommandText(pattern, bashAnalysis),
-          );
           if (isOwnedInspection) state.checkedActions += 1;
           return block(ctx, {
             timestamp: Date.now(),
             toolName: event.toolName,
-            reason: `Declined permissions.ask: ${pattern.raw}${
+            reason: `Declined permissions.ask: ${askRules}${
               matchedCommand ? `; matched command: ${matchedCommand}` : ""
             }`,
             action: summary,

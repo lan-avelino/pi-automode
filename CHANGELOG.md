@@ -29,6 +29,8 @@ All notable changes to this project are documented in this file.
 
 - **Classifier provenance on local decisions** — Record `classifierModel` and `reasoning` only on classifier-routed decision entries. A deterministic or permission decision never calls the classifier, so the previous entries advertised a classifier model and a `backend` reasoning mode for a verdict that was never requested, and a reader looking for the matching `classifier` entry would not find one.
 
+- **Single permission ask per tool call** — A tool call that matches several `permissions.ask` rules now shows one confirmation listing every matched rule instead of one dialog per rule. Declining still blocks the call and names every matched rule, and approving still routes it to the classifier.
+
 ## [1.17.0] - 2026-09-22
 
 ## New features

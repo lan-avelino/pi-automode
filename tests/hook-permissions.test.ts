@@ -1147,6 +1147,66 @@ test("accepted permissions.ask still obeys deniedPaths", async () => {
 	assert.equal(harness.classifierCalls, 0);
 });
 
+test("multiple matching permissions.ask rules prompt once per tool call", async () => {
+	const first = parseToolPattern("bash(*merge_requests*-X P*)");
+	const second = parseToolPattern("bash(*-X P*merge_requests*)");
+	assert.ok(first);
+	assert.ok(second);
+	const prompts: string[] = [];
+	const ctx = createFakeCtx();
+	ctx.ui.confirm = async (_title: string, message: string) => {
+		prompts.push(message);
+		return true;
+	};
+	const harness = await setupHookTest({
+		config: baseConfig({ permissionAsk: [first, second] }),
+		ctx,
+	});
+
+	await harness.emit("tool_call", {
+		toolName: "bash",
+		input: {
+			command:
+				"curl https://git.example/api/merge_requests/1; curl -X PUT https://git.example/api/merge_requests/1",
+		},
+	}, harness.ctx);
+
+	assert.equal(prompts.length, 1);
+	assert.match(prompts[0], /bash\(\*merge_requests\*-X P\*\)/);
+	assert.match(prompts[0], /bash\(\*-X P\*merge_requests\*\)/);
+	assert.equal(harness.classifierCalls, 1);
+});
+
+test("declined permissions.ask with multiple matching rules names all of them", async () => {
+	const first = parseToolPattern("bash(git push*)");
+	const second = parseToolPattern("bash(*origin main*)");
+	assert.ok(first);
+	assert.ok(second);
+	let prompts = 0;
+	const ctx = createFakeCtx();
+	ctx.ui.confirm = async () => {
+		prompts += 1;
+		return false;
+	};
+	const harness = await setupHookTest({
+		config: baseConfig({ permissionAsk: [first, second] }),
+		ctx,
+	});
+
+	const result = await harness.emit("tool_call", {
+		toolName: "bash",
+		input: { command: "git push origin main" },
+	}, harness.ctx) as { block?: boolean; reason?: string };
+
+	assert.equal(prompts, 1);
+	assert.equal(result.block, true);
+	assert.match(
+		result.reason ?? "",
+		/Declined permissions\.ask: bash\(git push\*\), bash\(\*origin main\*\)/,
+	);
+	assert.equal(harness.classifierCalls, 0);
+});
+
 test("declined permissions.ask blocks before permissions.allow", async () => {
 	const ask = parseToolPattern("bash(git status*)");
 	const allow = parseToolPattern("bash(*)");
