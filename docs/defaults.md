@@ -51,6 +51,12 @@ These are exceptions to `soft_deny`, not to `hard_deny`.
 
 The value `allowInsideWorkingDirectory: true` sends non-protected in-tree file access to the deterministic allow tier. Writes and edits to protected paths still reach the classifier. Classifier `allow` rules cannot override a classifier hard-deny decision.
 
+Matching is case-insensitive and works on whole path segments:
+
+- An entry without `/` matches that name at any depth: `build.gradle` protects `app/build.gradle`, and `.git` protects a nested repository's `.git/hooks`. A matching directory protects everything under it.
+- An entry with `/` is relative to the project root: `.config/git` and `src/main/webapp/WEB-INF`.
+- `*` matches any characters within one segment, never across `/`: `*.xcodeproj`, `vite.config.*`, `docker-compose*.yml`, `gradle/*.toml`. Other characters, including `.` and `+`, are literal.
+
 Protected directories: `.git`, `.config/git`, `.vscode`, `.idea`, `.husky`, `.cargo`, `.devcontainer`, `.yarn`, `.mvn`, `.pi`.
 
 Protected files include:
@@ -123,7 +129,7 @@ Classifier evidence has separate approximate-token budgets for user messages and
 
 The selector keeps the first and latest user messages as intent anchors. It fills the remaining space from the newest eligible entries.
 
-The selector limits individual entries. It marks omitted or truncated evidence in the classifier transcript. It excludes assistant prose and tool results.
+The selector limits individual entries. It keeps at most the 12 most recent tool calls, caps each at 400 approximate tokens, and caps each tool-call input string at 375 characters. The tool budget therefore does not bind at its 4000 default, and raising it above roughly 4800 adds no tool evidence. It marks omitted or truncated evidence in the classifier transcript. It excludes assistant prose and tool results. The user-message budget is separate, so no tool limit can evict a user message.
 
 These limits use approximate character counts. They do not guarantee the same result as a provider tokenizer.
 

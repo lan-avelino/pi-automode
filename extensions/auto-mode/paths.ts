@@ -188,15 +188,43 @@ function normalizeProtectedPathForMatch(value: string): string {
     .normalize("NFC");
 }
 
+/** Match one path segment against a pattern segment where `*` stays within the segment. */
+function segmentMatches(pattern: string, segment: string): boolean {
+  if (!pattern.includes("*")) return pattern === segment;
+  const source = pattern
+    .split("*")
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[^/]*");
+  return new RegExp(`^${source}$`).test(segment);
+}
+
+/**
+ * True when a project-relative path is protected. Matching is case-insensitive
+ * and works on whole path segments:
+ *
+ * - A pattern without `/` (`build.gradle`, `.git`, `*.xcodeproj`) matches that
+ *   name at any depth, and protects everything under a matching directory.
+ * - A pattern with `/` (`.config/git`, `src/main/webapp/WEB-INF`) is relative
+ *   to the project root and protects that path and everything under it.
+ * - `*` matches any characters within one segment, never across `/`. Other
+ *   characters are literal.
+ */
 export function matchesProtectedPath(
   relativePath: string,
   protectedPaths: string[],
 ): boolean {
-  const normalizedPath = normalizeProtectedPathForMatch(relativePath);
-  return protectedPaths.some((pattern) => {
-    const normalizedPattern = normalizeProtectedPathForMatch(pattern);
-    return normalizedPath === normalizedPattern ||
-      normalizedPath.startsWith(`${normalizedPattern}/`);
+  const segments = normalizeProtectedPathForMatch(relativePath)
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".");
+  return protectedPaths.some((raw) => {
+    const pattern = normalizeProtectedPathForMatch(raw).replace(/^\.\//, "");
+    const parts = pattern.split("/").filter((part) => part !== "");
+    if (parts.length === 0) return false;
+    if (!pattern.includes("/")) {
+      return segments.some((segment) => segmentMatches(parts[0]!, segment));
+    }
+    return segments.length >= parts.length &&
+      parts.every((part, index) => segmentMatches(part, segments[index]!));
   });
 }
 

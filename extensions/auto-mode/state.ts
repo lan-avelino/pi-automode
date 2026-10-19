@@ -29,8 +29,16 @@ export function statusText(
 ): string {
   return [
     `enabled: ${(state.enabledOverride ?? config.enabled) ? "yes" : "no"}`,
-    `classifier: ${config.classifierModel ?? "current session model"}`,
-    `classifier reasoning: ${config.classifierReasoningLevel ?? "server default"}`,
+    `classifier: ${
+      config.classifierBackend === "jev"
+        ? `jev (${config.jevModel})`
+        : `llm (${config.classifierModel ?? "current session model"})`
+    }`,
+    `classifier reasoning: ${
+      config.classifierBackend === "jev"
+        ? "not used by the Jev backend"
+        : config.classifierReasoningLevel ?? "server default"
+    }`,
     `checked actions: ${state.checkedActions}`,
     `blocked actions: ${state.blockedActions}`,
     `classifier allowed: ${state.classifierAllowed}`,

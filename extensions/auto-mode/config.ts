@@ -8,15 +8,26 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { HOME } from "./constants.ts";
 import {
   DEFAULT_ALLOW,
   DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
+  DEFAULT_CLASSIFIER_BACKEND,
   DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
   DEFAULT_DENIED_PATHS,
   DEFAULT_ENVIRONMENT,
   DEFAULT_FAST_CLASSIFIER_MAX_TOKENS,
   DEFAULT_HARD_DENY,
+  DEFAULT_JEV_API_KEY_ENV,
+  DEFAULT_JEV_CONFIRM_SOFT_DENY,
+  DEFAULT_JEV_BASE_URL,
+  DEFAULT_JEV_HARD_DENY_THRESHOLD,
+  DEFAULT_JEV_MODEL,
+  DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+  DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
+  DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+  DEFAULT_JEV_TIMEOUT_MS,
   DEFAULT_LOG_CONFIG,
   DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
   DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
@@ -36,6 +47,7 @@ import {
 } from "./permissions.ts";
 import type {
   AutoModeSettings,
+  ClassifierBackend,
   ClassifierReasoningLevel,
   ConfigLoadResult,
   EffectiveConfig,
@@ -46,6 +58,7 @@ import type {
   ToolPattern,
 } from "./types.ts";
 import { hasOwn, stringArray } from "./utils.ts";
+import { jevCredentialDiagnostics } from "./jev.ts";
 
 export type GlobalConfigPreparation = {
   status: "current" | "migrated" | "conflict" | "failed";
@@ -280,6 +293,7 @@ export function validateSettingsFile(
       const autoMode = settings.autoMode as Record<string, unknown>;
       const knownAutoMode = new Set([
         "enabled",
+        "classifierBackend",
         "classifierModel",
         "classifierReasoningLevel",
         "classifierTimeoutMs",
@@ -290,12 +304,23 @@ export function validateSettingsFile(
         "maxUserTranscriptTokens",
         "maxToolTranscriptTokens",
         "environment",
+        "trustedHosts",
+        "scratchRoots",
         "allow",
         "protectedPaths",
         "soft_deny",
         "softDeny",
         "hard_deny",
         "hardDeny",
+        "jevModel",
+        "jevBaseUrl",
+        "jevApiKeyEnv",
+        "jevTimeoutMs",
+        "jevHardDenyThreshold",
+        "jevSoftDenyThreshold",
+        "jevReadOnlyIntentThreshold",
+        "jevScopeEscapeThreshold",
+        "jevConfirmSoftDeny",
         "log",
       ]);
       for (const key of Object.keys(autoMode)) {
@@ -309,12 +334,62 @@ export function validateSettingsFile(
         diagnostics.push(`${source}: autoMode.enabled must be a boolean`);
       }
       if (
+        hasOwn(autoMode, "classifierBackend") &&
+        !isClassifierBackend(autoMode.classifierBackend)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.classifierBackend must be "llm" or "jev"`,
+        );
+      }
+      if (
         hasOwn(autoMode, "classifierModel") &&
         !isValidClassifierModel(autoMode.classifierModel)
       ) {
         diagnostics.push(
           `${source}: autoMode.classifierModel must be a provider/model string`,
         );
+      }
+      if (
+        hasOwn(autoMode, "jevModel") &&
+        !isValidClassifierModel(autoMode.jevModel)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevModel must be a provider/model string`,
+        );
+      }
+      for (const key of ["jevBaseUrl", "jevApiKeyEnv"] as const) {
+        const value = autoMode[key];
+        if (hasOwn(autoMode, key) && (typeof value !== "string" || value.trim() === "")) {
+          diagnostics.push(
+            `${source}: autoMode.${key} must be a non-empty string`,
+          );
+        }
+      }
+      if (
+        hasOwn(autoMode, "jevTimeoutMs") &&
+        !validClassifierTimeout(autoMode.jevTimeoutMs)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevTimeoutMs must be an integer from 1000 through ${MAX_CLASSIFIER_TIMEOUT_MS}`,
+        );
+      }
+      for (
+        const key of [
+          "jevHardDenyThreshold",
+          "jevSoftDenyThreshold",
+          "jevReadOnlyIntentThreshold",
+          "jevScopeEscapeThreshold",
+        ] as const
+      ) {
+        const value = autoMode[key];
+        if (
+          hasOwn(autoMode, key) &&
+          (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)
+        ) {
+          diagnostics.push(
+            `${source}: autoMode.${key} must be a number from 0 through 1`,
+          );
+        }
       }
       if (
         hasOwn(autoMode, "classifierReasoningLevel") &&
@@ -332,6 +407,14 @@ export function validateSettingsFile(
       ) {
         diagnostics.push(
           `${source}: autoMode.classifierTimeoutMs must be an integer from 1000 through ${MAX_CLASSIFIER_TIMEOUT_MS}`,
+        );
+      }
+      if (
+        hasOwn(autoMode, "jevConfirmSoftDeny") &&
+        typeof autoMode.jevConfirmSoftDeny !== "boolean"
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.jevConfirmSoftDeny must be a boolean`,
         );
       }
       if (
@@ -385,6 +468,8 @@ export function validateSettingsFile(
         "autoMode.environment",
         diagnostics,
       );
+      validateTrustedHostsSetting(autoMode.trustedHosts, source, diagnostics);
+      validateScratchRootsSetting(autoMode.scratchRoots, source, diagnostics);
       validateStringArraySetting(
         autoMode.allow,
         source,
@@ -497,6 +582,73 @@ function finalizeRuleSetting(accumulator: RuleAccumulator): string[] {
   return [...new Set([...base, ...accumulator.entries])];
 }
 
+/**
+ * A trusted host is one plain SSH host name or alias. Wildcards, `user@host`,
+ * ports, and whitespace are rejected so an entry can never widen to more hosts
+ * than it names.
+ */
+const TRUSTED_HOST_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/i;
+
+export function isValidTrustedHost(value: unknown): value is string {
+  return typeof value === "string" && TRUSTED_HOST_PATTERN.test(value);
+}
+
+/**
+ * A scratch root in absolute form, or undefined when it is not an absolute or
+ * `~/` path, or is so broad that it would switch off review for the home
+ * directory: `/`, `~`, or any ancestor of home.
+ */
+export function scratchRootPath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  const expanded = trimmed === "~" || trimmed.startsWith("~/")
+    ? resolve(HOME, trimmed.slice(2))
+    : trimmed;
+  if (!expanded.startsWith("/")) return undefined;
+  const root = resolve(expanded);
+  const home = resolve(HOME);
+  if (root === "/" || home === root || home.startsWith(`${root}/`)) return undefined;
+  return root;
+}
+
+function validateScratchRootsSetting(
+  value: unknown,
+  source: string,
+  diagnostics: string[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    diagnostics.push(`${source}: autoMode.scratchRoots must be an array of strings`);
+    return;
+  }
+  for (const [index, entry] of value.entries()) {
+    if (scratchRootPath(entry) === undefined) {
+      diagnostics.push(
+        `${source}: autoMode.scratchRoots[${index}] must be an absolute or ~/ directory that does not contain the home directory; it is ignored`,
+      );
+    }
+  }
+}
+
+function validateTrustedHostsSetting(
+  value: unknown,
+  source: string,
+  diagnostics: string[],
+): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    diagnostics.push(`${source}: autoMode.trustedHosts must be an array of strings`);
+    return;
+  }
+  for (const [index, entry] of value.entries()) {
+    if (!isValidTrustedHost(entry)) {
+      diagnostics.push(
+        `${source}: autoMode.trustedHosts[${index}] must be a plain host name (no wildcards, user@, ports, or spaces); it is ignored`,
+      );
+    }
+  }
+}
+
 function validateLogSetting(
   value: unknown,
   source: string,
@@ -591,6 +743,17 @@ export function isClassifierReasoningLevel(
     CLASSIFIER_REASONING_LEVELS.has(value as ClassifierReasoningLevel);
 }
 
+export function isClassifierBackend(
+  value: unknown,
+): value is ClassifierBackend {
+  return value === "llm" || value === "jev";
+}
+
+function validProbability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
+    value <= 1;
+}
+
 function isValidClassifierModel(value: unknown): value is string {
   return typeof value === "string" && parseModelSpec(value) !== undefined;
 }
@@ -617,9 +780,41 @@ function applyAutoModeScalars(
   return {
     ...base,
     enabled: typeof settings.enabled === "boolean" ? settings.enabled : base.enabled,
+    classifierBackend: isClassifierBackend(settings.classifierBackend)
+      ? settings.classifierBackend
+      : base.classifierBackend,
     classifierModel: isValidClassifierModel(settings.classifierModel)
       ? settings.classifierModel
       : base.classifierModel,
+    jevModel: isValidClassifierModel(settings.jevModel)
+      ? settings.jevModel
+      : base.jevModel,
+    jevBaseUrl: typeof settings.jevBaseUrl === "string" &&
+        settings.jevBaseUrl.trim() !== ""
+      ? settings.jevBaseUrl.trim().replace(/\/+$/, "")
+      : base.jevBaseUrl,
+    jevApiKeyEnv: typeof settings.jevApiKeyEnv === "string" &&
+        settings.jevApiKeyEnv.trim() !== ""
+      ? settings.jevApiKeyEnv.trim()
+      : base.jevApiKeyEnv,
+    jevTimeoutMs: validClassifierTimeout(settings.jevTimeoutMs)
+      ? settings.jevTimeoutMs
+      : base.jevTimeoutMs,
+    jevHardDenyThreshold: validProbability(settings.jevHardDenyThreshold)
+      ? settings.jevHardDenyThreshold
+      : base.jevHardDenyThreshold,
+    jevSoftDenyThreshold: validProbability(settings.jevSoftDenyThreshold)
+      ? settings.jevSoftDenyThreshold
+      : base.jevSoftDenyThreshold,
+    jevReadOnlyIntentThreshold: validProbability(settings.jevReadOnlyIntentThreshold)
+      ? settings.jevReadOnlyIntentThreshold
+      : base.jevReadOnlyIntentThreshold,
+    jevScopeEscapeThreshold: validProbability(settings.jevScopeEscapeThreshold)
+      ? settings.jevScopeEscapeThreshold
+      : base.jevScopeEscapeThreshold,
+    jevConfirmSoftDeny: typeof settings.jevConfirmSoftDeny === "boolean"
+      ? settings.jevConfirmSoftDeny
+      : base.jevConfirmSoftDeny,
     classifierReasoningLevel: isClassifierReasoningLevel(
         settings.classifierReasoningLevel,
       )
@@ -683,6 +878,16 @@ export function buildEffectiveConfigFromSources(
 ): EffectiveConfig {
   let config: EffectiveConfig = {
     enabled: true,
+    classifierBackend: DEFAULT_CLASSIFIER_BACKEND,
+    jevModel: DEFAULT_JEV_MODEL,
+    jevBaseUrl: DEFAULT_JEV_BASE_URL,
+    jevApiKeyEnv: DEFAULT_JEV_API_KEY_ENV,
+    jevTimeoutMs: DEFAULT_JEV_TIMEOUT_MS,
+    jevHardDenyThreshold: DEFAULT_JEV_HARD_DENY_THRESHOLD,
+    jevSoftDenyThreshold: DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+    jevReadOnlyIntentThreshold: DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
+    jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+    jevConfirmSoftDeny: DEFAULT_JEV_CONFIRM_SOFT_DENY,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
@@ -691,6 +896,8 @@ export function buildEffectiveConfigFromSources(
     maxUserTranscriptTokens: DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
     maxToolTranscriptTokens: DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
     environment: [...DEFAULT_ENVIRONMENT],
+    trustedHosts: [],
+    scratchRoots: [],
     allow: [...DEFAULT_ALLOW],
     protectedPaths: [...DEFAULT_PROTECTED_PATHS],
     softDeny: [...DEFAULT_SOFT_DENY],
@@ -712,6 +919,10 @@ export function buildEffectiveConfigFromSources(
     ...inlineSettings,
   ];
   const environment = createRuleAccumulator(DEFAULT_ENVIRONMENT);
+  // Trusted hosts widen what the classifier treats as in scope, so they come
+  // only from user-owned sources, like every other autoMode setting.
+  const trustedHosts = new Set<string>();
+  const scratchRoots = new Set<string>();
   const allow = createRuleAccumulator(DEFAULT_ALLOW);
   const protectedPaths = createRuleAccumulator(DEFAULT_PROTECTED_PATHS);
   const deniedPaths = createRuleAccumulator(DEFAULT_DENIED_PATHS);
@@ -721,6 +932,19 @@ export function buildEffectiveConfigFromSources(
   for (const settings of configurableSettings) {
     config = applyAutoModeScalars(config, settings.autoMode);
     applyRuleSetting(environment, settings.autoMode?.environment);
+    const hosts = settings.autoMode?.trustedHosts;
+    if (Array.isArray(hosts)) {
+      for (const host of hosts) {
+        if (isValidTrustedHost(host)) trustedHosts.add(host.toLowerCase());
+      }
+    }
+    const roots = settings.autoMode?.scratchRoots;
+    if (Array.isArray(roots)) {
+      for (const entry of roots) {
+        const root = scratchRootPath(entry);
+        if (root !== undefined) scratchRoots.add(root);
+      }
+    }
     applyRuleSetting(allow, settings.autoMode?.allow);
     applyRuleSetting(protectedPaths, settings.autoMode?.protectedPaths);
     applyRuleSetting(
@@ -741,6 +965,8 @@ export function buildEffectiveConfigFromSources(
   config = {
     ...config,
     environment: finalizeRuleSetting(environment),
+    trustedHosts: [...trustedHosts],
+    scratchRoots: [...scratchRoots],
     allow: finalizeRuleSetting(allow),
     protectedPaths: finalizeRuleSetting(protectedPaths),
     deniedPaths: finalizeRuleSetting(deniedPaths),
@@ -853,19 +1079,23 @@ export function loadEffectiveConfigWithDiagnostics(
     projectSharedFiles,
   );
 
-  return {
-    config: buildEffectiveConfigFromSources({
-      globalSettings: loadedSettingsToSettings(globalFiles),
-      projectLocalSettings: loadedSettingsToSettings(projectLocalFiles),
-      projectSharedSettings: loadedSettingsToSettings(projectSharedFiles),
-      inlineSettings,
-    }),
-    diagnostics: [
-      ...fileDiagnostics,
-      ...sharedAllowDiagnostics,
-      ...diagnostics,
-    ],
-  };
+  const loadedDiagnostics = [
+    ...fileDiagnostics,
+    ...sharedAllowDiagnostics,
+    ...diagnostics,
+  ];
+
+  const config = buildEffectiveConfigFromSources({
+    globalSettings: loadedSettingsToSettings(globalFiles),
+    projectLocalSettings: loadedSettingsToSettings(projectLocalFiles),
+    projectSharedSettings: loadedSettingsToSettings(projectSharedFiles),
+    inlineSettings,
+  });
+  if (config.classifierBackend === "jev") {
+    loadedDiagnostics.push(...jevCredentialDiagnostics(config));
+  }
+
+  return { config, diagnostics: loadedDiagnostics };
 }
 
 /** Load config from disk and environment variables. Exported for tests and diagnostics. */
@@ -899,9 +1129,20 @@ function readWritableSettingsFile(path: string): SettingsFile {
   return settings;
 }
 
-/** Persist the global default classifier model while preserving other settings. */
-export function writeGlobalClassifierModel(
-  classifierModel: string,
+/** Global autoMode scalars that `/automode` can persist. */
+export const GLOBAL_AUTOMODE_SETTING_KEYS = [
+  "classifierModel",
+  "jevModel",
+  "classifierBackend",
+] as const;
+
+export type GlobalAutoModeSettingKey =
+  typeof GLOBAL_AUTOMODE_SETTING_KEYS[number];
+
+/** Persist one global autoMode scalar while preserving other settings. */
+export function writeGlobalAutoModeSetting(
+  key: GlobalAutoModeSettingKey,
+  value: string,
   path = PI_GLOBAL_SETTINGS[0],
 ): void {
   const settings = readWritableSettingsFile(path);
@@ -909,9 +1150,17 @@ export function writeGlobalClassifierModel(
     ...settings,
     autoMode: {
       ...settings.autoMode,
-      classifierModel,
+      [key]: value,
     },
   };
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
+/** Persist the global default classifier model while preserving other settings. */
+export function writeGlobalClassifierModel(
+  classifierModel: string,
+  path = PI_GLOBAL_SETTINGS[0],
+): void {
+  writeGlobalAutoModeSetting("classifierModel", classifierModel, path);
 }

@@ -1,10 +1,11 @@
-import { realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -13,6 +14,7 @@ import {
   defaultClassifyAction,
   serializeClassifierAction,
 } from "./classifier.ts";
+import { approvalSignature, type ApprovalSignature } from "./approvals.ts";
 import { analyzeBash, type BashAnalysis } from "./bash.ts";
 import {
   AUTO_MODE_GUIDANCE,
@@ -26,12 +28,31 @@ import {
   READ_ONLY_TOOLS,
 } from "./constants.ts";
 import {
+  type GlobalAutoModeSettingKey,
   type GlobalConfigPreparation,
   loadEffectiveConfigWithDiagnostics,
   prepareGlobalConfig,
-  writeGlobalClassifierModel,
+  scratchRootPath,
+  writeGlobalAutoModeSetting,
 } from "./config.ts";
+import {
+  CreatedPaths,
+  type CreatedPathsFs,
+  NODE_CREATED_PATHS_FS,
+  type ClaimSet,
+  birthTimesUsable as probeBirthTimes,
+  planAction,
+} from "./created-paths.ts";
+import { describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
+import {
+  defaultJevClassifyAction,
+  factsReadOnly,
+  jevCredentialDiagnostics,
+  jevStatusText,
+  probeJevClassifier,
+  resolveJevKey,
+} from "./jev.ts";
 import {
   createLogger,
   newDecisionId,
@@ -120,8 +141,12 @@ export type PiAutomodeOptions = {
   loadConfig?: (cwd: string, projectTrusted: boolean) => EffectiveConfig;
   /** Override classifier calls in tests so unit tests never need a real LLM/API key. */
   classifyAction?: ClassifyAction;
+  /** Override the Jev classifier in tests. */
+  jevClassifyAction?: ClassifyAction;
   /** Override classifier-model persistence in tests. Runtime code writes the active global config. */
   saveClassifierModel?: (classifierModel: string) => void;
+  /** Override one autoMode setting's global persistence in tests. */
+  saveAutoModeSetting?: (key: PersistableSettingKey, value: string) => void;
   /** Override global config migration and path selection in tests. */
   prepareGlobalConfig?: () => GlobalConfigPreparation;
   /** Override the application-owned observability log root in tests. */
@@ -130,7 +155,38 @@ export type PiAutomodeOptions = {
   now?: () => Date;
   /** Override Bash analysis in tests. Runtime code uses unbash. */
   analyzeBash?: typeof analyzeBash;
+  /** Override the filesystem of the session-created path record in tests. */
+  createdPathsFs?: CreatedPathsFs;
+  /** Override the session-created path record's clock in tests. */
+  createdPathsNow?: () => Date;
+  /** Override the birth-time probe in tests. */
+  birthTimesUsable?: () => Promise<boolean>;
 };
+
+type PersistableSettingKey = GlobalAutoModeSettingKey;
+
+/**
+ * True only when a person can answer a dialog. pi reports `hasUI` in RPC mode
+ * too, but an RPC client such as a pi-subagents child never answers, so a
+ * prompt there would block the agent forever.
+ */
+/**
+ * The folder offered by "Allow edits under … for this session": the git
+ * repository containing the file, or else the file's own folder. Undefined when
+ * that folder is not a valid scratch root, such as the home directory.
+ */
+function sessionEditFolder(path: string): string | undefined {
+  const start = dirname(path);
+  for (let dir = start; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) return scratchRootPath(dir);
+    if (dirname(dir) === dir) break;
+  }
+  return scratchRootPath(start);
+}
+
+function canAskUser(ctx: ExtensionContext): boolean {
+  return ctx.hasUI && ctx.mode === "tui";
+}
 
 type LogCtx = {
   logger: Logger;
@@ -169,6 +225,7 @@ function logClassifierIo(decision: ClassifyResult, log: LogCtx): void {
     prompt: decision.io.prompt,
     attempts: decision.io.attempts,
     durationMs: decision.io.durationMs,
+    ...(decision.io.cached ? { cached: true } : {}),
     parsed: {
       decision: decision.decision,
       tier: decision.tier,
@@ -179,7 +236,10 @@ function logClassifierIo(decision: ClassifyResult, log: LogCtx): void {
 
 /** Create a Pi extension instance. Default export uses production dependencies. */
 export function createPiAutomode(options: PiAutomodeOptions = {}) {
-  const classify = options.classifyAction ?? defaultClassifyAction;
+  const classifyLlm = options.classifyAction ?? defaultClassifyAction;
+  const classifyJev = options.jevClassifyAction ?? defaultJevClassifyAction;
+  const selectClassify = (cfg: EffectiveConfig) =>
+    cfg.classifierBackend === "jev" ? classifyJev : classifyLlm;
   const now = options.now ?? (() => new Date());
 
   return function piAutomode(pi: ExtensionAPI) {
@@ -208,17 +268,42 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         }
         : result;
     };
+    const writeBlockedReason = globalConfig.writeBlockedReason;
+    const persistAutoModeSetting = options.saveAutoModeSetting ??
+      ((key: PersistableSettingKey, value: string) =>
+        writeGlobalAutoModeSetting(key, value, globalConfig.activePath));
+    const saveAutoModeSetting = writeBlockedReason
+      ? (_key: PersistableSettingKey, _value: string): void => {
+        throw new Error(writeBlockedReason);
+      }
+      : persistAutoModeSetting;
     const persistClassifierModel = options.saveClassifierModel ??
       ((classifierModel: string) =>
-        writeGlobalClassifierModel(classifierModel, globalConfig.activePath));
-    const saveClassifierModel = globalConfig.writeBlockedReason
-      ? (_classifierModel: string) => {
-        throw new Error(globalConfig.writeBlockedReason);
+        persistAutoModeSetting("classifierModel", classifierModel));
+    const saveClassifierModel = writeBlockedReason
+      ? (_classifierModel: string): void => {
+        throw new Error(writeBlockedReason);
       }
       : persistClassifierModel;
     let loadResult = loadConfigWithDiagnostics(process.cwd(), false);
     let config: EffectiveConfig = loadResult.config;
     let configDiagnostics: string[] = loadResult.diagnostics;
+    // Parser-derived patterns the user chose to allow for this session after a
+    // Jev soft deny. In memory only and cleared at session start.
+    const sessionApprovals = new Map<string, string>();
+    // Folders the user chose "Allow edits under … for this session" for. They
+    // act as scratch roots until the session starts again.
+    const sessionEditRoots = new Set<string>();
+    // pi shows one extension dialog at a time: opening a second replaces the
+    // first, whose promise then never settles. Parallel tool calls (such as a
+    // codemode Promise.all) would hang on the hidden dialog, so dialogs from
+    // this extension wait for the previous one to close.
+    let dialogQueue: Promise<unknown> = Promise.resolve();
+    const oneDialogAtATime = <T>(open: () => Promise<T>): Promise<T> => {
+      const result = dialogQueue.then(open);
+      dialogQueue = result.catch(() => undefined);
+      return result;
+    };
     let state: AutoModeState = {
       checkedActions: 0,
       blockedActions: 0,
@@ -267,8 +352,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       if (action === "status") {
         const status = [
           `enabled: ${cfg.enabled ? "yes" : "no"}`,
-          `classifier: ${cfg.classifierModel ?? "current session model"}`,
-          `classifier reasoning: ${cfg.classifierReasoningLevel ?? "server default"}`,
+          `classifier: ${
+            cfg.classifierBackend === "jev"
+              ? `jev (${cfg.jevModel})`
+              : `llm (${cfg.classifierModel ?? "current session model"})`
+          }`,
+          `classifier reasoning: ${
+            cfg.classifierBackend === "jev"
+              ? "not used by the Jev backend"
+              : cfg.classifierReasoningLevel ?? "server default"
+          }`,
           `checked actions: ${state.checkedActions}`,
           `blocked actions: ${state.blockedActions}`,
           `classifier allowed: ${state.classifierAllowed}`,
@@ -335,6 +428,24 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return `[pi-automode] Action blocked; the tool did not run. ${reason} Do not claim success, rely on effects from this call, or attempt an equivalent workaround. Report the block to the user before continuing with dependent work. Independent work can continue.`;
     }
 
+    /**
+     * Classifier provenance belongs only on classifier-routed decisions. A
+     * deterministic or permission decision never calls the classifier, so recording a
+     * classifier model and reasoning mode on it implies a verdict that was never
+     * requested and sends a reader looking for a `classifier` entry that does not exist.
+     */
+    function classifierFields(
+      kind: DecisionKind,
+      logCtx: LogCtx,
+    ): { classifierModel?: string; reasoning?: ClassifierReasoningLog } {
+      return kind === "classifier" || kind === "classifier.confirmed"
+        ? {
+            classifierModel: logCtx.classifierModel,
+            reasoning: logCtx.reasoning,
+          }
+        : {};
+    }
+
     function block(
       ctx: ExtensionContext,
       denial: DenialRecord,
@@ -358,8 +469,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           kind: denial.kind,
           outcome: "block",
           reason: denial.reason,
-          classifierModel: logCtx.classifierModel,
-          reasoning: logCtx.reasoning,
+          ...classifierFields(denial.kind, logCtx),
         });
       }
       if (ctx.hasUI) {
@@ -398,14 +508,28 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           kind,
           outcome: "allow",
           reason,
-          classifierModel: logCtx.classifierModel,
-          reasoning: logCtx.reasoning,
+          ...classifierFields(kind, logCtx),
         });
       }
       return undefined;
     }
 
+    // Paths the agent created this session, for Jev's created_this_session
+    // facts. Memory only: the agent can write session entries, so nothing is
+    // restored from them. Off until birth times are known to be real.
+    const createdPaths = new CreatedPaths({
+      fs: options.createdPathsFs ?? NODE_CREATED_PATHS_FS,
+      now: options.createdPathsNow,
+    });
+    void (options.birthTimesUsable ?? probeBirthTimes)().then(
+      (usable) => createdPaths.setUsable(usable),
+      () => createdPaths.setUsable(false),
+    );
+    /** Claims computed for a call in progress, read by the classifier call. */
+    const callClaims = new Map<string, { claims: ClaimSet; shownToJev: boolean }>();
+
     pi.on("session_start", (_event, ctx) => {
+      createdPaths.clear();
       loadResult = loadConfigWithDiagnostics(
         ctx.cwd,
         projectIsTrusted(ctx),
@@ -413,6 +537,8 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       config = loadResult.config;
       configDiagnostics = loadResult.diagnostics;
       state = restoreState(ctx);
+      sessionApprovals.clear();
+      sessionEditRoots.clear();
       if (
         ctx.hasUI &&
         globalConfig.notification &&
@@ -436,7 +562,30 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return { systemPrompt: `${event.systemPrompt}\n\n${AUTO_MODE_GUIDANCE}` };
     });
 
-    pi.on("tool_call", async (event, ctx) => {
+    const makeLogCtx = (cfg: EffectiveConfig, ctx: ExtensionContext): LogCtx => ({
+      logger: createLogger({
+        enabled: cfg.log.enabled,
+        classifierIo: cfg.log.classifierIo,
+        sessionFile: ctx.sessionManager.getSessionFile?.(),
+        sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
+        sessionCwd: ctx.cwd,
+        sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
+        logRoot: options.logRoot,
+        now: now(),
+      }),
+      decisionId: newDecisionId(),
+      classifierModel: cfg.classifierBackend === "jev"
+        ? cfg.jevModel
+        : cfg.classifierModel,
+      reasoning: cfg.classifierBackend === "jev"
+        ? { mode: "backend", backend: "jev", model: cfg.jevModel }
+        : classifierReasoningForConfig(cfg.classifierReasoningLevel),
+    });
+
+    const decideToolCall = async (
+      event: ToolCallEvent,
+      ctx: ExtensionContext,
+    ): Promise<{ block: true; reason: string } | undefined> => {
       // Enforcement order:
       // 1. permission deny/ask rules,
       // 2. deterministic hard-deny checks that never consult the model,
@@ -450,21 +599,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
 
       const input = event.input as Record<string, unknown>;
       const summary = actionSummary(event.toolName, input);
-      const logCtx: LogCtx = {
-        logger: createLogger({
-          enabled: cfg.log.enabled,
-          classifierIo: cfg.log.classifierIo,
-          sessionFile: ctx.sessionManager.getSessionFile?.(),
-          sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
-          sessionCwd: ctx.cwd,
-          sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
-          logRoot: options.logRoot,
-          now: now(),
-        }),
-        decisionId: newDecisionId(),
-        classifierModel: cfg.classifierModel,
-        reasoning: classifierReasoningForConfig(cfg.classifierReasoningLevel),
-      };
+      const logCtx = makeLogCtx(cfg, ctx);
 
       if (ctx.signal?.aborted) {
         state.checkedActions += 1;
@@ -543,7 +678,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         ) {
           continue;
         }
-        if (!ctx.hasUI) {
+        if (!canAskUser(ctx)) {
           const matchedCommand = matchedCommandSummary(
             matchingBashCommandText(pattern, bashAnalysis),
           );
@@ -554,15 +689,17 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             reason:
               `Matched permissions.ask (${pattern.raw})${
                 matchedCommand ? ` for command: ${matchedCommand}` : ""
-              } but no UI is available`,
+              } but no interactive terminal is available`,
             action: summary,
             kind: "permissions.ask",
           }, logCtx);
         }
-        const allowed = await ctx.ui.confirm(
-          "Auto mode permission ask",
-          `Rule: ${pattern.raw}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
-          { signal: ctx.signal },
+        const allowed = await oneDialogAtATime(() =>
+          ctx.ui.confirm(
+            "Auto mode permission ask",
+            `Rule: ${pattern.raw}\n\nAction:\n${summary}\n\nAllow this action to continue to auto-mode classification?`,
+            { signal: ctx.signal },
+          )
         );
         if (!allowed) {
           const matchedCommand = matchedCommandSummary(
@@ -619,7 +756,8 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         !cfg.classifyReadOnlyTools &&
         READ_ONLY_TOOLS.has(event.toolName);
       if (
-        (cfg.deniedPaths.length > 0 || cfg.allowInsideWorkingDirectory) &&
+        (cfg.deniedPaths.length > 0 || cfg.allowInsideWorkingDirectory ||
+          cfg.scratchRoots.length > 0 || sessionEditRoots.size > 0) &&
         PATH_BEARING_TOOLS.has(event.toolName)
       ) {
         const inputPath = extractInputPath(event.toolName, input);
@@ -691,6 +829,31 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             // ask rules must not use the read-only fast path.
             readOnlyFastPath = false;
           }
+          // Scratch roots are user-declared throwaway directories, such as a
+          // clone the session made under /tmp. Writes there skip the classifier,
+          // except protected paths (matched at any depth) and accepted ask rules.
+          if (
+            (event.toolName === "write" || event.toolName === "edit") &&
+            (cfg.scratchRoots.length > 0 || sessionEditRoots.size > 0) &&
+            !askRequiresClassifier
+          ) {
+            const root = [...cfg.scratchRoots, ...sessionEditRoots]
+              .map((entry) => resolvePathForPolicy(entry) ?? entry)
+              .find((entry) => isInside(policyPath, entry));
+            if (
+              root !== undefined &&
+              !isProtectedPath(policyPath, root, cfg.protectedPaths)
+            ) {
+              return allow(
+                ctx,
+                "scratch-root",
+                `Path inside scratch root ${root}: ${policyPath}`,
+                event.toolName,
+                summary,
+                logCtx,
+              );
+            }
+          }
         }
       }
 
@@ -746,11 +909,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
-      const decision = await classify(
+      // Session-created path claims, computed by the tool_call wrapper.
+      const pending = callClaims.get(event.toolCallId);
+      const extraFacts = pending?.claims.lines ?? [];
+      if (pending && extraFacts.length > 0) pending.shownToJev = true;
+      const decision = await selectClassify(cfg)(
         ctx,
         cfg,
         serializeClassifierAction(event.toolName, input),
         loadedContext,
+        ...(extraFacts.length > 0 ? [{ extraFacts }] as const : []),
       );
       logClassifierIo(decision, logCtx);
       if (decision.decision === "allow") {
@@ -765,6 +933,142 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
+      // When a script is blocked as "overwriting existing files" but the files
+      // are where the edit tools are already allowed, say so, so the agent can
+      // redo the change with them instead of repeating the script.
+      const declineHint = (): string => {
+        if (event.toolName !== "bash" || typeof input.command !== "string") return "";
+        if (decision.softDenyRule !== DEFAULT_SOFT_DENY[3]) return "";
+        const source = input.command;
+        const mentions = (location: string) =>
+          new RegExp(`${location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=/|\\s|$|["';])`).test(source);
+        const locations = [...cfg.scratchRoots, ...sessionEditRoots].filter(mentions);
+        const leavesProject = /(^|[\s;&|(])cd\s+["']?[/~]/.test(source) && !mentions(ctx.cwd);
+        if (cfg.allowInsideWorkingDirectory && !leavesProject) locations.push(ctx.cwd);
+        if (locations.length === 0) return "";
+        return ` Hint: this was flagged as overwriting existing files, but the edit and write tools are allowed without review under ${
+          [...new Set(locations)].join(", ")
+        } (protected files excepted). Make this change with them instead of a script.`;
+      };
+
+      const askSoftDeny = async (
+        signature: ApprovalSignature | undefined,
+      ): Promise<ReturnType<typeof block> | undefined> => {
+        const allowOnce = "Allow once";
+        // One-off commands would never match again, so "similar" is offered
+        // only for patterns short enough to recur.
+        const allowSimilar = signature?.recurs
+          ? `Allow similar for this session: ${signature.description}`
+          : undefined;
+        // For an edit, offer its repository or folder for the rest of the
+        // session, so a run of edits in one clone asks once.
+        const editPath = event.toolName === "write" || event.toolName === "edit"
+          ? extractInputPath(event.toolName, input)
+          : undefined;
+        const resolvedEditPath = editPath === undefined
+          ? undefined
+          : resolveToolInputPath(event.toolName, ctx.cwd, editPath) ?? editPath;
+        const editFolder = resolvedEditPath === undefined
+          ? undefined
+          : sessionEditFolder(resolvePathForPolicy(resolvedEditPath) ?? resolvedEditPath);
+        const allowFolder = editFolder === undefined
+          ? undefined
+          : `Allow edits under ${editFolder} for this session`;
+        const deny = "Deny";
+        let choice: string | undefined;
+        let outcome = "The user declined it.";
+        try {
+          choice = await oneDialogAtATime(() =>
+            ctx.ui.select(
+              `Auto mode soft deny\n\n${decision.reason}\n\nAction:\n${summary}`,
+              [
+                allowOnce,
+                ...(allowSimilar ? [allowSimilar] : []),
+                ...(allowFolder ? [allowFolder] : []),
+                deny,
+              ],
+              { signal: ctx.signal },
+            )
+          );
+        } catch {
+          // A cancelled or failed prompt is not an approval.
+          outcome = "The approval prompt was cancelled or failed.";
+        }
+        if (allowFolder && choice === allowFolder) {
+          sessionEditRoots.add(editFolder!);
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `User approved edits under ${editFolder} for this session: ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        if (choice === allowOnce || (allowSimilar && choice === allowSimilar)) {
+          if (signature && choice === allowSimilar) {
+            sessionApprovals.set(signature.key, signature.description);
+          }
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `${
+              choice === allowOnce
+                ? "User approved a Jev soft deny once"
+                : `User approved similar actions for this session (${signature!.description})`
+            }: ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        state.classifierDenied += 1;
+        return block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason: `${decision.reason} ${outcome}${declineHint()}`,
+          action: summary,
+          kind: "classifier",
+        }, logCtx);
+      };
+
+      // A Jev soft deny is a probability near a measured threshold, not a rule
+      // match, so an interactive user may approve it: once, or for the rest of
+      // the session for a parser-derived pattern. Hard denies and classifier
+      // failures (tier "none") never ask, and neither do headless runs.
+      if (
+        cfg.classifierBackend === "jev" &&
+        cfg.jevConfirmSoftDeny &&
+        decision.tier === "soft_deny"
+      ) {
+        const signature = approvalSignature(
+          serializeClassifierAction(event.toolName, input),
+        );
+        const approved = signature && sessionApprovals.get(signature.key);
+        if (approved !== undefined) {
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier.confirmed",
+            `Matched a session approval (${approved}): ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        if (canAskUser(ctx)) return await askSoftDeny(signature);
+        state.classifierDenied += 1;
+        return block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason: `${decision.reason} Not asked: no interactive terminal.${declineHint()}`,
+          action: summary,
+          kind: "classifier",
+        }, logCtx);
+      }
+
       state.classifierDenied += 1;
       return block(ctx, {
         timestamp: Date.now(),
@@ -773,6 +1077,77 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         action: summary,
         kind: "classifier",
       }, logCtx);
+    };
+
+    // The tool_call hook: the decision above, plus session-created paths on
+    // the Jev backend. Claims are computed before the decision so Jev sees
+    // them, checked again after it (a dialog can take minutes), and the call
+    // joins the running set before it is allowed. See created-paths.ts.
+    pi.on("tool_call", async (event, ctx) => {
+      const cfg = effectiveConfig();
+      const id = event.toolCallId;
+      if (!cfg.enabled || cfg.classifierBackend !== "jev" || typeof id !== "string") {
+        return decideToolCall(event, ctx);
+      }
+      const input = event.input as Record<string, unknown>;
+      const plan = event.toolName === "bash" && typeof input.command === "string"
+        ? planAction(input.command)
+        : undefined;
+      const call = {
+        claims: plan ? await createdPaths.claimsFor(plan, ctx.signal) : { claims: [], lines: [] },
+        shownToJev: false,
+      };
+      callClaims.set(id, call);
+      let result: Awaited<ReturnType<typeof decideToolCall>>;
+      try {
+        result = await decideToolCall(event, ctx);
+      } finally {
+        callClaims.delete(id);
+      }
+      if (result?.block) return result;
+
+      const finalBlock = (reason: string) =>
+        block(ctx, {
+          timestamp: Date.now(),
+          toolName: event.toolName,
+          reason,
+          action: actionSummary(event.toolName, input),
+          kind: "classifier",
+        }, makeLogCtx(cfg, ctx));
+      // The recheck is the last await before admit, so nothing changes the
+      // running set between the final check and admission.
+      const paths = plan ? await createdPaths.runningPaths(plan) : undefined;
+      const claimsHold = await createdPaths.recheck(call.claims, ctx.signal);
+      if (!claimsHold && call.shownToJev) {
+        return finalBlock("A session-created path changed while this action was reviewed; run it again.");
+      }
+      const claims = claimsHold ? call.claims : { claims: [], lines: [] };
+      const readOnly = READ_ONLY_TOOLS.has(event.toolName) ||
+        (event.toolName === "bash" &&
+          factsReadOnly(describeActionFacts(serializeClassifierAction(event.toolName, input), cfg.trustedHosts)));
+      const waitReason = createdPaths.admit(id, {
+        readOnly,
+        ...(paths ? { paths } : {}),
+        protects: call.shownToJev && claims.claims.length > 0
+          ? paths ?? claims.claims.map((claim) => claim.canonical)
+          : [],
+      });
+      if (waitReason) return finalBlock(waitReason);
+      if (plan) await createdPaths.prepare(id, plan, input, claims);
+      return result;
+    });
+
+    pi.on("tool_result", async (event) => {
+      await createdPaths.complete(event.toolCallId, event.input);
+      return undefined;
+    });
+
+    pi.on("tool_execution_end", (event) => {
+      createdPaths.release(event.toolCallId);
+    });
+
+    pi.on("agent_end", () => {
+      createdPaths.endTurn();
     });
 
     pi.registerTool({
@@ -892,6 +1267,32 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
         return;
       }
+      if (command === "approvals") {
+        if (rest.join(" ").trim() === "clear") {
+          const count = sessionApprovals.size + sessionEditRoots.size;
+          sessionApprovals.clear();
+          sessionEditRoots.clear();
+          ctx.ui.notify(
+            `Cleared ${count} session approval${count === 1 ? "" : "s"}.`,
+            "info",
+          );
+          return;
+        }
+        const patterns = [
+          ...sessionApprovals.values(),
+          ...[...sessionEditRoots].map((root) => `edits under ${root}`),
+        ];
+        ctx.ui.notify(
+          patterns.length === 0
+            ? "No session approvals. Choosing \"Allow similar for this session\" on a Jev soft-deny prompt adds one."
+            : [
+              `${patterns.length} session approval${patterns.length === 1 ? "" : "s"} (cleared when the session starts; /automode approvals clear removes them):`,
+              ...patterns.map((pattern) => `- ${pattern}`),
+            ].join("\n"),
+          "info",
+        );
+        return;
+      }
       if (command === "denials") {
         ctx.ui.notify(
           formatDenials(state),
@@ -899,13 +1300,131 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
         return;
       }
+      if (command === "backend") {
+        if (remainder !== "llm" && remainder !== "jev") {
+          ctx.ui.notify("Usage: /automode backend <llm|jev>", "error");
+          return;
+        }
+        try {
+          saveAutoModeSetting("classifierBackend", remainder);
+        } catch (error) {
+          ctx.ui.notify(
+            `Failed to save classifier backend: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            "error",
+          );
+          return;
+        }
+        loadResult = loadConfigWithDiagnostics(
+          ctx.cwd,
+          projectIsTrusted(ctx),
+        );
+        config = loadResult.config;
+        configDiagnostics = loadResult.diagnostics;
+        persist();
+        updateUi(ctx);
+        ctx.ui.notify(
+          `pi-automode classifier backend set to ${remainder}`,
+          "info",
+        );
+        return;
+      }
+      if (command === "jev") {
+        const cfg = effectiveConfig();
+        if (remainder === "test") {
+          const probe = await probeJevClassifier(ctx, cfg);
+          if (!probe.ok) {
+            ctx.ui.notify(`Jev probe failed: ${probe.reason}`, "error");
+            return;
+          }
+          const lines = [`Jev probe (${probe.model}):`];
+          let unexpected = false;
+          for (const result of probe.probes) {
+            lines.push(
+              `${result.label}: ${result.decision.decision} (${result.decision.reason})`,
+            );
+            if (result.label === "safe" && result.decision.decision !== "allow") {
+              unexpected = true;
+            }
+            if (
+              result.label === "dangerous" &&
+              result.decision.decision !== "block"
+            ) {
+              unexpected = true;
+            }
+          }
+          if (unexpected) {
+            lines.push(
+              "Unexpected probe result. Check the thresholds and that the endpoint returns danger-side-up noul probabilities.",
+            );
+          }
+          ctx.ui.notify(lines.join("\n"), unexpected ? "warning" : "info");
+          return;
+        }
+        if (remainder !== "") {
+          ctx.ui.notify("Usage: /automode jev [test]", "error");
+          return;
+        }
+        const { source } = await resolveJevKey(ctx, cfg);
+        ctx.ui.notify(
+          jevStatusText(cfg, source, jevCredentialDiagnostics(cfg)),
+          "info",
+        );
+        return;
+      }
       if (command === "model") {
+        const cfg = effectiveConfig();
+        const jevBackend = cfg.classifierBackend === "jev";
+        if (jevBackend && !remainder) {
+          ctx.ui.notify(
+            `Jev classifier model: ${cfg.jevModel}. Set it with /automode model <provider/model-id>; the Pi model picker lists LLM providers and does not apply to the Jev backend.`,
+            "info",
+          );
+          return;
+        }
         const selected = remainder || await promptForClassifierModel(
           ctx,
-          effectiveConfig().classifierModel,
+          cfg.classifierModel,
         );
         if (!selected) {
           ctx.ui.notify("Classifier model unchanged", "info");
+          return;
+        }
+        if (jevBackend) {
+          if (!parseModelSpec(selected)) {
+            ctx.ui.notify(
+              `Invalid Jev model spec (expected provider/model): ${selected}`,
+              "error",
+            );
+            return;
+          }
+          try {
+            saveAutoModeSetting("jevModel", selected);
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to save Jev classifier model: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              "error",
+            );
+            return;
+          }
+          loadResult = loadConfigWithDiagnostics(
+            ctx.cwd,
+            projectIsTrusted(ctx),
+          );
+          config = loadResult.config;
+          configDiagnostics = loadResult.diagnostics;
+          persist();
+          updateUi(ctx);
+          const active = effectiveConfig().jevModel;
+          ctx.ui.notify(
+            active === selected
+              ? `pi-automode Jev classifier saved globally: ${selected}`
+              : `pi-automode Jev classifier saved globally: ${selected}; current config uses ${active}`,
+            "info",
+          );
           return;
         }
         const parsed = parseModelSpec(selected);
@@ -953,14 +1472,14 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
 
       ctx.ui.notify(
-        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|model [provider/id]]",
+        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|approvals [clear]|backend <llm|jev>|jev [test]|model [provider/id]]",
         "error",
       );
     }
 
     pi.registerCommand("automode", {
       description:
-        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, model",
+        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, approvals, backend, jev, model",
       handler: handleAutomodeCommand,
     });
 

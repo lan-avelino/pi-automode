@@ -19,7 +19,8 @@ export type ClassifierReasoning =
     mode: "explicit";
     requestedLevel: ClassifierReasoningLevel;
     effectiveLevel: EffectiveClassifierReasoningLevel;
-  };
+  }
+  | { mode: "backend"; backend: "jev"; model: string };
 
 export type ClassifierReasoningLog =
   | ClassifierReasoning
@@ -36,9 +37,31 @@ export type LogConfig = {
   classifierIo: boolean;
 };
 
+export type ClassifierBackend = "llm" | "jev";
+
 export type AutoModeSettings = {
   enabled?: boolean;
+  /** Classifier backend: the LLM classifier (default) or the Jev / SystemOne classifier. */
+  classifierBackend?: ClassifierBackend;
   classifierModel?: string;
+  /** Jev classifier model id (default "~typesafe/jev-latest"). */
+  jevModel?: string;
+  /** OpenRouter-compatible base URL for the Jev classifier (default "https://openrouter.ai/api/v1"). */
+  jevBaseUrl?: string;
+  /** Environment variable that holds the Jev API key (default "OPENROUTER_API_KEY"). */
+  jevApiKeyEnv?: string;
+  /** Per-request timeout for Jev classifier calls in milliseconds (default 12000). */
+  jevTimeoutMs?: number;
+  /** Jev hard_deny probability at or above which the action is blocked (default 0.5). */
+  jevHardDenyThreshold?: number;
+  /** Jev soft-deny probability at or above which the action is blocked (default 0.55). */
+  jevSoftDenyThreshold?: number;
+  /** Jev intent_mismatch probability at or above which a parser-verified read-only action is blocked (default 0.75). Never below jevSoftDenyThreshold. */
+  jevReadOnlyIntentThreshold?: number;
+  /** Jev scope-escape probability at or above which a block reason names it as advisory (default 0.5). It never blocks. */
+  jevScopeEscapeThreshold?: number;
+  /** When true (default), a Jev soft deny asks the user in interactive sessions instead of blocking outright. */
+  jevConfirmSoftDeny?: boolean;
   classifierReasoningLevel?: ClassifierReasoningLevel;
   /** When true, read-only tools (read/grep/find/ls) are classified instead of auto-allowed. */
   classifyReadOnlyTools?: boolean;
@@ -53,6 +76,10 @@ export type AutoModeSettings = {
   maxUserTranscriptTokens?: number;
   maxToolTranscriptTokens?: number;
   environment?: unknown;
+  /** SSH host names the classifier treats as part of the trusted environment. User-owned sources only. */
+  trustedHosts?: unknown;
+  /** Absolute or `~/` directories where write/edit skip the classifier. User-owned sources only. */
+  scratchRoots?: unknown;
   allow?: unknown;
   protectedPaths?: unknown;
   soft_deny?: unknown;
@@ -89,8 +116,18 @@ export type ToolPattern = {
 
 export type EffectiveConfig = {
   enabled: boolean;
+  classifierBackend: ClassifierBackend;
   classifierModel?: string;
   classifierReasoningLevel?: ClassifierReasoningLevel;
+  jevModel: string;
+  jevBaseUrl: string;
+  jevApiKeyEnv: string;
+  jevTimeoutMs: number;
+  jevHardDenyThreshold: number;
+  jevSoftDenyThreshold: number;
+  jevReadOnlyIntentThreshold: number;
+  jevScopeEscapeThreshold: number;
+  jevConfirmSoftDeny: boolean;
   classifyReadOnlyTools: boolean;
   fastClassifierMaxTokens: number;
   classifierTimeoutMs: number;
@@ -99,6 +136,10 @@ export type EffectiveConfig = {
   maxUserTranscriptTokens: number;
   maxToolTranscriptTokens: number;
   environment: string[];
+  /** Lowercase SSH host names from user-owned config sources. */
+  trustedHosts: string[];
+  /** Absolute scratch-root directories, `~` expanded. */
+  scratchRoots: string[];
   allow: string[];
   protectedPaths: string[];
   softDeny: string[];
@@ -138,13 +179,17 @@ export type DenialRecord = {
 export type DecisionKind =
   | DenialRecord["kind"]
   | "permissions.allow"
+  | "classifier.confirmed"
   | "read-only"
-  | "inside-working-directory";
+  | "inside-working-directory"
+  | "scratch-root";
 
 export type ClassificationDecision = {
   decision: "allow" | "block";
   tier: "hard_deny" | "soft_deny" | "allow" | "explicit_intent" | "none";
   reason: string;
+  /** Jev only: the text of the soft-deny rule whose question crossed the threshold. */
+  softDenyRule?: string;
 };
 
 /** One classifier attempt: the raw model response (or error) and parsed decision. */
@@ -181,6 +226,8 @@ export type ClassifierIo = {
   };
   attempts: ClassifierIoAttempt[];
   durationMs: number;
+  /** True when the decision came from the session verdict cache and no request was made. */
+  cached?: boolean;
 };
 
 /** Classification decision plus resolved reasoning and the I/O that produced it (when available). */
@@ -201,9 +248,16 @@ export type ConfigLoadResult = {
   diagnostics: string[];
 };
 
+/** Per-call extras for a classifier. The LLM backend ignores them. */
+export type ClassifyExtras = {
+  /** Fact lines from pi-automode's own records, such as session-created paths. */
+  extraFacts?: string[];
+};
+
 export type ClassifyAction = (
   ctx: ExtensionContext,
   config: EffectiveConfig,
   action: string,
   loadedContext: string,
+  extras?: ClassifyExtras,
 ) => Promise<ClassifyResult>;

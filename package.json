@@ -1,6 +1,6 @@
 {
   "name": "@czottmann/pi-automode",
-  "version": "1.16.0",
+  "version": "1.17.0",
   "description": "Claude Code-style auto mode guardrail for pi.",
   "repository": {
     "url": "https://github.com/czottmann/pi-automode"
@@ -22,7 +22,8 @@
     "typecheck": "tsc --noEmit",
     "check": "tsc --noEmit",
     "build": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "jev:sweep": "node --import tsx scripts/jev-sweep.ts"
   },
   "files": [
     "CHANGELOG.md",

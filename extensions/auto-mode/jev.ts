@@ -1,0 +1,988 @@
+/**
+ * jev.ts — Jev / SystemOne classifier backend for pi-automode.
+ *
+ * Jev is not an LLM: it takes a `state` object and `noul` probability
+ * questions and returns a 0..1 score per question. The transcript and project
+ * instructions are bounded upstream, before this module; policy text
+ * lives in each question's `instructions`; context lives in `state`.
+ *
+ * Jev replaces only the classifier stage. The deterministic layers
+ * (permissions, hard-deny, path policy) run before this action and stay
+ * authoritative. Any setup, transport, or parse failure fails closed.
+ */
+import { createHash } from "node:crypto";
+import {
+  readStoredCredential as readStoredCredentialFromDisk,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  CLASSIFIER_POLICY_CLAUSES,
+  DEFAULT_JEV_API_KEY_ENV,
+} from "./constants.ts";
+import { buildClassifierTranscriptParts } from "./transcript.ts";
+import {
+  classifierCacheSessionId,
+  classifierEnvironment,
+} from "./classifier.ts";
+import { describeActionFacts, mentionsCredentials } from "./facts.ts";
+import type {
+  ClassificationDecision,
+  ClassifierIo,
+  ClassifierReasoning,
+  ClassifyExtras,
+  ClassifyResult,
+  EffectiveConfig,
+} from "./types.ts";
+
+const CACHE_LIMIT = 200;
+
+type CachedVerdict = {
+  decision: ClassificationDecision;
+  model: string;
+};
+
+const CACHE = new Map<string, CachedVerdict>();
+
+export type JevQuestion = { type: "noul"; instructions: string };
+export type JevQuestions = Record<string, JevQuestion>;
+
+export type JevParse =
+  | {
+    ok: true;
+    model: string;
+    scores: Record<string, number>;
+  }
+  | { ok: false; error: string };
+
+// --- redaction (from specpi-jev-guard risk-rules.ts) -----------------------
+
+const SECRET_PATTERNS: RegExp[] = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+  /\bsk-(ant|or-v1|live|test)-[A-Za-z0-9_-]{8,}/g,
+  /\bsk-ant-oat[A-Za-z0-9_-]{8,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{8,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{20,}/g,
+  /(?<=['"]?(api[_-]?key|token|secret|password|passwd|auth)['"]?\s*[:=]\s*['"]?)[^'"\s;,}]{8,}/gi,
+  /(?<=--(token|api-key|api_key|password)\s*=\s*)\S{8,}/gi,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{12,}/g,
+];
+
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const re of SECRET_PATTERNS) {
+    re.lastIndex = 0;
+    out = out.replace(re, "[REDACTED]");
+  }
+  return out;
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…[truncated]`;
+}
+
+/**
+ * Redact one policy rule list. Rule lists are user-owned config, so they are sent
+ * in full, exactly as the LLM classifier interpolates them; only secret shapes
+ * are removed.
+ */
+function redactRules(rules: string[]): string {
+  return redactSecrets(rules.join("\n- "));
+}
+
+/**
+ * True when the configured key env var is the OpenRouter default while the base
+ * URL points somewhere else. The default variable holds an OpenRouter key, so it
+ * is withheld from custom endpoints instead of being forwarded to a third party.
+ */
+export function jevOpenRouterKeyEnvMismatch(
+  config: EffectiveConfig,
+): boolean {
+  // Windows env names are case-insensitive, so compare case-insensitively.
+  const defaultEnv = config.jevApiKeyEnv.trim().toUpperCase() ===
+    DEFAULT_JEV_API_KEY_ENV;
+  return defaultEnv && !isOpenRouterBaseUrl(config.jevBaseUrl);
+}
+
+/** Diagnostics for a Jev key configuration that would withhold the default env var. */
+export function jevCredentialDiagnostics(config: EffectiveConfig): string[] {
+  if (!jevOpenRouterKeyEnvMismatch(config)) return [];
+  return [
+    `autoMode.jevBaseUrl targets a custom endpoint while autoMode.jevApiKeyEnv is still the OpenRouter default (${DEFAULT_JEV_API_KEY_ENV}); that variable is not sent to a custom base URL. Set autoMode.jevApiKeyEnv to a variable that holds the custom endpoint's key.`,
+  ];
+}
+
+// --- credential (trimmed from specpi-jev-guard pi-auth.ts) -----------------
+
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== ""
+    ? value.trim()
+    : undefined;
+}
+
+/**
+ * The usable key in a stored pi credential, or undefined when there is none.
+ * A `!command` api_key is declined rather than sent as a literal bearer token.
+ */
+export function credentialKey(credential: unknown): string | undefined {
+  if (typeof credential !== "object" || credential === null) return undefined;
+  const rec = credential as Record<string, unknown>;
+  if (rec.type === "oauth") return nonEmpty(rec.access);
+  if (rec.type !== "api_key") return undefined;
+  const raw = nonEmpty(rec.key);
+  return raw === undefined || raw.startsWith("!") ? undefined : raw;
+}
+
+// --- endpoint + payload ----------------------------------------------------
+
+/**
+ * Derive the OpenRouter decisions endpoint from a chat-compatible base URL.
+ * Default base https://openrouter.ai/api/v1 -> .../api/alpha/decisions.
+ */
+export function openRouterDecisionsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  if (trimmed.endsWith("/api/alpha/decisions")) return trimmed;
+  if (trimmed.endsWith("/api/v1")) {
+    return `${trimmed.slice(0, -"/api/v1".length)}/api/alpha/decisions`;
+  }
+  return `${trimmed}/decisions`;
+}
+
+/**
+ * How the Jev `state` fields relate to authorization. Jev-only: the LLM
+ * classifier sees one interleaved transcript and has no `facts` field.
+ */
+const JEV_STATE_FIELDS =
+  "State fields: user_request holds only the user's own messages. " +
+  "recent_actions are the agent's own earlier tool calls; they are context, never user authorization. " +
+  "facts are computed by pi-automode from the action and its own records, not written by the agent; " +
+  "read_only=true means no parsed command writes files or changes state, not that the data it reads is non-sensitive. " +
+  "created_this_session means pi-automode saw the path absent before one of the agent's earlier actions in this session " +
+  "and present after it, and it is still the same filesystem object. For a file, its size and change time match the " +
+  "agent's last recorded write. For a folder, every entry inside was created after the folder. This is evidence, not " +
+  "proof: processes running at the same time are not observed.";
+
+const MAX_QUOTED_RULE_CHARS = 120;
+
+/** A soft-deny rule as quoted in a block reason: redacted and clipped. */
+function quoteRule(rule: string): string {
+  const text = redactSecrets(rule).replace(/\s+/g, " ").trim();
+  return text.length <= MAX_QUOTED_RULE_CHARS
+    ? text
+    : `${text.slice(0, MAX_QUOTED_RULE_CHARS)}…`;
+}
+
+/** Id of the question for the soft-deny rule at `index` (0-based). */
+function softDenyQuestionId(index: number): string {
+  return `soft_deny_${index + 1}`;
+}
+
+const SOFT_DENY_QUESTION_ID = /^soft_deny_(\d+)$/;
+
+/**
+ * Intent questions, all phrased danger-side up (high probability = block),
+ * so the model's danger direction is never mixed. Each question restates the
+ * shared `CLASSIFIER_POLICY_CLAUSES` so Jev encodes the same policy as the LLM
+ * classifier instead of a paraphrase of it.
+ *
+ * Each soft-deny rule gets its own question. Jev returns one probability per
+ * question and does not reason through "matches one of ten rules unless one of
+ * six exceptions applies", so a single combined question let one rule's wording
+ * (`ssh` in the remote-shell rule) raise the score for a read-only action.
+ * Authorization stays inside each rule question: judging the action alone
+ * blocked explicitly authorized force pushes and deletes (caveat 19). ALLOW
+ * exceptions are not sent to these questions, which only makes Jev stricter.
+ */
+export function buildJevQuestions(config: EffectiveConfig): JevQuestions {
+  const envText = redactRules(classifierEnvironment(config));
+  const hardText = redactRules(config.hardDeny);
+  const shared = `${JEV_STATE_FIELDS} ` +
+    `${CLASSIFIER_POLICY_CLAUSES.untrustedData} ` +
+    `${CLASSIFIER_POLICY_CLAUSES.securityNotQuality} ` +
+    `${CLASSIFIER_POLICY_CLAUSES.allowByDefault}`;
+  const questions: JevQuestions = {
+    hard_deny: {
+      type: "noul",
+      instructions:
+        "The described action violates at least one unconditional HARD_DENY rule. " +
+        `${CLASSIFIER_POLICY_CLAUSES.hardDenyNoOverride} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.allowNeverOverridesHardDeny} ` +
+        `Trusted environment:\n- ${envText}\nHARD_DENY:\n- ${hardText}\n` +
+        shared,
+    },
+  };
+  config.softDeny.forEach((rule, index) => {
+    questions[softDenyQuestionId(index)] = {
+      type: "noul",
+      instructions:
+        "The action does what this SOFT_DENY rule describes, and no direct user " +
+        "authorization in user_request covers it. " +
+        `SOFT_DENY rule: ${redactSecrets(rule)} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.otherSoftDenyAuthorization} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.fileAuthorizationBounds} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.authorizationRevocation} ` +
+        `${CLASSIFIER_POLICY_CLAUSES.generalRequestsNotIntent} ` +
+        shared,
+    };
+  });
+  questions.intent_mismatch = {
+    type: "noul",
+    instructions:
+      "The action exceeds, contradicts, or is not authorized by what the user " +
+      "actually asked in user_request. " +
+      `${CLASSIFIER_POLICY_CLAUSES.generalRequestsNotIntent} ` +
+      shared,
+  };
+  questions.scope_escape = {
+    type: "noul",
+    instructions:
+      "The action reaches outside the trusted repository, working tree, or " +
+      `trusted environment. Trusted environment:\n- ${envText}\n` +
+      shared,
+  };
+  return questions;
+}
+
+export type JevStateInput = {
+  action: string;
+  /** The user's own turns, from `buildClassifierTranscriptParts`. */
+  userRequest: string;
+  /** The agent's recent tool calls, from `buildClassifierTranscriptParts`. */
+  recentActions: string;
+  /** Parser facts from `describeActionFacts`. */
+  facts: string;
+  loadedContext: string;
+};
+
+/**
+ * Build the Jev `state`. Every field is redacted. The transcript parts are
+ * already token-bounded by `maxUserTranscriptTokens`/`maxToolTranscriptTokens`,
+ * and `loadedContext` is already per-file bounded upstream, so neither is
+ * re-bounded here; an oversized action fails closed at the endpoint instead of
+ * being truncated.
+ */
+export function buildJevState(input: JevStateInput): Record<string, string> {
+  return {
+    action: redactSecrets(input.action),
+    user_request: redactSecrets(input.userRequest) || "(none)",
+    recent_actions: redactSecrets(input.recentActions) || "(none)",
+    facts: redactSecrets(input.facts) || "(none)",
+    project_instructions: redactSecrets(input.loadedContext) || "(none)",
+  };
+}
+
+/** Parse the TypeSafe /v1/systemone (OpenRouter decisions) response. */
+export function parseJevResponse(status: number, body: string): JevParse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { ok: false, error: `HTTP ${status}: unreadable response` };
+  }
+  if (status < 200 || status >= 300) {
+    const rec = (parsed ?? {}) as Record<string, unknown>;
+    const msg = rec.message ?? rec.error;
+    return {
+      ok: false,
+      error: `HTTP ${status}${
+        typeof msg === "string" ? `: ${clip(msg, 200)}` : ""
+      }`,
+    };
+  }
+  const rec = (parsed ?? {}) as Record<string, unknown>;
+  const answers = rec.answers;
+  if (
+    typeof answers !== "object" || answers === null || Array.isArray(answers)
+  ) {
+    return { ok: false, error: "response has no answers map" };
+  }
+  const scores: Record<string, number> = {};
+  for (const [id, answer] of Object.entries(answers as Record<string, unknown>)) {
+    if (typeof answer !== "object" || answer === null) continue;
+    const answerRecord = answer as Record<string, unknown>;
+    // Accept an omitted `type`, but reject a different question type outright.
+    if (answerRecord.type !== undefined && answerRecord.type !== "noul") {
+      continue;
+    }
+    const probability = answerRecord.noul;
+    if (
+      typeof probability !== "number" || !Number.isFinite(probability) ||
+      probability < 0 || probability > 1
+    ) {
+      // An out-of-range probability is a contract violation, not a score to
+      // clamp. Dropping it makes the answer missing and the call fails closed.
+      continue;
+    }
+    scores[id] = probability;
+  }
+  if (Object.keys(scores).length === 0) {
+    return { ok: false, error: "no usable noul answers in response" };
+  }
+  return {
+    ok: true,
+    model: typeof rec.model === "string" ? rec.model : "jev",
+    scores,
+  };
+}
+
+/**
+ * Question ids a Jev response must answer. A response that omits any of them
+ * is invalid output and fails closed rather than defaulting to zero danger.
+ */
+export function missingJevAnswers(
+  scores: Record<string, number>,
+  questions: JevQuestions,
+): string[] {
+  // `typeof !== "number"` rather than `=== undefined`, so a `null` or string
+  // answer counts as missing instead of defaulting to zero danger.
+  return Object.keys(questions).filter((id) => typeof scores[id] !== "number");
+}
+
+export type JevGateScores = {
+  hard: number;
+  /** The highest `soft_deny_<n>` score, or 0 with no soft-deny rules. */
+  softRule: number;
+  /** The 1-based rule behind `softRule`, or undefined with no soft-deny rules. */
+  softRuleNumber?: number;
+  intent: number;
+  scope: number;
+  /** The soft-deny band: `max(softRule, intent)`. */
+  soft: number;
+};
+
+/**
+ * The gate values `jevDecision` compares against its thresholds. Exported so
+ * calibration tooling measures exactly what the classifier gates on.
+ */
+export function jevGateScores(
+  scores: Record<string, number>,
+  questions: JevQuestions,
+): JevGateScores {
+  const hard = scores.hard_deny ?? 0;
+  const intent = scores.intent_mismatch ?? 0;
+  const scope = scores.scope_escape ?? 0;
+  // The highest-scoring soft-deny rule question, by rule number.
+  let softRule = 0;
+  let softRuleNumber: number | undefined;
+  for (const id of Object.keys(questions)) {
+    const match = SOFT_DENY_QUESTION_ID.exec(id);
+    if (!match) continue;
+    const score = scores[id] ?? 0;
+    if (softRuleNumber === undefined || score > softRule) {
+      softRule = score;
+      softRuleNumber = Number(match[1]);
+    }
+  }
+  // `scope_escape` is a supporting, non-parity signal. It is excluded from the
+  // soft-deny band and is advisory: it is reported but never blocks.
+  const soft = Math.max(softRule, intent);
+  return {
+    hard,
+    softRule,
+    ...(softRuleNumber === undefined ? {} : { softRuleNumber }),
+    intent,
+    scope,
+    soft,
+  };
+}
+
+/**
+ * The intent_mismatch threshold for an action. A parser-verified read-only
+ * action uses `jevReadOnlyIntentThreshold`, which never goes below the soft
+ * threshold: reading past what the user asked cannot restart, update, or delete
+ * anything. Soft-deny rules and hard_deny are unchanged.
+ */
+export function jevIntentThreshold(config: EffectiveConfig, readOnly: boolean): number {
+  return readOnly
+    ? Math.max(config.jevSoftDenyThreshold, config.jevReadOnlyIntentThreshold)
+    : config.jevSoftDenyThreshold;
+}
+
+/**
+ * True when the parser facts verify the action as read-only. Only the last
+ * line counts: `describeActionFacts` always ends with its own verdict.
+ */
+export function factsReadOnly(facts: string): boolean {
+  return facts.split("\n").at(-1) === "read_only: true";
+}
+
+/**
+ * True when an action gets the read-only intent threshold: the parser verifies
+ * it as read-only and it does not go looking for a credential.
+ */
+export function relaxedIntentRead(action: string, facts: string): boolean {
+  return factsReadOnly(facts) && !mentionsCredentials(action);
+}
+
+/**
+ * Map per-question probabilities onto pi-automode's decision + tier. Missing
+ * scores fail closed, so a caller that skips `missingJevAnswers` cannot turn
+ * incomplete output into an allow.
+ */
+export function jevDecision(
+  scores: Record<string, number>,
+  config: EffectiveConfig,
+  questions: JevQuestions,
+  options: { readOnly?: boolean } = {},
+): ClassificationDecision {
+  const missing = missingJevAnswers(scores, questions);
+  if (missing.length > 0) {
+    return {
+      decision: "block",
+      tier: "none",
+      reason:
+        `Jev: incomplete scores for ${missing.join(", ")}; auto mode fails closed.`,
+    };
+  }
+  const { hard, softRule, softRuleNumber, intent, scope, soft } = jevGateScores(
+    scores,
+    questions,
+  );
+  const intentThreshold = jevIntentThreshold(config, options.readOnly === true);
+  // Label the components and the gating value separately: a block driven by
+  // `intent_mismatch` would otherwise report the smaller rule score under a
+  // bare "soft" label.
+  const summary =
+    `hard=${hard.toFixed(2)} soft_rule=${softRule.toFixed(2)} (${
+      softRuleNumber === undefined ? "no rules" : `rule ${softRuleNumber}`
+    }) ` +
+    `intent=${intent.toFixed(2)} scope=${scope.toFixed(2)} ` +
+    `soft_gate=${soft.toFixed(2)}`;
+  // Name each gate that fired in words. The reason reaches the agent, the user's
+  // notification, and the soft-deny prompt, so a bare score line is not enough to
+  // act on.
+  const fired: string[] = [];
+  const scored = (label: string, score: number, threshold: number) =>
+    `${label} scored ${score.toFixed(2)} (threshold ${threshold.toFixed(2)})`;
+  if (hard >= config.jevHardDenyThreshold) {
+    fired.push(
+      `${scored("hard_deny", hard, config.jevHardDenyThreshold)}: the action may match a HARD_DENY rule`,
+    );
+  }
+  if (softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold) {
+    const rule = config.softDeny[softRuleNumber - 1];
+    fired.push(
+      `${scored(`soft-deny rule ${softRuleNumber}`, softRule, config.jevSoftDenyThreshold)}${
+        rule === undefined ? "" : `: "${quoteRule(rule)}"`
+      }`,
+    );
+  }
+  if (intent >= intentThreshold) {
+    const label = intentThreshold === config.jevSoftDenyThreshold
+      ? scored("intent_mismatch", intent, intentThreshold)
+      : `intent_mismatch scored ${intent.toFixed(2)} (read-only threshold ${intentThreshold.toFixed(2)})`;
+    fired.push(`${label}: the action may go beyond what the user asked`);
+  }
+  // `scope_escape` is advisory: it never blocks (caveat 20). At or above its
+  // threshold it is still named, so the user sees why the action looked risky.
+  const advisory = scope >= config.jevScopeEscapeThreshold
+    ? ` Advisory: scope_escape scored ${scope.toFixed(2)}: the action may reach outside the trusted environment (SSH hosts can be listed in autoMode.trustedHosts).`
+    : "";
+  const reason = `Jev: ${fired.join("; ")}.${advisory} Scores: ${summary}`;
+  const firedRule = softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold
+    ? config.softDeny[softRuleNumber - 1]
+    : undefined;
+  const ruleField = firedRule === undefined ? {} : { softDenyRule: firedRule };
+  if (hard >= config.jevHardDenyThreshold) {
+    return { decision: "block", tier: "hard_deny", reason, ...ruleField };
+  }
+  if (softRule >= config.jevSoftDenyThreshold || intent >= intentThreshold) {
+    return { decision: "block", tier: "soft_deny", reason, ...ruleField };
+  }
+  return {
+    decision: "allow",
+    tier: "none",
+    reason: `Jev: permitted (${summary})`,
+  };
+}
+
+// --- key resolution: pi registry -> env -> stored auth.json ----------------
+
+export type JevKeySource = "pi-auth" | "env" | "none";
+
+/** Test seams: keep key resolution deterministic without touching real auth.json. */
+export type JevKeyDeps = {
+  readStoredCredential?: (providerId: string) => unknown;
+  env?: Record<string, string | undefined>;
+};
+
+/**
+ * True when a base URL targets OpenRouter itself. Only then may OpenRouter-owned
+ * Pi credentials be sent; a custom endpoint must supply its own key via
+ * `jevApiKeyEnv` so the OpenRouter key never leaves for a third party.
+ */
+export function isOpenRouterBaseUrl(baseUrl: string): boolean {
+  try {
+    const url = new URL(openRouterDecisionsUrl(baseUrl));
+    const host = url.hostname.toLowerCase();
+    // Only the default-port HTTPS endpoint is the OpenRouter service. A
+    // non-default port or cleartext http is not, so the OpenRouter key stays
+    // withheld there.
+    return (host === "openrouter.ai" || host.endsWith(".openrouter.ai")) &&
+      url.port === "" &&
+      url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveJevKey(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  deps: JevKeyDeps = {},
+): Promise<{ key?: string; source: JevKeySource }> {
+  const env = deps.env ?? process.env;
+  const readStored = deps.readStoredCredential ?? readStoredCredentialFromDisk;
+  const openRouterOwned = isOpenRouterBaseUrl(config.jevBaseUrl);
+  if (openRouterOwned) {
+    try {
+      const viaRegistry = await ctx.modelRegistry?.getApiKeyForProvider(
+        "openrouter",
+      );
+      if (typeof viaRegistry === "string" && viaRegistry.trim() !== "") {
+        return { key: viaRegistry.trim(), source: "pi-auth" };
+      }
+    } catch {
+      // fall through to env / stored credential
+    }
+  }
+  // The OpenRouter default variable is withheld from custom endpoints. A custom
+  // base URL must name its own variable so the OpenRouter key is never sent.
+  // Compare case-insensitively because Windows env names are case-insensitive.
+  const defaultKeyEnv = config.jevApiKeyEnv.trim().toUpperCase() ===
+    DEFAULT_JEV_API_KEY_ENV;
+  if (openRouterOwned || !defaultKeyEnv) {
+    const fromEnv = env[config.jevApiKeyEnv];
+    if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
+      return { key: fromEnv.trim(), source: "env" };
+    }
+  }
+  if (openRouterOwned) {
+    try {
+      const stored = credentialKey(readStored("openrouter"));
+      if (stored) return { key: stored, source: "pi-auth" };
+    } catch {
+      // no stored credential
+    }
+  }
+  return { source: "none" };
+}
+
+/** Explain why key resolution produced no key for the active configuration. */
+function jevMissingKeyReason(config: EffectiveConfig): string {
+  const hint = jevOpenRouterKeyEnvMismatch(config)
+    ? `set autoMode.jevApiKeyEnv to a variable that holds the custom endpoint's key (${DEFAULT_JEV_API_KEY_ENV} is not sent to a custom base URL)`
+    : isOpenRouterBaseUrl(config.jevBaseUrl)
+    ? "run /login openrouter or set the env var"
+    : "set the env var (custom base URLs do not use Pi's OpenRouter credential)";
+  return `Jev classifier key missing (${config.jevApiKeyEnv}); ${hint}. ` +
+    "Auto mode fails closed.";
+}
+
+/** Test hook: clear the session verdict cache. */
+export function clearJevCache(): void {
+  CACHE.clear();
+}
+
+/** Human-readable Jev backend status for `/automode jev`. */
+export function jevStatusText(
+  config: EffectiveConfig,
+  keySource: JevKeySource,
+  diagnostics: string[] = [],
+): string {
+  const credential = {
+    "pi-auth": "Pi registry or stored credential",
+    "env": `environment variable ${config.jevApiKeyEnv}`,
+    "none": jevOpenRouterKeyEnvMismatch(config)
+      ? `none; the classifier fails closed (set a custom key variable, not ${DEFAULT_JEV_API_KEY_ENV})`
+      : `none; the classifier fails closed (set ${config.jevApiKeyEnv})`,
+  }[keySource];
+  const lines = [
+    `backend: ${config.classifierBackend}`,
+    `model: ${config.jevModel}`,
+    `endpoint: ${openRouterDecisionsUrl(config.jevBaseUrl)}`,
+    `credential: ${credential}`,
+    `hard deny threshold: ${config.jevHardDenyThreshold}`,
+    `soft deny threshold: ${config.jevSoftDenyThreshold}`,
+    `read-only intent threshold: ${jevIntentThreshold(config, true)} (verified read-only actions that name no credential)`,
+    `scope escape threshold: ${config.jevScopeEscapeThreshold} (advisory; scope_escape never blocks)`,
+    `confirm soft deny: ${config.jevConfirmSoftDeny ? "on (asks in interactive sessions)" : "off"}`,
+    `timeout: ${config.jevTimeoutMs}ms`,
+    "ignored by this backend: classifierReasoningLevel, fastClassifierMaxTokens",
+  ];
+  for (const diagnostic of diagnostics.filter((d) => /jev/i.test(d))) {
+    lines.push(`warning: ${diagnostic}`);
+  }
+  return lines.join("\n");
+}
+
+function jevIo(params: {
+  model: string;
+  baseUrl: string;
+  reasoning: ClassifierReasoning;
+  questions: JevQuestions;
+  state: Record<string, string>;
+  action: string;
+  decision?: ClassificationDecision;
+  error?: string;
+  durationMs: number;
+  cached: boolean;
+  /** Failed attempts before the final one, oldest first. */
+  earlier?: JevFailedAttempt[];
+}): ClassifierIo {
+  const { model, reasoning, questions, state, action, decision } = params;
+  return {
+    // The provider is only OpenRouter when the base URL is OpenRouter itself.
+    model: isOpenRouterBaseUrl(params.baseUrl)
+      ? `openrouter/${model}`
+      : model,
+    reasoning,
+    prompt: {
+      system: JSON.stringify(questions, null, 2),
+      context: JSON.stringify(state),
+      action,
+      fastInstruction: "(not used by the Jev backend)",
+      detailedInstruction: "(not used by the Jev backend)",
+    },
+    // Jev reports no token usage, so no synthetic provider response is
+    // fabricated and no ccusage `message` entry is written.
+    attempts: params.cached ? [] : [
+      ...(params.earlier ?? []).map((failed, index) => ({
+        stage: "detailed" as const,
+        attempt: index + 1,
+        error: failed.error,
+        durationMs: failed.durationMs,
+      })),
+      {
+        stage: "detailed" as const,
+        attempt: (params.earlier?.length ?? 0) + 1,
+        ...(decision === undefined ? {} : { parsed: decision }),
+        ...(params.error === undefined ? {} : { error: params.error }),
+        durationMs: params.durationMs,
+      },
+    ],
+    durationMs: params.durationMs,
+    ...(params.cached ? { cached: true } : {}),
+  };
+}
+
+type JevFailedAttempt = { error: string; durationMs: number };
+
+type JevScoresResult =
+  | {
+    ok: true;
+    scores: Record<string, number>;
+    model: string;
+    durationMs: number;
+    earlier?: JevFailedAttempt[];
+  }
+  | {
+    ok: false;
+    reason: string;
+    error?: string;
+    durationMs?: number;
+    earlier?: JevFailedAttempt[];
+    /** True for a failure a second request may not repeat (timeout, network, 429, 5xx). */
+    retryable?: boolean;
+  };
+
+/**
+ * Attempts per classification. Jev endpoint latency comes in bursts (live
+ * sessions saw 12 s timeouts clustered minutes apart while typical calls took
+ * under a second), so one retry of a transient failure removes most manual
+ * "try again" turns. The action still fails closed if both attempts fail.
+ */
+const JEV_MAX_ATTEMPTS = 2;
+
+/**
+ * A Jev decisions request with one retry of a transient failure. A client
+ * error, unreadable or incomplete output, and a cancelled turn are not retried.
+ */
+async function requestJevScores(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  state: Record<string, string>,
+  questions: JevQuestions,
+  deps: JevKeyDeps = {},
+): Promise<JevScoresResult> {
+  const earlier: JevFailedAttempt[] = [];
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await requestJevScoresOnce(ctx, config, state, questions, deps);
+    if (result.ok) {
+      return earlier.length > 0 ? { ...result, earlier: [...earlier] } : result;
+    }
+    const retry = result.retryable === true &&
+      result.error !== undefined &&
+      attempt < JEV_MAX_ATTEMPTS &&
+      !ctx.signal?.aborted;
+    if (!retry) {
+      return earlier.length > 0
+        ? {
+          ...result,
+          earlier: [...earlier],
+          reason: `${result.reason} (after ${attempt} attempts)`,
+        }
+        : result;
+    }
+    earlier.push({ error: result.error!, durationMs: result.durationMs ?? 0 });
+  }
+}
+
+/** One Jev decisions request. Any failure returns `ok: false` so callers block. */
+async function requestJevScoresOnce(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  state: Record<string, string>,
+  questions: JevQuestions,
+  deps: JevKeyDeps = {},
+): Promise<JevScoresResult> {
+  const { key } = await resolveJevKey(ctx, config, deps);
+  if (!key) return { ok: false, reason: jevMissingKeyReason(config) };
+
+  const signals: AbortSignal[] = [AbortSignal.timeout(config.jevTimeoutMs)];
+  if (ctx.signal) signals.push(ctx.signal);
+  const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+  const started = Date.now();
+
+  try {
+    const response = await fetch(openRouterDecisionsUrl(config.jevBaseUrl), {
+      method: "POST",
+      // A redirect could forward the Authorization header to another host; fail closed.
+      redirect: "error",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://pi.dev",
+        "X-Title": "pi-automode",
+      },
+      body: JSON.stringify({ model: config.jevModel, state, questions }),
+      signal,
+    });
+    const rawBody = await response.text();
+    const parsed = parseJevResponse(response.status, rawBody);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        reason: `Jev classifier failed; auto mode fails closed: ${parsed.error}`,
+        error: parsed.error,
+        durationMs: Date.now() - started,
+        retryable: response.status === 429 || response.status >= 500,
+      };
+    }
+    const missing = missingJevAnswers(parsed.scores, questions);
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        reason:
+          `Jev classifier response is missing answers for: ${missing.join(", ")}; ` +
+          "auto mode fails closed.",
+        error: `missing answers for: ${missing.join(", ")}`,
+        durationMs: Date.now() - started,
+      };
+    }
+    return {
+      ok: true,
+      scores: parsed.scores,
+      model: parsed.model,
+      durationMs: Date.now() - started,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const timedOut = signal.aborted || /abort|timeout/i.test(message);
+    return {
+      ok: false,
+      // A timeout or network error may pass on a second try; a turn the user
+      // cancelled must not be retried.
+      retryable: !ctx.signal?.aborted,
+      reason:
+        `Jev classifier ${
+          timedOut ? `timed out after ${config.jevTimeoutMs}ms` : "failed"
+        }; auto mode fails closed: ${clip(message, 160)}`,
+      error: clip(message, 160),
+      durationMs: Date.now() - started,
+    };
+  }
+}
+
+/**
+ * The ClassifyAction pi-automode calls when classifierBackend === "jev".
+ * Any setup, transport, or parse failure returns a block.
+ */
+export async function defaultJevClassifyAction(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  action: string,
+  loadedContext: string,
+  deps: JevKeyDeps & ClassifyExtras = {},
+): Promise<ClassifyResult> {
+  const model = config.jevModel;
+  const reasoning: ClassifierReasoning = {
+    mode: "backend",
+    backend: "jev",
+    model,
+  };
+  const transcript = buildClassifierTranscriptParts(ctx, {
+    maxUserTokens: config.maxUserTranscriptTokens,
+    maxToolTokens: config.maxToolTranscriptTokens,
+  });
+  const state = buildJevState({
+    action,
+    userRequest: transcript.userRequest,
+    recentActions: transcript.recentActions,
+    facts: describeActionFacts(action, config.trustedHosts, deps.extraFacts),
+    loadedContext,
+  });
+  const questions = buildJevQuestions(config);
+  const cacheKey = createHash("sha256")
+    .update(JSON.stringify({
+      session: classifierCacheSessionId(ctx),
+      model,
+      baseUrl: config.jevBaseUrl,
+      state,
+      questions,
+      hard: config.jevHardDenyThreshold,
+      soft: config.jevSoftDenyThreshold,
+      scope: config.jevScopeEscapeThreshold,
+      readOnlyIntent: config.jevReadOnlyIntentThreshold,
+    }))
+    .digest("hex");
+
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    // Refresh recency so the bounded cache evicts least-recently-used entries.
+    CACHE.delete(cacheKey);
+    CACHE.set(cacheKey, cached);
+    return {
+      ...cached.decision,
+      reason: `${cached.decision.reason} (cached)`,
+      reasoning,
+      io: jevIo({
+        model: cached.model,
+        baseUrl: config.jevBaseUrl,
+        reasoning,
+        questions,
+        state,
+        action,
+        decision: cached.decision,
+        durationMs: 0,
+        cached: true,
+      }),
+    };
+  }
+
+  const result = await requestJevScores(ctx, config, state, questions, deps);
+  if (!result.ok) {
+    return {
+      decision: "block",
+      tier: "none",
+      reasoning,
+      reason: result.reason,
+      // A missing key has no attempt to log, matching the LLM path. Transport,
+      // HTTP, parse, and incomplete-answer failures log one error attempt.
+      ...(result.error === undefined ? {} : {
+        io: jevIo({
+          model,
+          baseUrl: config.jevBaseUrl,
+          reasoning,
+          questions,
+          state,
+          action,
+          error: result.error,
+          durationMs: result.durationMs ?? 0,
+          cached: false,
+          earlier: result.earlier,
+        }),
+      }),
+    };
+  }
+
+  const decision = jevDecision(result.scores, config, questions, {
+    readOnly: relaxedIntentRead(action, state.facts ?? ""),
+  });
+  CACHE.delete(cacheKey);
+  CACHE.set(cacheKey, { decision, model: result.model });
+  while (CACHE.size > CACHE_LIMIT) {
+    const oldest = CACHE.keys().next();
+    if (oldest.done) break;
+    CACHE.delete(oldest.value);
+  }
+
+  return {
+    ...decision,
+    reasoning,
+    io: jevIo({
+      model: result.model,
+      baseUrl: config.jevBaseUrl,
+      reasoning,
+      questions,
+      state,
+      action,
+      decision,
+      durationMs: result.durationMs,
+      cached: false,
+      earlier: result.earlier,
+    }),
+  };
+}
+
+export type JevProbe = {
+  label: "safe" | "dangerous";
+  action: string;
+  scores: Record<string, number>;
+  decision: ClassificationDecision;
+};
+
+export type JevProbeResult =
+  | { ok: true; model: string; probes: JevProbe[] }
+  | { ok: false; reason: string };
+
+/**
+ * Probes that exercise the live endpoint once. A "safe" action should be allowed
+ * and a "dangerous" action blocked; if that is not the result, the endpoint's
+ * `noul` direction or the thresholds are misconfigured.
+ */
+const PROBES: Array<{ label: "safe" | "dangerous"; action: string; request: string }> = [
+  {
+    label: "safe",
+    action: '{"toolName":"read","input":{"path":"README.md"}}',
+    request: "Summarize the repository README.",
+  },
+  {
+    label: "dangerous",
+    action: '{"toolName":"bash","input":{"command":"rm -rf ~/Documents"}}',
+    request: "Summarize the repository README.",
+  },
+];
+
+/** Run the read-only direction probe used by `/automode jev test`. */
+export async function probeJevClassifier(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  deps: JevKeyDeps = {},
+): Promise<JevProbeResult> {
+  const questions = buildJevQuestions(config);
+  const probes: JevProbe[] = [];
+  let model = config.jevModel;
+  for (const probe of PROBES) {
+    const state = buildJevState({
+      action: probe.action,
+      userRequest: `User: ${probe.request}`,
+      recentActions: "",
+      facts: describeActionFacts(probe.action, config.trustedHosts),
+      loadedContext: "",
+    });
+    const result = await requestJevScores(ctx, config, state, questions, deps);
+    if (!result.ok) return { ok: false, reason: result.reason };
+    model = result.model;
+    probes.push({
+      label: probe.label,
+      action: probe.action,
+      scores: result.scores,
+      decision: jevDecision(result.scores, config, questions, {
+        readOnly: relaxedIntentRead(probe.action, state.facts ?? ""),
+      }),
+    });
+  }
+  return { ok: true, model, probes };
+}

@@ -40,6 +40,93 @@ Higher levels can use all 512 or 1200 stage tokens before they produce visible o
 
 If a request stalls or exceeds its budget, pi-automode aborts it. Then auto mode fails closed and blocks the action.
 
+Under the Jev backend, `allow` exceptions do not reach the per-rule soft-deny questions, so they do not lift a soft deny. This makes Jev stricter than the LLM classifier for those actions. In an interactive session, `jevConfirmSoftDeny` lets you approve a single call or similar calls for the rest of the session; use `permissions.allow` for an action that Jev keeps blocking across sessions.
+
+### Session approvals
+
+"Allow similar for this session" stores a pattern that pi-automode's Bash parser derives from the command. A later action matches only if it has the same shape:
+
+- the same command names in the same order, with the same separators (`|`, `&&`, `;`);
+- the same flags and the same non-numeric arguments;
+- the same `ssh` host and the same remote commands under the same rules;
+- the same redirect targets.
+
+The option is offered only when the pattern is short enough to recur: at most 3 substantive commands (output trimmers such as `head -20`, `tail -n 50`, and `wc -l` do not count), no literal argument over 40 characters (paths and URLs up to 100), and at most 120 literal characters in total. Long `grep -E` regexes, `sed` scripts, inline SQL, and chains of marker `echo`s are one-off probes, so they get only **Allow once**. The prompt shows the pattern as a shell command, with `<n>` and `…` where values may differ.
+
+Only numbers in value positions may differ: a number after a flag (`-n 50`), a count flag (`head -20`), a `key=15` value, or a `timeout` duration. `--flag=value` values may also differ. Bare positional numbers stay exact, and every number stays exact for commands whose numbers are targets (`kill`, `chmod`, `chown`, `umask`, firewall tools), including behind `sudo`. Heredocs, nested shells (`bash -c`, `eval`), dynamic words, and compound shell syntax get no pattern, so only **Allow once** is offered.
+
+A session approval only replaces the soft-deny prompt. Permission rules, deterministic hard-deny checks, and a Jev `hard_deny` still apply. Approvals live in memory, are cleared when a session starts, and can be listed or cleared with `/automode approvals` and `/automode approvals clear`.
+
+## Scratch roots
+
+`scratchRoots` lists directories where the agent's `write` and `edit` calls skip the classifier, for example a clone the session creates under `/tmp`:
+
+```json
+{
+  "autoMode": {
+    "scratchRoots": ["/tmp", "~/scratch"]
+  }
+}
+```
+
+Protected paths inside a scratch root still reach the classifier, matched relative to the root and by name at any depth (`.git`, `build.gradle`). Denied paths, permission rules, accepted `permissions.ask` rules, and the deterministic hard-deny and safety-control checks still apply. `bash` commands are classified as usual, even when they write inside a scratch root.
+
+A Jev soft-deny prompt for a `write` or `edit` also offers **Allow edits under FOLDER for this session**, where FOLDER is the git repository containing the file, or else the file's folder. Choosing it makes that folder a scratch root until the session starts again, with the same exceptions. It is listed by `/automode approvals` and removed by `/automode approvals clear`. The option is not offered when the folder would be an invalid scratch root, such as the home directory.
+
+If you decline a Jev soft deny for a `bash` script on the file-overwrite rule, and the script works under a scratch root, a session folder, or the project folder with `allowInsideWorkingDirectory`, the block message tells the agent that the edit and write tools are allowed there, so it can redo the change with them. Blocks on any other rule, other tools, and scripts elsewhere get no hint.
+
+Each entry must be an absolute or `~/` path. `/`, `~`, and any directory that contains the home directory are rejected with a diagnostic, because they would switch off review for nearly everything. Entries merge across global, project-local, and inline config; shared project `.pi/automode.json` cannot add scratch roots.
+
+## Trusted hosts
+
+`trustedHosts` lists SSH host names or aliases that the classifier should treat as part of the trusted environment:
+
+```json
+{
+  "autoMode": {
+    "trustedHosts": ["prod-proxy"]
+  }
+}
+```
+
+Both classifier backends receive the list as one extra trusted-environment line. The Jev backend also marks the parsed `ssh` target as `trusted=true` in its parser facts. A trusted host is only context for the classifier. It does not allow any command, and a write to a trusted host still matches the remote-shell soft-deny rule.
+
+Each entry must be one plain host name: no wildcards, `user@`, ports, or spaces. Invalid entries are dropped with a diagnostic. Matching is case-insensitive. The list has no built-in entries, so it needs no `$defaults`. It merges across global, project-local, and inline config. Shared project `.pi/automode.json` cannot add trusted hosts.
+
+## Jev classifier backend
+
+`classifierBackend` selects the classifier stage: `"llm"` (default) or `"jev"`. The Jev backend replaces only the classifier stage and leaves every deterministic layer unchanged. Any Jev error fails closed.
+
+The following keys apply only when `classifierBackend` is `"jev"`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `jevModel` | `"~typesafe/jev-latest"` | Jev model id sent to the decisions endpoint |
+| `jevBaseUrl` | `"https://openrouter.ai/api/v1"` | Chat-compatible base URL; pi-automode derives `/api/alpha/decisions` |
+| `jevApiKeyEnv` | `"OPENROUTER_API_KEY"` | Environment variable consulted after the Pi registry and before stored auth. On a custom `jevBaseUrl`, the default variable is withheld and a custom variable must be named |
+| `jevTimeoutMs` | `12000` | Per-request timeout, integer from 1000 through 2147483647 |
+| `jevHardDenyThreshold` | `0.5` | `hard_deny` probability at or above which the action is blocked |
+| `jevSoftDenyThreshold` | `0.55` | Highest soft-side probability at or above which the action is blocked: the highest per-rule `soft_deny_<n>` score or `intent_mismatch`. Jev asks one question per `soft_deny` rule, so each configured rule adds one question to every request. See [Jev classifier backend](jev-classifier-backend.md) for the measurements behind this value |
+| `jevReadOnlyIntentThreshold` | `0.75` | `intent_mismatch` probability at or above which an action is blocked when the parser verifies it as read-only and it names no credential (no key, secret, password, token, `.env`, or private-key file other than an environment reference or auth header). A read cannot restart, update, or delete anything, so a looser intent check costs little. Soft-deny rules and `hard_deny` keep their thresholds, and the value never goes below `jevSoftDenyThreshold` |
+| `jevConfirmSoftDeny` | `true` | In an interactive session, a Jev `soft_deny` block (a soft-deny rule or `intent_mismatch`) asks instead of blocking outright: **Allow once**, **Allow similar for this session**, or **Deny**. The prompt shows the reason and the action. "Similar" is offered only for `bash` actions the parser can pin down (see below). Only the interactive terminal (`ctx.mode` `tui`) asks: headless runs and RPC-mode clients such as pi-subagents children block instead, because nobody can answer there. Hard denies and classifier failures never ask; a dismissed, cancelled, or failed prompt blocks |
+| `jevScopeEscapeThreshold` | `0.5` | `scope_escape` probability at or above which a block reason names it as advisory. `scope_escape` never blocks |
+
+`scope_escape` is advisory. It asks whether the action reaches outside the trusted repository, working tree, or trusted environment, and it has no LLM-classifier counterpart. It is logged and, at or above `jevScopeEscapeThreshold`, named in a block reason, but it never blocks: in the calibration sweep it blocked no violation that the soft-deny rules or `intent_mismatch` missed, while it blocked read-only remote queries, public GET requests, and declared installs.
+
+`classifierBackend` is a scalar with normal precedence: global, then project-local, then `PI_AUTOMODE_SETTINGS_JSON`. Shared project `.pi/automode.json` cannot set it. `classifierReasoningLevel` and `fastClassifierMaxTokens` are ignored when `classifierBackend` is `"jev"`.
+
+Jev key resolution is the Pi registry (`/login openrouter`), then `jevApiKeyEnv`, then stored `auth.json`. The registry and stored credentials are only used when `jevBaseUrl` targets OpenRouter. A custom base URL must name its own key variable in `jevApiKeyEnv`; the default `OPENROUTER_API_KEY` is withheld from custom hosts so the OpenRouter key is never sent to a third party. A response that omits any requested question id fails closed.
+
+Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action and does not re-bound the transcript or the rule lists for Jev; a payload the endpoint rejects fails closed.
+
+The transcript keeps only the most recent tool calls (12) and bounds each tool-call input to a budget whose string cap is `budget / 4` characters (375 with the default `1500`). Tool inputs are the agent's own actions, not the user's authorization. Measured against the live endpoint, the inflation tracks the security vocabulary in the input text rather than its length or recency, and the user's authorization lives in the user entries, which are budgeted separately and are unaffected by any tool-transcript budget. `maxToolTranscriptTokens` does not bind at its `4000` default because the retained tool calls are shorter than that.
+
+On the Jev backend, pi-automode also keeps an in-memory record of paths the agent created during the session. It is not configurable. When a later `bash` action overwrites or removes one of them, Jev gets a `created_this_session` fact so a refresh of the agent's own worktree or diff is not mistaken for overwriting the user's files. The record covers only `>`/`>>` redirects, `mkdir`, and `git worktree add`, in actions that pi-automode's parser can read completely. A file loses its status for good once anyone else changes it, and a folder's claim requires every entry inside it to be newer than the folder. The record is never written to the session, starts empty on every session start, and works only where the filesystem reports real creation times (macOS, and Linux with `statx`). While a removal that relied on such a claim is running, other calls that may change files are blocked with a message to run them again. It is evidence for Jev, not an allow rule; see caveat 26 in [Jev classifier backend](jev-classifier-backend.md).
+
+Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers, so its allow tier is always `none`. Only the optional `classifier` I/O log records that a Jev allow overrode a soft-deny rule, through the score summary.
+
+`/automode backend <llm|jev>` writes `classifierBackend` to the global config. When the Jev backend is active, `/automode model` writes `jevModel` and does not require the model to be present in the Pi registry; the Pi model picker is LLM-only, so pass the Jev model id explicitly. `/automode jev` reports the effective endpoint, credential source, and thresholds. `/automode jev test` sends one clearly safe and one clearly dangerous probe to the live endpoint and reports both verdicts, which validates that `noul` answers are danger-side-up.
+
 `allowInsideWorkingDirectory` adds a deterministic allow tier for the file tools. The default value is `false`. The file tools are `read`, `write`, `edit`, `grep`, `find`, and `ls`.
 
 The value `allowInsideWorkingDirectory: true` allows access to paths inside the working directory without classifier review. Pi-automode sends access to outside paths to the classifier. This rule also applies to read calls.
@@ -47,6 +134,8 @@ The value `allowInsideWorkingDirectory: true` allows access to paths inside the 
 This tier takes precedence over `classifyReadOnlyTools`. If both configuration fields are enabled, pi-automode still allows in-tree file access locally. `classifyReadOnlyTools: true` does not change this behavior.
 
 Protected in-tree targets do not use this allow tier. Writes and edits to `.git/hooks`, `.pi` controls, shell profiles, and configuration files still reach the classifier.
+
+`protectedPaths` entries without `/` match that name at any depth, entries with `/` are relative to the project root, and `*` matches within one path segment; see [Defaults and rule-list behavior](defaults.md#protectedpaths).
 
 `deniedPaths` is a list of path glob patterns. The default list is `[]`. A matching pattern blocks a file-tool call before classifier review or an allow tier.
 
@@ -67,6 +156,7 @@ Example:
 ```json
 {
   "autoMode": {
+    "classifierBackend": "llm",
     "classifierModel": "provider/model-id",
     "classifierReasoningLevel": "low",
     "classifyReadOnlyTools": false,
@@ -99,7 +189,7 @@ Example:
 }
 ```
 
-`maxUserTranscriptTokens` and `maxToolTranscriptTokens` are approximate budgets for each category. Both default to 4000 and accept integers of at least 32.
+`maxUserTranscriptTokens` and `maxToolTranscriptTokens` are approximate budgets for each category. Both default to 4000 and accept integers of at least 32. The tool budget is capped independently by the 12 most recent tool calls and by a 400-token per-entry limit, so it does not bind at its default: raising `maxToolTranscriptTokens` above roughly 4800 adds no tool evidence. Each tool-call input is serialized with a string cap of `budget / 4` characters, 375 with the default budget. These limits apply to both classifier backends, because both share the transcript builder. The user budget is separate, so tool limits never evict a user message.
 
 Pi-automode does not support the former `maxTranscriptLines` field. Evidence selection now uses token budgets instead of line counts.
 

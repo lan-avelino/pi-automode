@@ -2,8 +2,22 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { safeJson, truncateMiddle } from "./utils.ts";
 
 const MAX_USER_ENTRY_TOKENS = 1000;
-const MAX_TOOL_ENTRY_TOKENS = 1000;
-const MAX_RECENT_TOOL_ENTRIES = 40;
+const MAX_TOOL_ENTRY_TOKENS = 400;
+const MAX_RECENT_TOOL_ENTRIES = 12;
+/**
+ * Per-tool-call input budget. `safeJson` divides it by 4, so each string value is
+ * capped at `MAX_TOOL_INPUT_BUDGET / 4` characters (375 here, down from 2000 with
+ * the previous inline 8000).
+ *
+ * Tool inputs are the agent's own actions, not the user's authorization. Measured
+ * against the live endpoint with the same 12 tool calls: real inputs scored
+ * `soft=0.30`, the same inputs emptied scored `soft=0.15`, and benign filler of
+ * the *same length* scored `soft=0.18`. So the inflation is the security
+ * vocabulary in the input text, not its length or recency. The user's authorization
+ * lives in the user entries, which are budgeted separately by
+ * `maxUserTranscriptTokens`.
+ */
+const MAX_TOOL_INPUT_BUDGET = 1500;
 const CHARS_PER_APPROX_TOKEN = 4;
 
 type TranscriptEntry = {
@@ -86,15 +100,23 @@ function truncateToTokenCap(
   };
 }
 
+/**
+ * User turns come from the whole branch, tool calls from the model's context.
+ *
+ * Compaction drops earlier entries from the model's context. A standing
+ * instruction such as "commit and push once the reviewer says clean" then
+ * disappeared too, and every later commit looked unauthorized. The compaction
+ * summary is agent-written, so it never stands in for the user's turns.
+ */
 function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
     buildContextEntries?: () => ReturnType<typeof ctx.sessionManager.getBranch>;
   };
-  const contextEntries = sessionManager.buildContextEntries?.() ??
-    sessionManager.getBranch();
+  const branch = sessionManager.getBranch();
+  const inContext = new Set(sessionManager.buildContextEntries?.() ?? branch);
 
-  for (const [index, entry] of contextEntries.entries()) {
+  for (const [index, entry] of branch.entries()) {
     if (entry.type !== "message") continue;
     const message = entry.message as { role?: string; content?: unknown };
     if (message.role === "user") {
@@ -102,7 +124,7 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
       if (text) entries.push({ index, order: 0, kind: "user", text });
       continue;
     }
-    if (message.role !== "assistant") continue;
+    if (message.role !== "assistant" || !inContext.has(entry)) continue;
 
     for (const [order, toolCall] of collectAssistantToolCalls(
       message.content,
@@ -111,7 +133,9 @@ function collectTranscriptEntries(ctx: ExtensionContext): TranscriptEntry[] {
         index,
         order,
         kind: "tool",
-        text: `${toolCall.name}: ${safeJson(toolCall.input, 8000)}`,
+        text: `${toolCall.name}: ${
+          safeJson(toolCall.input, MAX_TOOL_INPUT_BUDGET)
+        }`,
       });
     }
   }
@@ -196,6 +220,8 @@ function selectToolEntries(
   };
 }
 
+const OMITTED_MARKER = "<transcript_entries_omitted />";
+
 /** Build classifier evidence from user text and assistant tool-call payloads only. */
 export function buildClassifierTranscript(
   ctx: ExtensionContext,
@@ -212,10 +238,37 @@ export function buildClassifierTranscript(
       index: Number.MAX_SAFE_INTEGER,
       order: 0,
       kind: "tool",
-      text: "<transcript_entries_omitted />",
+      text: OMITTED_MARKER,
     });
   }
   return selected.map((entry) => entry.text).join("\n");
+}
+
+export type ClassifierTranscriptParts = {
+  /** The user's own turns, oldest first. */
+  userRequest: string;
+  /** The agent's recent tool calls, oldest first. Never user authorization. */
+  recentActions: string;
+};
+
+/**
+ * The same bounded evidence as `buildClassifierTranscript`, split so the user's
+ * turns and the agent's tool calls reach the classifier under separate labels.
+ * Each part carries its own omission marker.
+ */
+export function buildClassifierTranscriptParts(
+  ctx: ExtensionContext,
+  budgets: ClassifierTranscriptBudgets,
+): ClassifierTranscriptParts {
+  const entries = collectTranscriptEntries(ctx);
+  const users = selectUserEntries(entries, budgets.maxUserTokens);
+  const tools = selectToolEntries(entries, budgets.maxToolTokens);
+  const render = (part: { selected: TranscriptEntry[]; omitted: boolean }) =>
+    [
+      ...part.selected.map((entry) => entry.text),
+      ...(part.omitted ? [OMITTED_MARKER] : []),
+    ].join("\n");
+  return { userRequest: render(users), recentActions: render(tools) };
 }
 
 export function loadedContextFromSystemPromptOptions(options: unknown): string {

@@ -23,6 +23,10 @@ export type BashRedirectAnalysis = {
   fileDescriptor?: number;
   variableName?: string;
   heredoc: boolean;
+  /** Heredoc body as written, before any expansion. */
+  heredocContent?: string;
+  /** True for `<<'EOF'`, whose body the shell does not expand. */
+  heredocQuoted?: boolean;
 };
 
 export type EffectiveCommand = {
@@ -312,13 +316,17 @@ export function analyzeBash(
   }
 
   function analyzeRedirect(redirect: Redirect): BashRedirectAnalysis {
+    const heredoc = redirect.operator === "<<" || redirect.operator === "<<-";
     return {
       operator: redirect.operator,
       target: redirect.target?.value,
       targetDynamic: !!redirect.target && !wordIsStatic(redirect.target),
       fileDescriptor: redirect.fileDescriptor,
       variableName: redirect.variableName,
-      heredoc: redirect.operator === "<<" || redirect.operator === "<<-",
+      heredoc,
+      ...(heredoc && redirect.content !== undefined
+        ? { heredocContent: redirect.content, heredocQuoted: !!redirect.heredocQuoted }
+        : {}),
     };
   }
 

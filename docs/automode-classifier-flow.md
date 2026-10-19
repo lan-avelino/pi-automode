@@ -11,18 +11,20 @@ For each Pi `tool_call` event, the extension does this:
 3. If the agent turn was cancelled, block the call.
 4. Block a matching `permissions.deny` rule.
 5. If a `permissions.ask` rule matches, ask the user.
-6. If the user declines or no UI is available, block the call.
+6. If the user declines, or there is no interactive terminal (`ctx.mode` is not `tui`, for example a pi-subagents child in RPC mode), block the call.
 7. Mark an accepted ask call for required classifier review.
 8. Run deterministic hard-deny checks.
 9. If no accepted ask rule requires review, let the extension-owned `automode_inspect` tool run locally.
 10. Run path-deny checks, including recursive search scopes and symlink aliases.
 11. If an ask rule was accepted, skip all deterministic allow tiers.
 12. Otherwise, apply the inside-working-directory, `permissions.allow`, and read-only tiers in that order.
-13. Send every remaining action through a one-token conservative filter.
+13. Send every remaining action through a one-token conservative filter (LLM backend) or a single Jev decisions request (Jev backend).
 14. If the filter requests review, run structured classifier review.
 15. Persist state and update the UI status and denial history.
 
 The default posture is fail-closed. If model resolution, authentication, a classifier call, or response parsing fails, pi-automode blocks the action.
+
+Step 13/14 select the classifier backend from `classifierBackend`. The `llm` backend runs the staged filter and structured review described below. The `jev` backend replaces that stage with one Jev / SystemOne request and maps its `noul` probabilities onto the same tiers. Every preceding deterministic step is shared by both backends and is never delegated to Jev.
 
 ## Diagram
 
@@ -317,6 +319,8 @@ Pi-automode builds the transcript from active Pi context entries. It includes on
 Pi-automode excludes assistant prose, hidden reasoning, and tool results. User evidence and tool-call evidence have separate approximate-token budgets. Both budgets default to 4000.
 
 The selector keeps the first and latest user messages. It fills the remaining budget from the newest eligible entries. It renders retained evidence in chronological order. It also marks omitted or truncated evidence.
+
+The tool-call side is bounded by three independent limits: the 12 most recent tool calls, 400 approximate tokens per entry, and a per-input string cap of 375 characters. The tool budget therefore does not bind at its 4000 default, and raising it above roughly 4800 adds no tool evidence. These limits apply to both the LLM and Jev backends, which share the transcript builder. The user-message budget is separate, so no tool limit can evict a user message.
 
 Transcript truncation does not change the dedicated current-action message.
 

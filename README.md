@@ -43,8 +43,12 @@ pi -e ./extensions/auto-mode.ts
 /automode defaults  # print the built-in rule lists
 /automode config    # effective config, resolved log file path, + diagnostics
 /automode denials   # denial history for this session
-/automode model     # open classifier model selector and save to ~/.pi/agent/extensions/pi-automode/config.json
-/automode model provider/model-id # save classifier model to ~/.pi/agent/extensions/pi-automode/config.json
+/automode approvals [clear] # list or clear this session's "allow similar" approvals
+/automode backend llm|jev # select the classifier backend and save it globally
+/automode jev       # report the Jev backend endpoint, credential source, and thresholds
+/automode jev test  # probe the live Jev endpoint in both directions
+/automode model     # open the LLM classifier model selector (LLM backend only)
+/automode model provider/model-id # save the active backend's classifier model to ~/.pi/agent/extensions/pi-automode/config.json
 ```
 
 `/auto-mode` is an alias.
@@ -93,6 +97,7 @@ AM ● a:12 d:2 ca:5 cd:1
 - [Permission recipes](docs/permission-recipes.md)
 - [Defaults and rule-list behavior](docs/defaults.md)
 - [Auto-mode classifier flow](docs/automode-classifier-flow.md)
+- [Jev classifier backend](docs/jev-classifier-backend.md)
 - [Observability logging](docs/observability-logging.md)
 - [Architecture decisions](docs/adr/INDEX.md)
 
@@ -122,6 +127,47 @@ Pi-automode blocks a `deniedPaths` match before classifier review or an allow ti
 The list does not govern `bash`. The classifier and deterministic hard-deny checks govern shell access to these paths.
 
 The value `allowInsideWorkingDirectory: true` allows file access inside the working directory locally. Pi-automode sends all outside file access to the classifier, including reads.
+
+## Classifier backends
+
+The classifier stage supports two backends. The default is the LLM classifier (`"classifierBackend": "llm"`).
+
+The opt-in Jev backend (`"classifierBackend": "jev"`) replaces the classifier stage. It calls the Jev / SystemOne classifier through OpenRouter decisions API (`POST {model, state, questions}`). Every layer above the classifier stays authoritative and unchanged, including permission rules, deterministic hard-deny, `deniedPaths`, and the allow tiers.
+
+Jev answers are probabilities, not a decision. Pi-automode maps them locally onto the same `hard_deny` / `soft_deny` / `none` tiers used by the LLM classifier. Deterministic hard-deny is never routed through Jev. Jev cannot report the LLM classifier's `allow` or `explicit_intent` tiers; its allow tier is always `none`, so only the optional `classifier` I/O log distinguishes an authorization override, and only through the score summary.
+
+Jev blocks at `jevHardDenyThreshold` (default `0.5`) and at the soft-deny band's `jevSoftDenyThreshold` (default `0.55`). For an action the parser verifies as read-only that names no credential, `intent_mismatch` blocks only at `jevReadOnlyIntentThreshold` (default `0.75`); its soft-deny rules still block at `0.55`. The soft-deny band is the highest score among one question per `soft_deny` rule, each asking whether the action does what that rule describes without direct user authorization, together with `intent_mismatch`. `allow` exceptions are not sent to these questions, so under Jev they do not lift a soft deny; use `permissions.allow` for an action Jev keeps blocking. In an interactive session, a Jev soft deny asks you instead of blocking outright (`jevConfirmSoftDeny`, default `true`): allow once, allow similar actions for the rest of the session, or deny. "Similar" is a pattern the parser derives from the `bash` command: every command name, flag, non-numeric argument, `ssh` host, remote command, and redirect must match, and only numbers in value positions (`-n 50`, `head -20`, a `timeout` duration) and `--flag=value` values may differ. Heredocs, nested shells, and dynamic words get no pattern. Session approvals only replace the prompt; hard denies, classifier failures, headless runs, and RPC-mode sessions such as pi-subagents children still block, since nobody can answer a prompt there. A subagent does not inherit the parent's session approvals. Jev block reasons name the gate that fired, quote the soft-deny rule when one fired, and list the scores. Both values are measured against the live endpoint with `npm run jev:sweep`; see [Jev classifier backend](docs/jev-classifier-backend.md). `scope_escape` asks whether the action reaches outside the trusted repository, working tree, or trusted environment. It is advisory: it is logged, and named in a block reason at or above `jevScopeEscapeThreshold` (default `0.5`), but it never blocks. In the calibration sweep it blocked no violation that the other questions missed, while it did block read-only remote queries, public GET requests, and declared installs.
+
+Jev fails closed. A missing key, network failure, timeout, or unparseable response blocks the action (a timeout, network error, HTTP 429, or 5xx is retried once first), matching the LLM classifier's posture. Jev's hard-deny answer is advisory; the deterministic layer remains the unconditional floor.
+
+Jev is opt-in and its answers are an unverified third-party contract. The backend assumes each `noul` answer is a danger-side-up probability (higher means more dangerous). Run `/automode jev test` once against the live endpoint before relying on it; the probe sends one clearly safe and one clearly dangerous action and reports both verdicts.
+
+Configure it in a user-owned config source:
+
+```json
+{
+  "autoMode": {
+    "classifierBackend": "jev",
+    "jevModel": "~typesafe/jev-latest",
+    "jevBaseUrl": "https://openrouter.ai/api/v1",
+    "jevApiKeyEnv": "OPENROUTER_API_KEY",
+    "jevTimeoutMs": 12000,
+    "jevHardDenyThreshold": 0.5,
+    "jevSoftDenyThreshold": 0.55,
+    "jevScopeEscapeThreshold": 0.5
+  }
+}
+```
+
+Key resolution order: the Pi model registry (`/login openrouter`), then `jevApiKeyEnv`, then a stored `auth.json` credential. The OpenRouter registry and stored credentials are only sent when `jevBaseUrl` points at OpenRouter itself. A custom base URL must name its own key variable in `jevApiKeyEnv`; the default `OPENROUTER_API_KEY` is withheld from custom hosts so the OpenRouter key never reaches a third party. A response that omits any requested question fails closed. `classifierReasoningLevel` and `fastClassifierMaxTokens` do not apply to the Jev backend. Redirect responses are rejected rather than followed, so the key is never forwarded to another host.
+
+Switch backends with `/automode backend llm` or `/automode backend jev`. This writes the global config, like `/automode model`. In Jev mode, `/automode model` writes `jevModel` instead of `classifierModel`; the Pi model picker is LLM-only, so pass the Jev model id explicitly. `/automode jev` reports the effective endpoint, credential source, and thresholds. `/automode jev test` probes the live endpoint.
+
+The Jev client redacts common secret shapes from the action payload and transcript before sending them, but the payload still leaves the machine. Do not put credentials in rules or tool inputs.
+
+Jev sends the same bounded context the LLM classifier sees: the token-bounded transcript, the per-file-bounded project instructions, and the full redacted rule lists. Pi-automode does not truncate the current action, and it does not re-bound the rule lists for Jev. It keeps only the 12 most recent tool calls in the transcript and bounds each tool-call input to 1500 characters, because tool inputs are the agent's own actions rather than your authorization. A payload the endpoint rejects fails closed. If the endpoint instead accepts and silently truncates an oversized payload, Jev can classify a partial action and pi-automode cannot detect that; only the deterministic layers are unaffected by payload size.
+
+The rest of this section describes the LLM backend.
 
 Classification starts with a conservative one-token filter. If the filter requests review, pi-automode requests one internal `classifier_decision` tool call.
 

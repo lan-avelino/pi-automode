@@ -20,6 +20,12 @@ import {
 	DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
 	DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
 	DEFAULT_HARD_DENY,
+	DEFAULT_JEV_HARD_DENY_THRESHOLD,
+	DEFAULT_JEV_MODEL,
+	DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+	DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
+	DEFAULT_JEV_SOFT_DENY_THRESHOLD,
+	DEFAULT_JEV_TIMEOUT_MS,
 	DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
 	DEFAULT_SOFT_DENY,
 	PI_GLOBAL_SETTINGS,
@@ -30,6 +36,7 @@ import {
 	modelVisibleConfigDiagnostics,
 	prepareGlobalConfig,
 	validateSettingsFile,
+	writeGlobalAutoModeSetting,
 	writeGlobalClassifierModel,
 } from "../extensions/auto-mode.ts";
 import {
@@ -689,6 +696,64 @@ test("project shared Pi settings can add deny and ask permissions but cannot wea
 	assert.deepEqual(config.permissionAllow, []);
 });
 
+test("autoMode.trustedHosts merges user-owned scopes and ignores shared project config", () => {
+	assert.deepEqual(buildEffectiveConfigFromSources({}).trustedHosts, []);
+
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { trustedHosts: ["Prod-Proxy"] } }],
+		projectSharedSettings: [{ autoMode: { trustedHosts: ["checked-in-host"] } }],
+		projectLocalSettings: [{ autoMode: { trustedHosts: ["db-1", "prod-proxy"] } }],
+		inlineSettings: [{ autoMode: { trustedHosts: ["build.internal"] } }],
+	});
+	// Hosts are compared case-insensitively, so they are stored lowercase and deduplicated.
+	assert.deepEqual(config.trustedHosts, ["prod-proxy", "db-1", "build.internal"]);
+});
+
+test("autoMode.jevConfirmSoftDeny defaults on and must be a boolean", () => {
+	assert.equal(buildEffectiveConfigFromSources({}).jevConfirmSoftDeny, true);
+	assert.equal(
+		buildEffectiveConfigFromSources({
+			globalSettings: [{ autoMode: { jevConfirmSoftDeny: false } }],
+		}).jevConfirmSoftDeny,
+		false,
+	);
+	// A checked-in project file cannot change it.
+	assert.equal(
+		buildEffectiveConfigFromSources({
+			globalSettings: [{ autoMode: { jevConfirmSoftDeny: false } }],
+			projectSharedSettings: [{ autoMode: { jevConfirmSoftDeny: true } }],
+		}).jevConfirmSoftDeny,
+		false,
+	);
+	assert.deepEqual(
+		validateSettingsFile({ autoMode: { jevConfirmSoftDeny: "yes" } }, "inline"),
+		["inline: autoMode.jevConfirmSoftDeny must be a boolean"],
+	);
+});
+
+test("autoMode.trustedHosts drops entries that are not plain host names", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{
+			autoMode: { trustedHosts: ["ok-host", "*", "user@host", "two words", "", 7] as never },
+		}],
+	});
+	assert.deepEqual(config.trustedHosts, ["ok-host"]);
+
+	const diagnostics = validateSettingsFile(
+		{ autoMode: { trustedHosts: ["ok-host", "*", "user@host"] } },
+		"inline",
+	);
+	assert.ok(diagnostics.some((line) => line.includes("autoMode.trustedHosts[1]")));
+	assert.ok(diagnostics.some((line) => line.includes("autoMode.trustedHosts[2]")));
+	assert.ok(!diagnostics.some((line) => line.includes("unknown autoMode key")));
+	// trustedHosts has no built-in list, so it does not ask for $defaults.
+	assert.ok(!diagnostics.some((line) => line.includes("$defaults")));
+	assert.deepEqual(
+		validateSettingsFile({ autoMode: { trustedHosts: "proxy" } }, "inline"),
+		["inline: autoMode.trustedHosts must be an array of strings"],
+	);
+});
+
 test("permissions.allow is read only from user-owned permission scopes", () => {
 	assert.deepEqual(buildEffectiveConfigFromSources({}).permissionAllow, []);
 
@@ -713,13 +778,26 @@ test("shared project permissions.allow is ignored with a diagnostic", () => {
 		mkdirSync(join(project, ".pi"), { recursive: true });
 		writeFileSync(
 			join(project, ".pi/automode.json"),
-			JSON.stringify({ permissions: { allow: ["bash(git status*)"], deny: ["bash(rm -rf *)"] } }),
+			JSON.stringify({
+				permissions: {
+					allow: ["bash(shared-project-only*)"],
+					deny: ["bash(rm -rf *)"],
+				},
+			}),
 		);
 
-		const { config, diagnostics } = loadEffectiveConfigWithDiagnostics(project, true);
+		// Point the global source at a non-existent path so the merged list cannot
+		// pick up the developer's real global config and make this non-hermetic.
+		const { config, diagnostics } = loadEffectiveConfigWithDiagnostics(
+			project,
+			true,
+			join(project, "no-global-config.json"),
+		);
 
 		assert.equal(
-			config.permissionAllow.some((pattern) => pattern.raw === "bash(git status*)"),
+			config.permissionAllow.some((pattern) =>
+				pattern.raw === "bash(shared-project-only*)"
+			),
 			false,
 		);
 		assert.equal(config.permissionDeny.some((pattern) => pattern.raw === "bash(rm -rf *)"), true);
@@ -1244,4 +1322,196 @@ test("validateSettingsFile accepts a valid classifierTimeoutMs", () => {
 		"inline",
 	);
 	assert.equal(diagnostics.length, 0);
+});
+
+// --- Jev classifier backend ------------------------------------------------
+
+test("Jev backend defaults are seeded without configuration", () => {
+	const config = buildEffectiveConfigFromSources();
+	assert.equal(config.classifierBackend, "llm");
+	assert.equal(config.jevModel, DEFAULT_JEV_MODEL);
+	assert.equal(config.jevTimeoutMs, DEFAULT_JEV_TIMEOUT_MS);
+	assert.equal(config.jevHardDenyThreshold, DEFAULT_JEV_HARD_DENY_THRESHOLD);
+	assert.equal(config.jevSoftDenyThreshold, DEFAULT_JEV_SOFT_DENY_THRESHOLD);
+	assert.equal(
+		config.jevScopeEscapeThreshold,
+		DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
+	);
+});
+
+test("validateSettingsFile accepts and rejects jevScopeEscapeThreshold", () => {
+	const accepted = validateSettingsFile({
+		autoMode: { classifierBackend: "jev", jevScopeEscapeThreshold: 0.6 },
+	});
+	assert.equal(accepted.length, 0, accepted.join("; "));
+
+	const rejected = validateSettingsFile({
+		autoMode: { classifierBackend: "jev", jevScopeEscapeThreshold: 1.4 },
+	});
+	assert.ok(
+		rejected.some((d) =>
+			/jevScopeEscapeThreshold must be a number from 0 through 1/.test(d)
+		),
+		rejected.join("; "),
+	);
+});
+
+test("project-local jevScopeEscapeThreshold overrides the global value", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevScopeEscapeThreshold: 0.8 } }],
+		projectLocalSettings: [{ autoMode: { jevScopeEscapeThreshold: 0.7 } }],
+	});
+	assert.equal(config.jevScopeEscapeThreshold, 0.7);
+});
+
+test("validateSettingsFile accepts the Jev classifier keys", () => {
+	const diagnostics = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "jev",
+				jevModel: "~typesafe/jev-latest",
+				jevBaseUrl: "https://openrouter.ai/api/v1",
+				jevApiKeyEnv: "OPENROUTER_API_KEY",
+				jevTimeoutMs: 12_000,
+				jevHardDenyThreshold: 0.5,
+				jevSoftDenyThreshold: 0.35,
+			},
+		},
+		"inline",
+	);
+	assert.deepEqual(diagnostics, []);
+});
+
+test("validateSettingsFile rejects invalid Jev classifier settings", () => {
+	const diagnostics = validateSettingsFile(
+		{
+			autoMode: {
+				classifierBackend: "openai",
+				jevModel: "not-a-model",
+				jevBaseUrl: "  ",
+				jevApiKeyEnv: "",
+				jevTimeoutMs: 10,
+				jevHardDenyThreshold: 1.5,
+				jevSoftDenyThreshold: -0.1,
+			},
+		},
+		"inline",
+	);
+	for (const expected of [
+		/autoMode\.classifierBackend must be "llm" or "jev"/,
+		/autoMode\.jevModel must be a provider\/model string/,
+		/autoMode\.jevBaseUrl must be a non-empty string/,
+		/autoMode\.jevApiKeyEnv must be a non-empty string/,
+		/autoMode\.jevTimeoutMs must be an integer from 1000 through 2147483647/,
+		/autoMode\.jevHardDenyThreshold must be a number from 0 through 1/,
+		/autoMode\.jevSoftDenyThreshold must be a number from 0 through 1/,
+	]) {
+		assert.ok(diagnostics.some((d) => expected.test(d)), String(expected));
+	}
+});
+
+test("invalid Jev settings do not override valid base values", () => {
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{
+			autoMode: {
+				classifierBackend: "openai",
+				jevTimeoutMs: 1,
+			},
+		}],
+	});
+	assert.equal(config.classifierBackend, "llm");
+	assert.equal(config.jevTimeoutMs, DEFAULT_JEV_TIMEOUT_MS);
+});
+
+test("project-local Jev settings override global settings, shared project config cannot", () => {
+	const merged = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevModel: "global/jev", classifierBackend: "llm" } }],
+		projectLocalSettings: [{ autoMode: { jevModel: "local/jev", classifierBackend: "jev" } }],
+		projectSharedSettings: [{ autoMode: { jevModel: "shared/jev", classifierBackend: "llm" } }],
+	});
+	assert.equal(merged.jevModel, "local/jev");
+	assert.equal(merged.classifierBackend, "jev");
+});
+
+test("writeGlobalAutoModeSetting persists one Jev key without dropping others", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-setting-"));
+	try {
+		const path = join(dir, "config.json");
+		writeGlobalClassifierModel("test/classifier", path);
+		writeGlobalAutoModeSetting("jevModel", "test/jev", path);
+		writeGlobalAutoModeSetting("classifierBackend", "jev", path);
+		const settings = JSON.parse(readFileSync(path, "utf8"));
+		assert.equal(settings.autoMode.classifierModel, "test/classifier");
+		assert.equal(settings.autoMode.jevModel, "test/jev");
+		assert.equal(settings.autoMode.classifierBackend, "jev");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("config diagnostics warn when a custom Jev endpoint uses the default key env", () => {
+	const dir = mkdtempSync(join(os.tmpdir(), "pi-automode-jev-keyenv-"));
+	const previousInlineSettings = process.env.PI_AUTOMODE_SETTINGS_JSON;
+	delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+	try {
+		const path = join(dir, "config.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				autoMode: {
+					classifierBackend: "jev",
+					jevBaseUrl: "https://classifier.test/api/v1",
+				},
+			}),
+		);
+		const loaded = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		assert.ok(
+			loaded.diagnostics.some((d) => /jevApiKeyEnv/.test(d)),
+			JSON.stringify(loaded.diagnostics),
+		);
+
+		// Naming a custom key variable clears the warning.
+		writeFileSync(
+			path,
+			JSON.stringify({
+				autoMode: {
+					classifierBackend: "jev",
+					jevBaseUrl: "https://classifier.test/api/v1",
+					jevApiKeyEnv: "CLASSIFIER_API_KEY",
+				},
+			}),
+		);
+		const clean = loadEffectiveConfigWithDiagnostics(dir, false, path);
+		assert.equal(
+			clean.diagnostics.some((d) => /jevApiKeyEnv/.test(d)),
+			false,
+		);
+	} finally {
+		if (previousInlineSettings === undefined) {
+			delete process.env.PI_AUTOMODE_SETTINGS_JSON;
+		} else {
+			process.env.PI_AUTOMODE_SETTINGS_JSON = previousInlineSettings;
+		}
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("jevReadOnlyIntentThreshold defaults, validates, and overrides like the other thresholds", () => {
+	assert.equal(buildEffectiveConfigFromSources().jevReadOnlyIntentThreshold, DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD);
+	assert.deepEqual(validateSettingsFile({ autoMode: { jevReadOnlyIntentThreshold: 0.8 } }), []);
+	assert.ok(
+		validateSettingsFile({ autoMode: { jevReadOnlyIntentThreshold: 2 } }).some((d) =>
+			/jevReadOnlyIntentThreshold must be a number from 0 through 1/.test(d)
+		),
+	);
+	const config = buildEffectiveConfigFromSources({
+		globalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: 0.8 } }],
+		projectLocalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: 0.65 } }],
+	});
+	assert.equal(config.jevReadOnlyIntentThreshold, 0.65);
+	assert.equal(
+		buildEffectiveConfigFromSources({ globalSettings: [{ autoMode: { jevReadOnlyIntentThreshold: -1 } }] })
+			.jevReadOnlyIntentThreshold,
+		DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
+	);
 });

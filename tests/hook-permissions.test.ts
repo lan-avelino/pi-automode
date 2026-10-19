@@ -10,9 +10,11 @@ import {
 	matchesToolPattern,
 	parseToolPattern,
 } from "../extensions/auto-mode.ts";
+import { createPiAutomode } from "../extensions/auto-mode.ts";
 import {
 	baseConfig,
 	createFakeCtx,
+	createFakePi,
 	setupHookTest,
 } from "./test-helpers.ts";
 
@@ -366,6 +368,116 @@ test("Bash permission ask matches a command inside a chain", async () => {
 	assert.equal(result.block, true);
 	assert.match(prompt, /git status && git push origin main/);
 	assert.match(result.reason ?? "", /Declined permissions\.ask/);
+});
+
+/**
+ * pi has one dialog slot: opening a dialog replaces the visible one, and the
+ * replaced dialog's promise never resolves. `answerVisible` answers whatever
+ * dialog is on screen, waiting for one to appear.
+ */
+function singleDialogSlot(ctx: ReturnType<typeof createFakeCtx>) {
+	let visible: ((answer: unknown) => void) | undefined;
+	let opened = 0;
+	const open = (answers: { confirm: unknown; select: unknown }, kind: "confirm" | "select") =>
+		new Promise((resolve) => {
+			opened += 1;
+			visible = () => resolve(answers[kind]);
+		});
+	return {
+		install(answers: { confirm: unknown; select: unknown }) {
+			ctx.ui.confirm = () => open(answers, "confirm") as Promise<boolean>;
+			(ctx.ui as Record<string, unknown>).select = () => open(answers, "select");
+		},
+		async waitForDialog(): Promise<boolean> {
+			for (let i = 0; i < 200 && !visible; i++) await new Promise((r) => setImmediate(r));
+			return visible !== undefined;
+		},
+		async answerVisible(): Promise<boolean> {
+			await this.waitForDialog();
+			const answer = visible;
+			visible = undefined;
+			answer?.(undefined);
+			return answer !== undefined;
+		},
+		get opened() {
+			return opened;
+		},
+	};
+}
+
+async function settledWithin<T>(promise: Promise<T>): Promise<T | "pending"> {
+	let settled = false;
+	let value: T | undefined;
+	void promise.then((v) => {
+		settled = true;
+		value = v;
+	});
+	for (let i = 0; i < 200 && !settled; i++) await new Promise((r) => setImmediate(r));
+	return settled ? value as T : "pending";
+}
+
+test("concurrent permission asks show one dialog at a time so none is lost", async () => {
+	// A codemode script ran two matching curls with Promise.allSettled; the
+	// second dialog replaced the first, which then waited forever.
+	const ask = parseToolPattern("bash(*merge_requests*)");
+	assert.ok(ask);
+	const ctx = createFakeCtx();
+	const slot = singleDialogSlot(ctx);
+	slot.install({ confirm: true, select: undefined });
+	const harness = await setupHookTest({
+		config: baseConfig({ permissionAsk: [ask] }),
+		ctx,
+	});
+	const call = (branch: string) =>
+		harness.emit("tool_call", {
+			toolName: "bash",
+			input: { command: `curl -s "http://git.example/api/v4/projects/1/merge_requests?source_branch=${branch}"` },
+		}, harness.ctx) as Promise<{ block?: boolean } | undefined>;
+
+	const both = Promise.all([call("one"), call("two")]);
+	assert.equal(await slot.answerVisible(), true);
+	assert.equal(await slot.answerVisible(), true, "the second ask never showed a dialog");
+	const results = await settledWithin(both);
+
+	assert.notEqual(results, "pending");
+	assert.deepEqual(results, [undefined, undefined]);
+	assert.equal(slot.opened, 2);
+	assert.equal(harness.classifierCalls, 2);
+});
+
+test("a permission ask waits for an open soft-deny prompt instead of replacing it", async () => {
+	const ask = parseToolPattern("bash(*merge_requests*)");
+	assert.ok(ask);
+	const fake = createFakePi();
+	createPiAutomode({
+		loadConfig: () => baseConfig({ classifierBackend: "jev", permissionAsk: [ask] }),
+		jevClassifyAction: async () => ({ decision: "block", tier: "soft_deny", reason: "Jev: soft deny" }),
+	})(fake.pi);
+	const ctx = createFakeCtx(fake.entries, { hasUI: true, mode: "tui" });
+	const slot = singleDialogSlot(ctx);
+	slot.install({ confirm: false, select: "Allow once" });
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+	const call = (command: string) =>
+		fake.emit("tool_call", { toolName: "bash", input: { command } }, ctx) as Promise<
+			{ block?: boolean; reason?: string } | undefined
+		>;
+
+	const softDenied = call("ssh web-1 sudo systemctl restart nginx");
+	assert.equal(await slot.waitForDialog(), true);
+	// The ask arrives while the soft-deny prompt is still on screen.
+	const asked = call("curl -s http://git.example/api/v4/merge_requests");
+	for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+	const both = Promise.all([softDenied, asked]);
+	assert.equal(await slot.answerVisible(), true);
+	assert.equal(await slot.answerVisible(), true, "the overlapping dialog never showed");
+	const results = await settledWithin(both);
+
+	assert.notEqual(results, "pending");
+	const [softDeniedResult, askedResult] = results as Array<{ block?: boolean; reason?: string } | undefined>;
+	assert.equal(softDeniedResult, undefined);
+	assert.equal(askedResult?.block, true);
+	assert.match(askedResult?.reason ?? "", /Declined permissions\.ask/);
+	assert.equal(slot.opened, 2);
 });
 
 test("Bash deny and ask patterns normalize whitespace between tokens", async () => {
@@ -1292,4 +1404,43 @@ test("tool_call broad permissions.allow cannot bypass deterministic denies under
 		if (previousTmpdir === undefined) delete process.env.TMPDIR;
 		else process.env.TMPDIR = previousTmpdir;
 	}
+});
+
+test("an env-assignment or env-wrapper prefix cannot hide a command from deny and ask rules", async () => {
+	const deny = parseToolPattern("bash(git push --force*)");
+	const ask = parseToolPattern("bash(git credential*)");
+	const allow = parseToolPattern("bash(git status*)");
+	assert.ok(deny && ask && allow);
+	const ctx = createFakeCtx();
+	let asked = 0;
+	ctx.ui.confirm = async () => {
+		asked += 1;
+		return false;
+	};
+	const harness = await setupHookTest({
+		config: baseConfig({ permissionDeny: [deny], permissionAsk: [ask], permissionAllow: [allow] }),
+		ctx,
+	});
+	for (const command of [
+		"GIT_TRACE=0 git push --force origin main",
+		"env GIT_TRACE=0 git push --force origin main",
+		"cd /tmp && A=1 B=2 git push --force origin main",
+	]) {
+		const result = await harness.emit("tool_call", { toolName: "bash", input: { command } }, harness.ctx) as {
+			block?: boolean;
+			reason?: string;
+		};
+		assert.equal(result.block, true, command);
+		assert.match(result.reason ?? "", /permissions\.deny/, command);
+	}
+	const credential = await harness.emit("tool_call", {
+		toolName: "bash",
+		input: { command: "x=$(printf 'a' | GIT_TERMINAL_PROMPT=0 git credential fill)" },
+	}, harness.ctx) as { block?: boolean };
+	assert.equal(asked, 1);
+	assert.equal(credential.block, true);
+	// Allow rules stay literal: a prefix such as LD_PRELOAD= must not ride on one.
+	const before = harness.classifierCalls;
+	await harness.emit("tool_call", { toolName: "bash", input: { command: "LD_PRELOAD=/tmp/x.so git status" } }, harness.ctx);
+	assert.equal(harness.classifierCalls, before + 1);
 });
