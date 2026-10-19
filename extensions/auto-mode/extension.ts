@@ -18,6 +18,7 @@ import { approvalSignature, type ApprovalSignature } from "./approvals.ts";
 import { analyzeBash, type BashAnalysis } from "./bash.ts";
 import {
   AUTO_MODE_GUIDANCE,
+  CLEF_CANARY_SIZES,
   DEFAULT_ALLOW,
   DEFAULT_ENVIRONMENT,
   DEFAULT_HARD_DENY,
@@ -32,6 +33,7 @@ import {
   type GlobalConfigPreparation,
   loadEffectiveConfigWithDiagnostics,
   prepareGlobalConfig,
+  isClassifierBackend,
   scratchRootPath,
   writeGlobalAutoModeSetting,
 } from "./config.ts";
@@ -46,12 +48,16 @@ import {
 import { describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
 import {
+  decisionLabel,
+  decisionProfile,
   defaultJevClassifyAction,
   factsReadOnly,
+  isDecisionBackend,
   jevCredentialDiagnostics,
   jevStatusText,
   probeJevClassifier,
   resolveJevKey,
+  runDecisionCanary,
 } from "./jev.ts";
 import {
   createLogger,
@@ -77,6 +83,7 @@ import {
 } from "./paths.ts";
 import {
   actionSummary,
+  classifierStatusLines,
   formatDenials,
   pushDenial,
   restoreState,
@@ -90,6 +97,7 @@ import type {
   ClassifyAction,
   ClassifyResult,
   ConfigLoadResult,
+  DecisionBackend,
   DecisionKind,
   DenialRecord,
   EffectiveConfig,
@@ -239,7 +247,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
   const classifyLlm = options.classifyAction ?? defaultClassifyAction;
   const classifyJev = options.jevClassifyAction ?? defaultJevClassifyAction;
   const selectClassify = (cfg: EffectiveConfig) =>
-    cfg.classifierBackend === "jev" ? classifyJev : classifyLlm;
+    isDecisionBackend(cfg.classifierBackend) ? classifyJev : classifyLlm;
   const now = options.now ?? (() => new Date());
 
   return function piAutomode(pi: ExtensionAPI) {
@@ -321,6 +329,38 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       };
     }
 
+    const APPROVALS_CLEARED =
+      "; session approvals cleared because the classifier changed";
+
+    /** The classifier a session approval answers: the backend and, for a decision backend, its model. */
+    function classifierIdentity(cfg: EffectiveConfig): string {
+      const backend = cfg.classifierBackend;
+      return isDecisionBackend(backend)
+        ? `${backend}:${decisionProfile(cfg, backend).model}`
+        : backend;
+    }
+
+    /**
+     * Apply a config load. A session approval answers one model's soft denies,
+     * so approvals are cleared when the backend or its model changes. Edit
+     * roots skip the classifier, like scratch roots, and are kept.
+     */
+    function applyLoadResult(
+      next: ConfigLoadResult,
+    ): { approvalsCleared: boolean } {
+      const before = classifierIdentity(config);
+      loadResult = next;
+      config = next.config;
+      configDiagnostics = next.diagnostics;
+      if (
+        classifierIdentity(config) === before || sessionApprovals.size === 0
+      ) {
+        return { approvalsCleared: false };
+      }
+      sessionApprovals.clear();
+      return { approvalsCleared: true };
+    }
+
     function ownsInspectionTool(): boolean {
       const tool = pi.getAllTools().find(({ name }) => name === INSPECT_TOOL);
       if (!tool) return false;
@@ -352,16 +392,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       if (action === "status") {
         const status = [
           `enabled: ${cfg.enabled ? "yes" : "no"}`,
-          `classifier: ${
-            cfg.classifierBackend === "jev"
-              ? `jev (${cfg.jevModel})`
-              : `llm (${cfg.classifierModel ?? "current session model"})`
-          }`,
-          `classifier reasoning: ${
-            cfg.classifierBackend === "jev"
-              ? "not used by the Jev backend"
-              : cfg.classifierReasoningLevel ?? "server default"
-          }`,
+          ...classifierStatusLines(cfg),
           `checked actions: ${state.checkedActions}`,
           `blocked actions: ${state.blockedActions}`,
           `classifier allowed: ${state.classifierAllowed}`,
@@ -530,12 +561,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
 
     pi.on("session_start", (_event, ctx) => {
       createdPaths.clear();
-      loadResult = loadConfigWithDiagnostics(
-        ctx.cwd,
-        projectIsTrusted(ctx),
-      );
-      config = loadResult.config;
-      configDiagnostics = loadResult.diagnostics;
+      applyLoadResult(loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)));
       state = restoreState(ctx);
       sessionApprovals.clear();
       sessionEditRoots.clear();
@@ -562,25 +588,29 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       return { systemPrompt: `${event.systemPrompt}\n\n${AUTO_MODE_GUIDANCE}` };
     });
 
-    const makeLogCtx = (cfg: EffectiveConfig, ctx: ExtensionContext): LogCtx => ({
-      logger: createLogger({
-        enabled: cfg.log.enabled,
-        classifierIo: cfg.log.classifierIo,
-        sessionFile: ctx.sessionManager.getSessionFile?.(),
-        sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
-        sessionCwd: ctx.cwd,
-        sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
-        logRoot: options.logRoot,
-        now: now(),
-      }),
-      decisionId: newDecisionId(),
-      classifierModel: cfg.classifierBackend === "jev"
-        ? cfg.jevModel
-        : cfg.classifierModel,
-      reasoning: cfg.classifierBackend === "jev"
-        ? { mode: "backend", backend: "jev", model: cfg.jevModel }
-        : classifierReasoningForConfig(cfg.classifierReasoningLevel),
-    });
+    const makeLogCtx = (cfg: EffectiveConfig, ctx: ExtensionContext): LogCtx => {
+      const backend = cfg.classifierBackend;
+      const decisionModel = isDecisionBackend(backend)
+        ? decisionProfile(cfg, backend).model
+        : undefined;
+      return {
+        logger: createLogger({
+          enabled: cfg.log.enabled,
+          classifierIo: cfg.log.classifierIo,
+          sessionFile: ctx.sessionManager.getSessionFile?.(),
+          sessionDir: ctx.sessionManager.getSessionDir?.() ?? "",
+          sessionCwd: ctx.cwd,
+          sessionId: ctx.sessionManager.getSessionId?.() ?? "unknown",
+          logRoot: options.logRoot,
+          now: now(),
+        }),
+        decisionId: newDecisionId(),
+        classifierModel: decisionModel ?? cfg.classifierModel,
+        reasoning: isDecisionBackend(backend)
+          ? { mode: "backend", backend, model: decisionModel! }
+          : classifierReasoningForConfig(cfg.classifierReasoningLevel),
+      };
+    };
 
     const decideToolCall = async (
       event: ToolCallEvent,
@@ -1016,7 +1046,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             "classifier.confirmed",
             `${
               choice === allowOnce
-                ? "User approved a Jev soft deny once"
+                ? `User approved a ${
+                  decisionLabel(cfg.classifierBackend as DecisionBackend)
+                } soft deny once`
                 : `User approved similar actions for this session (${signature!.description})`
             }: ${decision.reason}`,
             event.toolName,
@@ -1039,7 +1071,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       // the session for a parser-derived pattern. Hard denies and classifier
       // failures (tier "none") never ask, and neither do headless runs.
       if (
-        cfg.classifierBackend === "jev" &&
+        isDecisionBackend(cfg.classifierBackend) &&
         cfg.jevConfirmSoftDeny &&
         decision.tier === "soft_deny"
       ) {
@@ -1079,14 +1111,15 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }, logCtx);
     };
 
-    // The tool_call hook: the decision above, plus session-created paths on
-    // the Jev backend. Claims are computed before the decision so Jev sees
-    // them, checked again after it (a dialog can take minutes), and the call
-    // joins the running set before it is allowed. See created-paths.ts.
+    // The tool_call hook: the decision above, plus session-created paths on a
+    // decision backend (Jev or Clef). Claims are computed before the decision
+    // so the classifier sees them, checked again after it (a dialog can take
+    // minutes), and the call joins the running set before it is allowed. See
+    // created-paths.ts.
     pi.on("tool_call", async (event, ctx) => {
       const cfg = effectiveConfig();
       const id = event.toolCallId;
-      if (!cfg.enabled || cfg.classifierBackend !== "jev" || typeof id !== "string") {
+      if (!cfg.enabled || !isDecisionBackend(cfg.classifierBackend) || typeof id !== "string") {
         return decideToolCall(event, ctx);
       }
       const input = event.input as Record<string, unknown>;
@@ -1201,16 +1234,13 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         return;
       }
       if (command === "reload") {
-        loadResult = loadConfigWithDiagnostics(
-          ctx.cwd,
-          projectIsTrusted(ctx),
+        const { approvalsCleared } = applyLoadResult(
+          loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)),
         );
-        config = loadResult.config;
-        configDiagnostics = loadResult.diagnostics;
         persist();
         updateUi(ctx);
         ctx.ui.notify(
-          "pi-automode config reloaded",
+          `pi-automode config reloaded${approvalsCleared ? APPROVALS_CLEARED : ""}`,
           configDiagnostics.length > 0 ? "warning" : "info",
         );
         return;
@@ -1284,7 +1314,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         ];
         ctx.ui.notify(
           patterns.length === 0
-            ? "No session approvals. Choosing \"Allow similar for this session\" on a Jev soft-deny prompt adds one."
+            ? "No session approvals. Choosing \"Allow similar for this session\" on a soft-deny prompt adds one."
             : [
               `${patterns.length} session approval${patterns.length === 1 ? "" : "s"} (cleared when the session starts; /automode approvals clear removes them):`,
               ...patterns.map((pattern) => `- ${pattern}`),
@@ -1301,8 +1331,8 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         return;
       }
       if (command === "backend") {
-        if (remainder !== "llm" && remainder !== "jev") {
-          ctx.ui.notify("Usage: /automode backend <llm|jev>", "error");
+        if (!isClassifierBackend(remainder)) {
+          ctx.ui.notify("Usage: /automode backend <llm|jev|clef>", "error");
           return;
         }
         try {
@@ -1316,29 +1346,31 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           );
           return;
         }
-        loadResult = loadConfigWithDiagnostics(
-          ctx.cwd,
-          projectIsTrusted(ctx),
+        const { approvalsCleared } = applyLoadResult(
+          loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)),
         );
-        config = loadResult.config;
-        configDiagnostics = loadResult.diagnostics;
         persist();
         updateUi(ctx);
+        const active = effectiveConfig().classifierBackend;
         ctx.ui.notify(
-          `pi-automode classifier backend set to ${remainder}`,
+          `pi-automode classifier backend saved globally: ${remainder}${
+            active === remainder ? "" : `; current config uses ${active}`
+          }${approvalsCleared ? APPROVALS_CLEARED : ""}`,
           "info",
         );
         return;
       }
-      if (command === "jev") {
+      if (command === "jev" || command === "clef") {
+        const backend: DecisionBackend = command;
+        const label = decisionLabel(backend);
         const cfg = effectiveConfig();
         if (remainder === "test") {
-          const probe = await probeJevClassifier(ctx, cfg);
+          const probe = await probeJevClassifier(ctx, cfg, backend);
           if (!probe.ok) {
-            ctx.ui.notify(`Jev probe failed: ${probe.reason}`, "error");
+            ctx.ui.notify(`${label} probe failed: ${probe.reason}`, "error");
             return;
           }
-          const lines = [`Jev probe (${probe.model}):`];
+          const lines = [`${label} probe (${probe.model}):`];
           let unexpected = false;
           for (const result of probe.probes) {
             lines.push(
@@ -1359,26 +1391,57 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
               "Unexpected probe result. Check the thresholds and that the endpoint returns danger-side-up noul probabilities.",
             );
           }
+          if (backend === "clef") {
+            const profile = decisionProfile(cfg, "clef");
+            let failed = false;
+            let inconclusive = false;
+            for (const size of CLEF_CANARY_SIZES) {
+              const outcome = await runDecisionCanary(ctx, cfg, profile, size);
+              if (outcome.status === "pass") {
+                lines.push(
+                  `canary at ${size} tokens: pass (${outcome.inputTokens ?? "unknown"} input tokens read)`,
+                );
+                continue;
+              }
+              unexpected = true;
+              if (outcome.status === "fail") failed = true;
+              else inconclusive = true;
+              lines.push(`canary at ${size} tokens: ${outcome.status}: ${outcome.detail}`);
+            }
+            if (failed) {
+              lines.push(
+                "The canary checks that the provider reads the start and the end of a long state. A failure means Clef may be judging a cut-off state; switch backend until it passes.",
+              );
+            } else if (inconclusive) {
+              lines.push(
+                "An inconclusive canary hit a timeout or network error; run /automode clef test again.",
+              );
+            }
+          }
           ctx.ui.notify(lines.join("\n"), unexpected ? "warning" : "info");
           return;
         }
         if (remainder !== "") {
-          ctx.ui.notify("Usage: /automode jev [test]", "error");
+          ctx.ui.notify(`Usage: /automode ${backend} [test]`, "error");
           return;
         }
         const { source } = await resolveJevKey(ctx, cfg);
         ctx.ui.notify(
-          jevStatusText(cfg, source, jevCredentialDiagnostics(cfg)),
+          jevStatusText(cfg, backend, source, [
+            ...new Set([...configDiagnostics, ...jevCredentialDiagnostics(cfg)]),
+          ]),
           "info",
         );
         return;
       }
       if (command === "model") {
         const cfg = effectiveConfig();
-        const jevBackend = cfg.classifierBackend === "jev";
-        if (jevBackend && !remainder) {
+        const backend = cfg.classifierBackend;
+        const decision = isDecisionBackend(backend) ? backend : undefined;
+        if (decision && !remainder) {
+          const label = decisionLabel(decision);
           ctx.ui.notify(
-            `Jev classifier model: ${cfg.jevModel}. Set it with /automode model <provider/model-id>; the Pi model picker lists LLM providers and does not apply to the Jev backend.`,
+            `${label} classifier model: ${decisionProfile(cfg, decision).model}. Set it with /automode model <provider/model-id>; the Pi model picker lists LLM providers and does not apply to the ${label} backend.`,
             "info",
           );
           return;
@@ -1391,38 +1454,41 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           ctx.ui.notify("Classifier model unchanged", "info");
           return;
         }
-        if (jevBackend) {
+        if (decision) {
+          const label = decisionLabel(decision);
           if (!parseModelSpec(selected)) {
             ctx.ui.notify(
-              `Invalid Jev model spec (expected provider/model): ${selected}`,
+              `Invalid ${label} model spec (expected provider/model): ${selected}`,
               "error",
             );
             return;
           }
           try {
-            saveAutoModeSetting("jevModel", selected);
+            saveAutoModeSetting(
+              decision === "clef" ? "clefModel" : "jevModel",
+              selected,
+            );
           } catch (error) {
             ctx.ui.notify(
-              `Failed to save Jev classifier model: ${
+              `Failed to save ${label} classifier model: ${
                 error instanceof Error ? error.message : String(error)
               }`,
               "error",
             );
             return;
           }
-          loadResult = loadConfigWithDiagnostics(
-            ctx.cwd,
-            projectIsTrusted(ctx),
+          const { approvalsCleared } = applyLoadResult(
+            loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)),
           );
-          config = loadResult.config;
-          configDiagnostics = loadResult.diagnostics;
           persist();
           updateUi(ctx);
-          const active = effectiveConfig().jevModel;
+          const active = decisionProfile(effectiveConfig(), decision).model;
           ctx.ui.notify(
-            active === selected
-              ? `pi-automode Jev classifier saved globally: ${selected}`
-              : `pi-automode Jev classifier saved globally: ${selected}; current config uses ${active}`,
+            `${
+              active === selected
+                ? `pi-automode ${label} classifier saved globally: ${selected}`
+                : `pi-automode ${label} classifier saved globally: ${selected}; current config uses ${active}`
+            }${approvalsCleared ? APPROVALS_CLEARED : ""}`,
             "info",
           );
           return;
@@ -1452,12 +1518,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           );
           return;
         }
-        loadResult = loadConfigWithDiagnostics(
-          ctx.cwd,
-          projectIsTrusted(ctx),
-        );
-        config = loadResult.config;
-        configDiagnostics = loadResult.diagnostics;
+        applyLoadResult(loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)));
         persist();
         updateUi(ctx);
         const active = effectiveConfig().classifierModel ??
@@ -1472,14 +1533,14 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
 
       ctx.ui.notify(
-        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|approvals [clear]|backend <llm|jev>|jev [test]|model [provider/id]]",
+        "Usage: /automode [status|on|off|reload|reset|defaults|config|denials|approvals [clear]|backend <llm|jev|clef>|jev [test]|clef [test]|model [provider/id]]",
         "error",
       );
     }
 
     pi.registerCommand("automode", {
       description:
-        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, approvals, backend, jev, model",
+        "Control pi-automode: status, on, off, reload, reset, defaults, config, denials, approvals, backend, jev, clef, model",
       handler: handleAutomodeCommand,
     });
 

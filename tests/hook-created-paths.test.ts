@@ -11,7 +11,7 @@ type ToolCallResult = { block?: boolean; reason?: string } | undefined;
  * runs while the classifier is "thinking", to change files mid-review.
  */
 async function setup(options: {
-	backend?: "jev" | "llm";
+	backend?: "jev" | "clef" | "llm";
 	permissionAllow?: string[];
 } = {}) {
 	const fs = new FakeFs();
@@ -85,6 +85,15 @@ test("Jev sees a claim for a worktree the agent added earlier in the session", a
 	await env.bash("git worktree add -q --detach /tmp/w HEAD", () => env.fs.mkdir("/tmp/w").write("/tmp/w/a"));
 	env.fs.tick();
 	assert.deepEqual(lastFacts(env.seen), []);
+	await env.bash("git worktree remove --force /tmp/w", () => env.fs.rm("/tmp/w"));
+	assert.equal(lastFacts(env.seen).length, 1);
+	assert.match(lastFacts(env.seen)[0]!, /^created_this_session: \/tmp\/w \(folder;/);
+});
+
+test("on the Clef backend, a claim reaches the classifier", async () => {
+	const env = await setup({ backend: "clef" });
+	await env.bash("git worktree add -q --detach /tmp/w HEAD", () => env.fs.mkdir("/tmp/w").write("/tmp/w/a"));
+	env.fs.tick();
 	await env.bash("git worktree remove --force /tmp/w", () => env.fs.rm("/tmp/w"));
 	assert.equal(lastFacts(env.seen).length, 1);
 	assert.match(lastFacts(env.seen)[0]!, /^created_this_session: \/tmp\/w \(folder;/);

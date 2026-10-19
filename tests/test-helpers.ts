@@ -3,6 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	DEFAULT_CLASSIFIER_BACKEND,
+	DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+	DEFAULT_CLEF_MODEL,
+	DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+	DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
+	DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
 	DEFAULT_JEV_API_KEY_ENV,
 	DEFAULT_JEV_BASE_URL,
 	DEFAULT_JEV_HARD_DENY_THRESHOLD,
@@ -166,6 +171,11 @@ export function baseConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveC
 		jevReadOnlyIntentThreshold: DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
 		jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
 		jevConfirmSoftDeny: true,
+		clefModel: DEFAULT_CLEF_MODEL,
+		clefHardDenyThreshold: DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+		clefSoftDenyThreshold: DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
+		clefReadOnlyIntentThreshold: DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+		clefScopeEscapeThreshold: DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
 		classifyReadOnlyTools: false,
 		allowInsideWorkingDirectory: false,
 		deniedPaths: [],

@@ -85,3 +85,9 @@ test("auto mode guidance steers routine file changes to the edit and write tools
 	// Scripts stay available for the cases they are good at.
 	assert.match(AUTO_MODE_GUIDANCE, /computed, spans many files, or is a temporary mutation test/);
 });
+
+test("statusText reports the Clef backend and its model", () => {
+	const text = statusText(baseConfig({ classifierBackend: "clef" }), baseState());
+	assert.match(text, /^classifier: clef \(cloudflare\/clef\)$/m);
+	assert.match(text, /^classifier reasoning: not used by the Clef backend$/m);
+});

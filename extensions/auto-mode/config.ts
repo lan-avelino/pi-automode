@@ -15,6 +15,11 @@ import {
   DEFAULT_CLASSIFIER_BACKEND,
   DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
+  DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+  DEFAULT_CLEF_MODEL,
+  DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+  DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
+  DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
   DEFAULT_DENIED_PATHS,
   DEFAULT_ENVIRONMENT,
   DEFAULT_FAST_CLASSIFIER_MAX_TOKENS,
@@ -58,7 +63,7 @@ import type {
   ToolPattern,
 } from "./types.ts";
 import { hasOwn, stringArray } from "./utils.ts";
-import { jevCredentialDiagnostics } from "./jev.ts";
+import { isDecisionBackend, jevCredentialDiagnostics } from "./jev.ts";
 
 export type GlobalConfigPreparation = {
   status: "current" | "migrated" | "conflict" | "failed";
@@ -321,6 +326,11 @@ export function validateSettingsFile(
         "jevReadOnlyIntentThreshold",
         "jevScopeEscapeThreshold",
         "jevConfirmSoftDeny",
+        "clefModel",
+        "clefHardDenyThreshold",
+        "clefSoftDenyThreshold",
+        "clefReadOnlyIntentThreshold",
+        "clefScopeEscapeThreshold",
         "log",
       ]);
       for (const key of Object.keys(autoMode)) {
@@ -338,7 +348,7 @@ export function validateSettingsFile(
         !isClassifierBackend(autoMode.classifierBackend)
       ) {
         diagnostics.push(
-          `${source}: autoMode.classifierBackend must be "llm" or "jev"`,
+          `${source}: autoMode.classifierBackend must be "llm", "jev", or "clef"`,
         );
       }
       if (
@@ -349,13 +359,12 @@ export function validateSettingsFile(
           `${source}: autoMode.classifierModel must be a provider/model string`,
         );
       }
-      if (
-        hasOwn(autoMode, "jevModel") &&
-        !isValidClassifierModel(autoMode.jevModel)
-      ) {
-        diagnostics.push(
-          `${source}: autoMode.jevModel must be a provider/model string`,
-        );
+      for (const key of ["jevModel", "clefModel"] as const) {
+        if (hasOwn(autoMode, key) && !isValidClassifierModel(autoMode[key])) {
+          diagnostics.push(
+            `${source}: autoMode.${key} must be a provider/model string`,
+          );
+        }
       }
       for (const key of ["jevBaseUrl", "jevApiKeyEnv"] as const) {
         const value = autoMode[key];
@@ -379,6 +388,10 @@ export function validateSettingsFile(
           "jevSoftDenyThreshold",
           "jevReadOnlyIntentThreshold",
           "jevScopeEscapeThreshold",
+          "clefHardDenyThreshold",
+          "clefSoftDenyThreshold",
+          "clefReadOnlyIntentThreshold",
+          "clefScopeEscapeThreshold",
         ] as const
       ) {
         const value = autoMode[key];
@@ -746,7 +759,7 @@ export function isClassifierReasoningLevel(
 export function isClassifierBackend(
   value: unknown,
 ): value is ClassifierBackend {
-  return value === "llm" || value === "jev";
+  return value === "llm" || value === "jev" || value === "clef";
 }
 
 function validProbability(value: unknown): value is number {
@@ -815,6 +828,21 @@ function applyAutoModeScalars(
     jevConfirmSoftDeny: typeof settings.jevConfirmSoftDeny === "boolean"
       ? settings.jevConfirmSoftDeny
       : base.jevConfirmSoftDeny,
+    clefModel: isValidClassifierModel(settings.clefModel)
+      ? settings.clefModel
+      : base.clefModel,
+    clefHardDenyThreshold: validProbability(settings.clefHardDenyThreshold)
+      ? settings.clefHardDenyThreshold
+      : base.clefHardDenyThreshold,
+    clefSoftDenyThreshold: validProbability(settings.clefSoftDenyThreshold)
+      ? settings.clefSoftDenyThreshold
+      : base.clefSoftDenyThreshold,
+    clefReadOnlyIntentThreshold: validProbability(settings.clefReadOnlyIntentThreshold)
+      ? settings.clefReadOnlyIntentThreshold
+      : base.clefReadOnlyIntentThreshold,
+    clefScopeEscapeThreshold: validProbability(settings.clefScopeEscapeThreshold)
+      ? settings.clefScopeEscapeThreshold
+      : base.clefScopeEscapeThreshold,
     classifierReasoningLevel: isClassifierReasoningLevel(
         settings.classifierReasoningLevel,
       )
@@ -888,6 +916,11 @@ export function buildEffectiveConfigFromSources(
     jevReadOnlyIntentThreshold: DEFAULT_JEV_READ_ONLY_INTENT_THRESHOLD,
     jevScopeEscapeThreshold: DEFAULT_JEV_SCOPE_ESCAPE_THRESHOLD,
     jevConfirmSoftDeny: DEFAULT_JEV_CONFIRM_SOFT_DENY,
+    clefModel: DEFAULT_CLEF_MODEL,
+    clefHardDenyThreshold: DEFAULT_CLEF_HARD_DENY_THRESHOLD,
+    clefSoftDenyThreshold: DEFAULT_CLEF_SOFT_DENY_THRESHOLD,
+    clefReadOnlyIntentThreshold: DEFAULT_CLEF_READ_ONLY_INTENT_THRESHOLD,
+    clefScopeEscapeThreshold: DEFAULT_CLEF_SCOPE_ESCAPE_THRESHOLD,
     classifyReadOnlyTools: DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
@@ -1091,7 +1124,7 @@ export function loadEffectiveConfigWithDiagnostics(
     projectSharedSettings: loadedSettingsToSettings(projectSharedFiles),
     inlineSettings,
   });
-  if (config.classifierBackend === "jev") {
+  if (isDecisionBackend(config.classifierBackend)) {
     loadedDiagnostics.push(...jevCredentialDiagnostics(config));
   }
 
@@ -1133,6 +1166,7 @@ function readWritableSettingsFile(path: string): SettingsFile {
 export const GLOBAL_AUTOMODE_SETTING_KEYS = [
   "classifierModel",
   "jevModel",
+  "clefModel",
   "classifierBackend",
 ] as const;
 

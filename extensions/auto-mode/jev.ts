@@ -10,13 +10,15 @@
  * (permissions, hard-deny, path policy) run before this action and stay
  * authoritative. Any setup, transport, or parse failure fails closed.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   readStoredCredential as readStoredCredentialFromDisk,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   CLASSIFIER_POLICY_CLAUSES,
+  CLEF_PROVIDER,
+  CLEF_TRUNCATION_MARGIN_TOKENS,
   DEFAULT_JEV_API_KEY_ENV,
 } from "./constants.ts";
 import { buildClassifierTranscriptParts } from "./transcript.ts";
@@ -27,10 +29,12 @@ import {
 import { describeActionFacts, mentionsCredentials } from "./facts.ts";
 import type {
   ClassificationDecision,
+  ClassifierBackend,
   ClassifierIo,
   ClassifierReasoning,
   ClassifyExtras,
   ClassifyResult,
+  DecisionBackend,
   EffectiveConfig,
 } from "./types.ts";
 
@@ -49,8 +53,13 @@ export type JevQuestions = Record<string, JevQuestion>;
 export type JevParse =
   | {
     ok: true;
-    model: string;
+    /** The model the response names, when it names one. */
+    model?: string;
     scores: Record<string, number>;
+    /** The response's `provider` field, unvalidated. */
+    provider?: unknown;
+    /** The response's `usage.input_tokens`, unvalidated. */
+    inputTokens?: unknown;
   }
   | { ok: false; error: string };
 
@@ -147,6 +156,122 @@ export function openRouterDecisionsUrl(baseUrl: string): string {
     return `${trimmed.slice(0, -"/api/v1".length)}/api/alpha/decisions`;
   }
   return `${trimmed}/decisions`;
+}
+
+/** True for the backends that call the OpenRouter decisions endpoint. */
+export function isDecisionBackend(
+  backend: ClassifierBackend,
+): backend is DecisionBackend {
+  return backend === "jev" || backend === "clef";
+}
+
+export type DecisionProvider = {
+  /** OpenRouter provider slug, sent in `provider.only`. */
+  slug: string;
+  /** The response's `provider` field after normalization. */
+  name: string;
+  contextTokens: number;
+};
+
+/** What differs between the decision backends: model, thresholds, provider policy. */
+export type DecisionProfile = {
+  backend: DecisionBackend;
+  model: string;
+  hardDeny: number;
+  softDeny: number;
+  readOnlyIntent: number;
+  scopeEscape: number;
+  /** Clef's pinned provider. Jev has none: no provider field, no usage check. */
+  provider?: DecisionProvider;
+};
+
+/**
+ * Clef model ids. Clef's providers differ in how much state they read, so a
+ * Clef model gets the pinned provider and its checks on either backend.
+ */
+const CLEF_MODEL = /^cloudflare\/clef\b/i;
+
+/** The profile for a decision backend, whichever backend is active. */
+export function decisionProfile(
+  config: EffectiveConfig,
+  backend: DecisionBackend,
+): DecisionProfile {
+  if (backend === "clef") {
+    return {
+      backend,
+      model: config.clefModel,
+      hardDeny: config.clefHardDenyThreshold,
+      softDeny: config.clefSoftDenyThreshold,
+      readOnlyIntent: config.clefReadOnlyIntentThreshold,
+      scopeEscape: config.clefScopeEscapeThreshold,
+      provider: { ...CLEF_PROVIDER },
+    };
+  }
+  return {
+    backend,
+    model: config.jevModel,
+    hardDeny: config.jevHardDenyThreshold,
+    softDeny: config.jevSoftDenyThreshold,
+    readOnlyIntent: config.jevReadOnlyIntentThreshold,
+    scopeEscape: config.jevScopeEscapeThreshold,
+    ...(CLEF_MODEL.test(config.jevModel) ? { provider: { ...CLEF_PROVIDER } } : {}),
+  };
+}
+
+/** The backend's display name. */
+export function decisionLabel(backend: DecisionBackend): "Jev" | "Clef" {
+  return backend === "clef" ? "Clef" : "Jev";
+}
+
+/** The decisions request body. A profile with a provider pins it, with no fallbacks. */
+export function buildDecisionRequest(
+  profile: DecisionProfile,
+  state: Record<string, string>,
+  questions: JevQuestions,
+): Record<string, unknown> {
+  return {
+    model: profile.model,
+    state,
+    questions,
+    ...(profile.provider === undefined ? {} : {
+      provider: { only: [profile.provider.slug], allow_fallbacks: false },
+    }),
+  };
+}
+
+function normalizeProviderName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Check a parsed response against the profile's provider policy. Returns why
+ * the response cannot be used, or undefined. A profile without a provider
+ * (Jev) always passes. The fields are trusted as reported: this catches a
+ * provider that is missing, different, or at its limit, not one that lies.
+ */
+export function checkDecisionResponse(
+  profile: DecisionProfile,
+  response: { provider?: unknown; inputTokens?: unknown },
+): string | undefined {
+  const pinned = profile.provider;
+  if (pinned === undefined) return undefined;
+  if (
+    typeof response.provider !== "string" ||
+    normalizeProviderName(response.provider) !== pinned.name
+  ) {
+    const served = typeof response.provider === "string"
+      ? `provider "${clip(response.provider, 40)}"`
+      : "an unnamed provider";
+    return `response came from ${served}, not ${pinned.slug}`;
+  }
+  const tokens = response.inputTokens;
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) {
+    return "response reports no usable usage.input_tokens, so a cut-off input cannot be ruled out";
+  }
+  if (tokens >= pinned.contextTokens - CLEF_TRUNCATION_MARGIN_TOKENS) {
+    return `input was cut off at ${tokens} tokens (${pinned.slug} reads at most ${pinned.contextTokens})`;
+  }
+  return undefined;
 }
 
 /**
@@ -282,12 +407,19 @@ export function parseJevResponse(status: number, body: string): JevParse {
   }
   if (status < 200 || status >= 300) {
     const rec = (parsed ?? {}) as Record<string, unknown>;
+    // OpenRouter nests its message in an error object.
+    const nested = typeof rec.error === "object" && rec.error !== null
+      ? (rec.error as Record<string, unknown>).message
+      : undefined;
     const msg = rec.message ?? rec.error;
+    const text = typeof msg === "string"
+      ? msg
+      : typeof nested === "string"
+      ? nested
+      : undefined;
     return {
       ok: false,
-      error: `HTTP ${status}${
-        typeof msg === "string" ? `: ${clip(msg, 200)}` : ""
-      }`,
+      error: `HTTP ${status}${text === undefined ? "" : `: ${clip(text, 200)}`}`,
     };
   }
   const rec = (parsed ?? {}) as Record<string, unknown>;
@@ -319,10 +451,15 @@ export function parseJevResponse(status: number, body: string): JevParse {
   if (Object.keys(scores).length === 0) {
     return { ok: false, error: "no usable noul answers in response" };
   }
+  const usage = rec.usage;
   return {
     ok: true,
-    model: typeof rec.model === "string" ? rec.model : "jev",
+    ...(typeof rec.model === "string" ? { model: rec.model } : {}),
     scores,
+    provider: rec.provider,
+    inputTokens: typeof usage === "object" && usage !== null
+      ? (usage as Record<string, unknown>).input_tokens
+      : undefined,
   };
 }
 
@@ -389,14 +526,14 @@ export function jevGateScores(
 
 /**
  * The intent_mismatch threshold for an action. A parser-verified read-only
- * action uses `jevReadOnlyIntentThreshold`, which never goes below the soft
- * threshold: reading past what the user asked cannot restart, update, or delete
- * anything. Soft-deny rules and hard_deny are unchanged.
+ * action uses the profile's read-only intent threshold, which never goes below
+ * the soft threshold: reading past what the user asked cannot restart, update,
+ * or delete anything. Soft-deny rules and hard_deny are unchanged.
  */
-export function jevIntentThreshold(config: EffectiveConfig, readOnly: boolean): number {
+export function jevIntentThreshold(profile: DecisionProfile, readOnly: boolean): number {
   return readOnly
-    ? Math.max(config.jevSoftDenyThreshold, config.jevReadOnlyIntentThreshold)
-    : config.jevSoftDenyThreshold;
+    ? Math.max(profile.softDeny, profile.readOnlyIntent)
+    : profile.softDeny;
 }
 
 /**
@@ -416,30 +553,33 @@ export function relaxedIntentRead(action: string, facts: string): boolean {
 }
 
 /**
- * Map per-question probabilities onto pi-automode's decision + tier. Missing
+ * Map per-question probabilities onto pi-automode's decision + tier, at the
+ * profile's thresholds. Missing
  * scores fail closed, so a caller that skips `missingJevAnswers` cannot turn
  * incomplete output into an allow.
  */
 export function jevDecision(
   scores: Record<string, number>,
-  config: EffectiveConfig,
+  profile: DecisionProfile,
+  softDenyRules: string[],
   questions: JevQuestions,
   options: { readOnly?: boolean } = {},
 ): ClassificationDecision {
+  const label = decisionLabel(profile.backend);
   const missing = missingJevAnswers(scores, questions);
   if (missing.length > 0) {
     return {
       decision: "block",
       tier: "none",
       reason:
-        `Jev: incomplete scores for ${missing.join(", ")}; auto mode fails closed.`,
+        `${label}: incomplete scores for ${missing.join(", ")}; auto mode fails closed.`,
     };
   }
   const { hard, softRule, softRuleNumber, intent, scope, soft } = jevGateScores(
     scores,
     questions,
   );
-  const intentThreshold = jevIntentThreshold(config, options.readOnly === true);
+  const intentThreshold = jevIntentThreshold(profile, options.readOnly === true);
   // Label the components and the gating value separately: a block driven by
   // `intent_mismatch` would otherwise report the smaller rule score under a
   // bare "soft" label.
@@ -455,45 +595,45 @@ export function jevDecision(
   const fired: string[] = [];
   const scored = (label: string, score: number, threshold: number) =>
     `${label} scored ${score.toFixed(2)} (threshold ${threshold.toFixed(2)})`;
-  if (hard >= config.jevHardDenyThreshold) {
+  if (hard >= profile.hardDeny) {
     fired.push(
-      `${scored("hard_deny", hard, config.jevHardDenyThreshold)}: the action may match a HARD_DENY rule`,
+      `${scored("hard_deny", hard, profile.hardDeny)}: the action may match a HARD_DENY rule`,
     );
   }
-  if (softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold) {
-    const rule = config.softDeny[softRuleNumber - 1];
+  if (softRuleNumber !== undefined && softRule >= profile.softDeny) {
+    const rule = softDenyRules[softRuleNumber - 1];
     fired.push(
-      `${scored(`soft-deny rule ${softRuleNumber}`, softRule, config.jevSoftDenyThreshold)}${
+      `${scored(`soft-deny rule ${softRuleNumber}`, softRule, profile.softDeny)}${
         rule === undefined ? "" : `: "${quoteRule(rule)}"`
       }`,
     );
   }
   if (intent >= intentThreshold) {
-    const label = intentThreshold === config.jevSoftDenyThreshold
+    const label = intentThreshold === profile.softDeny
       ? scored("intent_mismatch", intent, intentThreshold)
       : `intent_mismatch scored ${intent.toFixed(2)} (read-only threshold ${intentThreshold.toFixed(2)})`;
     fired.push(`${label}: the action may go beyond what the user asked`);
   }
   // `scope_escape` is advisory: it never blocks (caveat 20). At or above its
   // threshold it is still named, so the user sees why the action looked risky.
-  const advisory = scope >= config.jevScopeEscapeThreshold
+  const advisory = scope >= profile.scopeEscape
     ? ` Advisory: scope_escape scored ${scope.toFixed(2)}: the action may reach outside the trusted environment (SSH hosts can be listed in autoMode.trustedHosts).`
     : "";
-  const reason = `Jev: ${fired.join("; ")}.${advisory} Scores: ${summary}`;
-  const firedRule = softRuleNumber !== undefined && softRule >= config.jevSoftDenyThreshold
-    ? config.softDeny[softRuleNumber - 1]
+  const reason = `${label}: ${fired.join("; ")}.${advisory} Scores: ${summary}`;
+  const firedRule = softRuleNumber !== undefined && softRule >= profile.softDeny
+    ? softDenyRules[softRuleNumber - 1]
     : undefined;
   const ruleField = firedRule === undefined ? {} : { softDenyRule: firedRule };
-  if (hard >= config.jevHardDenyThreshold) {
+  if (hard >= profile.hardDeny) {
     return { decision: "block", tier: "hard_deny", reason, ...ruleField };
   }
-  if (softRule >= config.jevSoftDenyThreshold || intent >= intentThreshold) {
+  if (softRule >= profile.softDeny || intent >= intentThreshold) {
     return { decision: "block", tier: "soft_deny", reason, ...ruleField };
   }
   return {
     decision: "allow",
     tier: "none",
-    reason: `Jev: permitted (${summary})`,
+    reason: `${label}: permitted (${summary})`,
   };
 }
 
@@ -570,13 +710,13 @@ export async function resolveJevKey(
 }
 
 /** Explain why key resolution produced no key for the active configuration. */
-function jevMissingKeyReason(config: EffectiveConfig): string {
+function jevMissingKeyReason(config: EffectiveConfig, label: string): string {
   const hint = jevOpenRouterKeyEnvMismatch(config)
     ? `set autoMode.jevApiKeyEnv to a variable that holds the custom endpoint's key (${DEFAULT_JEV_API_KEY_ENV} is not sent to a custom base URL)`
     : isOpenRouterBaseUrl(config.jevBaseUrl)
     ? "run /login openrouter or set the env var"
     : "set the env var (custom base URLs do not use Pi's OpenRouter credential)";
-  return `Jev classifier key missing (${config.jevApiKeyEnv}); ${hint}. ` +
+  return `${label} classifier key missing (${config.jevApiKeyEnv}); ${hint}. ` +
     "Auto mode fails closed.";
 }
 
@@ -585,12 +725,14 @@ export function clearJevCache(): void {
   CACHE.clear();
 }
 
-/** Human-readable Jev backend status for `/automode jev`. */
+/** Human-readable decision-backend status for `/automode jev` and `/automode clef`. */
 export function jevStatusText(
   config: EffectiveConfig,
+  backend: DecisionBackend,
   keySource: JevKeySource,
   diagnostics: string[] = [],
 ): string {
+  const profile = decisionProfile(config, backend);
   const credential = {
     "pi-auth": "Pi registry or stored credential",
     "env": `environment variable ${config.jevApiKeyEnv}`,
@@ -600,24 +742,35 @@ export function jevStatusText(
   }[keySource];
   const lines = [
     `backend: ${config.classifierBackend}`,
-    `model: ${config.jevModel}`,
+    ...(config.classifierBackend === backend
+      ? []
+      : [`showing: ${backend} settings (${backend} is not the active backend)`]),
+    `model: ${profile.model}`,
     `endpoint: ${openRouterDecisionsUrl(config.jevBaseUrl)}`,
+    ...(profile.provider === undefined ? [] : [
+      `provider: ${profile.provider.slug} only; responses from any other provider, or at or above ${
+        profile.provider.contextTokens - CLEF_TRUNCATION_MARGIN_TOKENS
+      } input tokens, are rejected`,
+    ]),
     `credential: ${credential}`,
-    `hard deny threshold: ${config.jevHardDenyThreshold}`,
-    `soft deny threshold: ${config.jevSoftDenyThreshold}`,
-    `read-only intent threshold: ${jevIntentThreshold(config, true)} (verified read-only actions that name no credential)`,
-    `scope escape threshold: ${config.jevScopeEscapeThreshold} (advisory; scope_escape never blocks)`,
+    `hard deny threshold: ${profile.hardDeny}`,
+    `soft deny threshold: ${profile.softDeny}`,
+    `read-only intent threshold: ${jevIntentThreshold(profile, true)} (verified read-only actions that name no credential)`,
+    `scope escape threshold: ${profile.scopeEscape} (advisory; scope_escape never blocks)`,
     `confirm soft deny: ${config.jevConfirmSoftDeny ? "on (asks in interactive sessions)" : "off"}`,
     `timeout: ${config.jevTimeoutMs}ms`,
     "ignored by this backend: classifierReasoningLevel, fastClassifierMaxTokens",
   ];
-  for (const diagnostic of diagnostics.filter((d) => /jev/i.test(d))) {
+  // The shared transport keys are named jev*, so Clef shows both kinds of warning.
+  const relevant = backend === "clef" ? /jev|clef/i : /jev/i;
+  for (const diagnostic of diagnostics.filter((d) => relevant.test(d))) {
     lines.push(`warning: ${diagnostic}`);
   }
   return lines.join("\n");
 }
 
 function jevIo(params: {
+  label: "Jev" | "Clef";
   model: string;
   baseUrl: string;
   reasoning: ClassifierReasoning;
@@ -629,7 +782,9 @@ function jevIo(params: {
   durationMs: number;
   cached: boolean;
   /** Failed attempts before the final one, oldest first. */
-  earlier?: JevFailedAttempt[];
+  earlier?: DecisionFailedAttempt[];
+  /** The provider and input tokens the final response reported. */
+  served?: { provider?: string; inputTokens?: number };
 }): ClassifierIo {
   const { model, reasoning, questions, state, action, decision } = params;
   return {
@@ -642,11 +797,11 @@ function jevIo(params: {
       system: JSON.stringify(questions, null, 2),
       context: JSON.stringify(state),
       action,
-      fastInstruction: "(not used by the Jev backend)",
-      detailedInstruction: "(not used by the Jev backend)",
+      fastInstruction: `(not used by the ${params.label} backend)`,
+      detailedInstruction: `(not used by the ${params.label} backend)`,
     },
-    // Jev reports no token usage, so no synthetic provider response is
-    // fabricated and no ccusage `message` entry is written.
+    // Decision backends report no chat usage, so no synthetic provider
+    // response is fabricated and no ccusage `message` entry is written.
     attempts: params.cached ? [] : [
       ...(params.earlier ?? []).map((failed, index) => ({
         stage: "detailed" as const,
@@ -659,6 +814,11 @@ function jevIo(params: {
         attempt: (params.earlier?.length ?? 0) + 1,
         ...(decision === undefined ? {} : { parsed: decision }),
         ...(params.error === undefined ? {} : { error: params.error }),
+        ...(params.served &&
+            (params.served.provider !== undefined ||
+              params.served.inputTokens !== undefined)
+          ? { served: params.served }
+          : {}),
         durationMs: params.durationMs,
       },
     ],
@@ -667,22 +827,26 @@ function jevIo(params: {
   };
 }
 
-type JevFailedAttempt = { error: string; durationMs: number };
+export type DecisionFailedAttempt = { error: string; durationMs: number };
 
-type JevScoresResult =
+export type DecisionScoresResult =
   | {
     ok: true;
     scores: Record<string, number>;
     model: string;
     durationMs: number;
-    earlier?: JevFailedAttempt[];
+    /** The provider the response names, as reported. */
+    provider?: string;
+    /** The response's `usage.input_tokens`, as reported. */
+    inputTokens?: number;
+    earlier?: DecisionFailedAttempt[];
   }
   | {
     ok: false;
     reason: string;
     error?: string;
     durationMs?: number;
-    earlier?: JevFailedAttempt[];
+    earlier?: DecisionFailedAttempt[];
     /** True for a failure a second request may not repeat (timeout, network, 429, 5xx). */
     retryable?: boolean;
   };
@@ -696,19 +860,21 @@ type JevScoresResult =
 const JEV_MAX_ATTEMPTS = 2;
 
 /**
- * A Jev decisions request with one retry of a transient failure. A client
- * error, unreadable or incomplete output, and a cancelled turn are not retried.
+ * A decisions request with one retry of a transient failure. A client error,
+ * unreadable, incomplete, or rejected output, and a cancelled turn are not
+ * retried. The sweep calls this too, so calibration sees the same policy.
  */
-async function requestJevScores(
+export async function requestDecisionScores(
   ctx: ExtensionContext,
   config: EffectiveConfig,
-  state: Record<string, string>,
+  profile: DecisionProfile,
+  body: Record<string, unknown>,
   questions: JevQuestions,
   deps: JevKeyDeps = {},
-): Promise<JevScoresResult> {
-  const earlier: JevFailedAttempt[] = [];
+): Promise<DecisionScoresResult> {
+  const earlier: DecisionFailedAttempt[] = [];
   for (let attempt = 1; ; attempt += 1) {
-    const result = await requestJevScoresOnce(ctx, config, state, questions, deps);
+    const result = await requestDecisionScoresOnce(ctx, config, profile, body, questions, deps);
     if (result.ok) {
       return earlier.length > 0 ? { ...result, earlier: [...earlier] } : result;
     }
@@ -729,16 +895,18 @@ async function requestJevScores(
   }
 }
 
-/** One Jev decisions request. Any failure returns `ok: false` so callers block. */
-async function requestJevScoresOnce(
+/** One decisions request. Any failure returns `ok: false` so callers block. */
+async function requestDecisionScoresOnce(
   ctx: ExtensionContext,
   config: EffectiveConfig,
-  state: Record<string, string>,
+  profile: DecisionProfile,
+  body: Record<string, unknown>,
   questions: JevQuestions,
   deps: JevKeyDeps = {},
-): Promise<JevScoresResult> {
+): Promise<DecisionScoresResult> {
+  const label = decisionLabel(profile.backend);
   const { key } = await resolveJevKey(ctx, config, deps);
-  if (!key) return { ok: false, reason: jevMissingKeyReason(config) };
+  if (!key) return { ok: false, reason: jevMissingKeyReason(config, label) };
 
   const signals: AbortSignal[] = [AbortSignal.timeout(config.jevTimeoutMs)];
   if (ctx.signal) signals.push(ctx.signal);
@@ -756,7 +924,7 @@ async function requestJevScoresOnce(
         "HTTP-Referer": "https://pi.dev",
         "X-Title": "pi-automode",
       },
-      body: JSON.stringify({ model: config.jevModel, state, questions }),
+      body: JSON.stringify(body),
       signal,
     });
     const rawBody = await response.text();
@@ -764,10 +932,21 @@ async function requestJevScoresOnce(
     if (!parsed.ok) {
       return {
         ok: false,
-        reason: `Jev classifier failed; auto mode fails closed: ${parsed.error}`,
+        reason: `${label} classifier failed; auto mode fails closed: ${parsed.error}`,
         error: parsed.error,
         durationMs: Date.now() - started,
         retryable: response.status === 429 || response.status >= 500,
+      };
+    }
+    // A wrong provider or a cut-off input repeats on a second try with the
+    // same routing, so it is not retryable.
+    const rejected = checkDecisionResponse(profile, parsed);
+    if (rejected !== undefined) {
+      return {
+        ok: false,
+        reason: `${label} classifier response rejected; auto mode fails closed: ${rejected}`,
+        error: rejected,
+        durationMs: Date.now() - started,
       };
     }
     const missing = missingJevAnswers(parsed.scores, questions);
@@ -775,7 +954,7 @@ async function requestJevScoresOnce(
       return {
         ok: false,
         reason:
-          `Jev classifier response is missing answers for: ${missing.join(", ")}; ` +
+          `${label} classifier response is missing answers for: ${missing.join(", ")}; ` +
           "auto mode fails closed.",
         error: `missing answers for: ${missing.join(", ")}`,
         durationMs: Date.now() - started,
@@ -784,7 +963,11 @@ async function requestJevScoresOnce(
     return {
       ok: true,
       scores: parsed.scores,
-      model: parsed.model,
+      model: parsed.model ?? profile.model,
+      ...(typeof parsed.provider === "string" ? { provider: parsed.provider } : {}),
+      ...(typeof parsed.inputTokens === "number"
+        ? { inputTokens: parsed.inputTokens }
+        : {}),
       durationMs: Date.now() - started,
     };
   } catch (error) {
@@ -796,7 +979,7 @@ async function requestJevScoresOnce(
       // cancelled must not be retried.
       retryable: !ctx.signal?.aborted,
       reason:
-        `Jev classifier ${
+        `${label} classifier ${
           timedOut ? `timed out after ${config.jevTimeoutMs}ms` : "failed"
         }; auto mode fails closed: ${clip(message, 160)}`,
       error: clip(message, 160),
@@ -806,8 +989,8 @@ async function requestJevScoresOnce(
 }
 
 /**
- * The ClassifyAction pi-automode calls when classifierBackend === "jev".
- * Any setup, transport, or parse failure returns a block.
+ * The ClassifyAction pi-automode calls on a decision backend (Jev or Clef).
+ * Any setup, transport, parse, or provider-check failure returns a block.
  */
 export async function defaultJevClassifyAction(
   ctx: ExtensionContext,
@@ -816,12 +999,19 @@ export async function defaultJevClassifyAction(
   loadedContext: string,
   deps: JevKeyDeps & ClassifyExtras = {},
 ): Promise<ClassifyResult> {
-  const model = config.jevModel;
-  const reasoning: ClassifierReasoning = {
-    mode: "backend",
-    backend: "jev",
-    model,
-  };
+  const backend = config.classifierBackend;
+  if (!isDecisionBackend(backend)) {
+    return {
+      decision: "block",
+      tier: "none",
+      reason:
+        `classifier backend ${backend} does not use the decisions endpoint; auto mode fails closed.`,
+    };
+  }
+  const profile = decisionProfile(config, backend);
+  const label = decisionLabel(backend);
+  const model = profile.model;
+  const reasoning: ClassifierReasoning = { mode: "backend", backend, model };
   const transcript = buildClassifierTranscriptParts(ctx, {
     maxUserTokens: config.maxUserTranscriptTokens,
     maxToolTokens: config.maxToolTranscriptTokens,
@@ -837,14 +1027,16 @@ export async function defaultJevClassifyAction(
   const cacheKey = createHash("sha256")
     .update(JSON.stringify({
       session: classifierCacheSessionId(ctx),
+      backend,
       model,
       baseUrl: config.jevBaseUrl,
+      provider: profile.provider ?? null,
       state,
       questions,
-      hard: config.jevHardDenyThreshold,
-      soft: config.jevSoftDenyThreshold,
-      scope: config.jevScopeEscapeThreshold,
-      readOnlyIntent: config.jevReadOnlyIntentThreshold,
+      hard: profile.hardDeny,
+      soft: profile.softDeny,
+      scope: profile.scopeEscape,
+      readOnlyIntent: profile.readOnlyIntent,
     }))
     .digest("hex");
 
@@ -858,6 +1050,7 @@ export async function defaultJevClassifyAction(
       reason: `${cached.decision.reason} (cached)`,
       reasoning,
       io: jevIo({
+        label,
         model: cached.model,
         baseUrl: config.jevBaseUrl,
         reasoning,
@@ -871,7 +1064,11 @@ export async function defaultJevClassifyAction(
     };
   }
 
-  const result = await requestJevScores(ctx, config, state, questions, deps);
+  // Built once, after redaction and after a cache miss, so a retry sends the
+  // same body. The cache is written only after a checked success, so a cache
+  // hit never skips the provider and truncation checks.
+  const body = buildDecisionRequest(profile, state, questions);
+  const result = await requestDecisionScores(ctx, config, profile, body, questions, deps);
   if (!result.ok) {
     return {
       decision: "block",
@@ -882,6 +1079,7 @@ export async function defaultJevClassifyAction(
       // HTTP, parse, and incomplete-answer failures log one error attempt.
       ...(result.error === undefined ? {} : {
         io: jevIo({
+          label,
           model,
           baseUrl: config.jevBaseUrl,
           reasoning,
@@ -897,7 +1095,7 @@ export async function defaultJevClassifyAction(
     };
   }
 
-  const decision = jevDecision(result.scores, config, questions, {
+  const decision = jevDecision(result.scores, profile, config.softDeny, questions, {
     readOnly: relaxedIntentRead(action, state.facts ?? ""),
   });
   CACHE.delete(cacheKey);
@@ -912,6 +1110,7 @@ export async function defaultJevClassifyAction(
     ...decision,
     reasoning,
     io: jevIo({
+      label,
       model: result.model,
       baseUrl: config.jevBaseUrl,
       reasoning,
@@ -922,6 +1121,7 @@ export async function defaultJevClassifyAction(
       durationMs: result.durationMs,
       cached: false,
       earlier: result.earlier,
+      served: { provider: result.provider, inputTokens: result.inputTokens },
     }),
   };
 }
@@ -955,15 +1155,17 @@ const PROBES: Array<{ label: "safe" | "dangerous"; action: string; request: stri
   },
 ];
 
-/** Run the read-only direction probe used by `/automode jev test`. */
+/** Run the read-only direction probe used by `/automode jev test` and `/automode clef test`. */
 export async function probeJevClassifier(
   ctx: ExtensionContext,
   config: EffectiveConfig,
+  backend: DecisionBackend,
   deps: JevKeyDeps = {},
 ): Promise<JevProbeResult> {
+  const profile = decisionProfile(config, backend);
   const questions = buildJevQuestions(config);
   const probes: JevProbe[] = [];
-  let model = config.jevModel;
+  let model = profile.model;
   for (const probe of PROBES) {
     const state = buildJevState({
       action: probe.action,
@@ -972,17 +1174,127 @@ export async function probeJevClassifier(
       facts: describeActionFacts(probe.action, config.trustedHosts),
       loadedContext: "",
     });
-    const result = await requestJevScores(ctx, config, state, questions, deps);
+    const body = buildDecisionRequest(profile, state, questions);
+    const result = await requestDecisionScores(ctx, config, profile, body, questions, deps);
     if (!result.ok) return { ok: false, reason: result.reason };
     model = result.model;
     probes.push({
       label: probe.label,
       action: probe.action,
       scores: result.scores,
-      decision: jevDecision(result.scores, config, questions, {
+      decision: jevDecision(result.scores, profile, config.softDeny, questions, {
         readOnly: relaxedIntentRead(probe.action, state.facts ?? ""),
       }),
     });
   }
   return { ok: true, model, probes };
+}
+
+// --- canary -----------------------------------------------------------------
+
+/**
+ * Questions that check reading, not policy: one per fact, and one negated
+ * control per fact naming a different value.
+ */
+export const CANARY_QUESTIONS: JevQuestions = {
+  head: {
+    type: "noul",
+    instructions: "The state says the deploy target is named heron-7.",
+  },
+  head_control: {
+    type: "noul",
+    instructions: "The state says the deploy target is named osprey-3.",
+  },
+  tail: {
+    type: "noul",
+    instructions: "The state says the release owner is named Marisol.",
+  },
+  tail_control: {
+    type: "noul",
+    instructions: "The state says the release owner is named Teodoro.",
+  },
+};
+
+/** Random hex tokenizes at about 1.14 characters per token on Clef (measured 2026-10-14). */
+const CANARY_CHARS_PER_TOKEN = 1.14;
+
+/** A state with one fact at each end of hex filler sized to about `targetTokens`. */
+export function decisionCanaryState(
+  targetTokens: number,
+  random: (size: number) => Buffer = randomBytes,
+): Record<string, string> {
+  const chars = Math.ceil(targetTokens * CANARY_CHARS_PER_TOKEN);
+  return {
+    first: "Deploy target: heron-7.",
+    blob: random(Math.ceil(chars / 2)).toString("hex").slice(0, chars),
+    last: "Release owner: Marisol.",
+  };
+}
+
+export type CanaryOutcome =
+  | {
+    status: "pass";
+    targetTokens: number;
+    inputTokens?: number;
+    scores: Record<string, number>;
+  }
+  | {
+    status: "fail";
+    targetTokens: number;
+    detail: string;
+    scores?: Record<string, number>;
+  }
+  | { status: "inconclusive"; targetTokens: number; detail: string };
+
+/**
+ * Check that the provider reads the start and the end of a long state. The
+ * usage check catches truncation the provider reports; this catches a
+ * provider that cuts the state but reports the full count.
+ */
+export async function runDecisionCanary(
+  ctx: ExtensionContext,
+  config: EffectiveConfig,
+  profile: DecisionProfile,
+  targetTokens: number,
+  deps: JevKeyDeps = {},
+): Promise<CanaryOutcome> {
+  const body = buildDecisionRequest(
+    profile,
+    decisionCanaryState(targetTokens),
+    CANARY_QUESTIONS,
+  );
+  const result = await requestDecisionScores(
+    ctx,
+    config,
+    profile,
+    body,
+    CANARY_QUESTIONS,
+    deps,
+  );
+  if (!result.ok) {
+    // A timeout or transport failure says nothing about how much the provider reads.
+    return result.retryable === true
+      ? { status: "inconclusive", targetTokens, detail: result.reason }
+      : { status: "fail", targetTokens, detail: result.reason };
+  }
+  const problems = [
+    ...["head", "tail"]
+      .filter((id) => result.scores[id]! < 0.9)
+      .map((id) =>
+        `${id} fact scored ${result.scores[id]!.toFixed(2)} (needs at least 0.90)`
+      ),
+    ...["head_control", "tail_control"]
+      .filter((id) => result.scores[id]! > 0.1)
+      .map((id) =>
+        `${id} scored ${result.scores[id]!.toFixed(2)} (needs at most 0.10)`
+      ),
+  ];
+  return problems.length === 0
+    ? {
+      status: "pass",
+      targetTokens,
+      ...(result.inputTokens === undefined ? {} : { inputTokens: result.inputTokens }),
+      scores: result.scores,
+    }
+    : { status: "fail", targetTokens, detail: problems.join("; "), scores: result.scores };
 }

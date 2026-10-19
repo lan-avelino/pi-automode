@@ -4,14 +4,20 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	buildDecisionRequest,
+	CANARY_QUESTIONS,
 	buildJevQuestions,
+	checkDecisionResponse,
 	buildJevState,
 	clearJevCache,
 	CLASSIFIER_POLICY_CLAUSES,
 	CLASSIFIER_SYSTEM_PROMPT,
 	credentialKey,
+	decisionCanaryState,
+	decisionProfile,
 	defaultJevClassifyAction,
 	DEFAULT_JEV_API_KEY_ENV,
+	DEFAULT_JEV_MODEL,
 	isOpenRouterBaseUrl,
 	jevCredentialDiagnostics,
 	jevDecision,
@@ -22,6 +28,7 @@ import {
 	probeJevClassifier,
 	redactSecrets,
 	resolveJevKey,
+	runDecisionCanary,
 	statusText,
 } from "../extensions/auto-mode.ts";
 import { createPiAutomode } from "../extensions/auto-mode.ts";
@@ -68,6 +75,58 @@ test("openRouterDecisionsUrl appends /decisions to an arbitrary base", () => {
 
 /** A question set with one soft-deny rule; required scores are derived from it. */
 const baseQuestions = () => buildJevQuestions(baseConfig({ softDeny: ["SOFT_RULE"] }));
+
+/** jevDecision under the Jev profile of `config`, as the Jev backend calls it. */
+function decideJev(
+	scores: Record<string, number>,
+	config: EffectiveConfig,
+	questions: ReturnType<typeof buildJevQuestions>,
+	options: { readOnly?: boolean } = {},
+) {
+	return jevDecision(scores, decisionProfile(config, "jev"), config.softDeny, questions, options);
+}
+
+test("decisionProfile returns each backend's own model and thresholds, whichever is active", () => {
+	const config = baseConfig({
+		classifierBackend: "jev",
+		clefModel: "cloudflare/clef",
+		clefHardDenyThreshold: 0.7,
+		clefSoftDenyThreshold: 0.4,
+		clefReadOnlyIntentThreshold: 0.8,
+		clefScopeEscapeThreshold: 0.6,
+	});
+	assert.deepEqual(decisionProfile(config, "clef"), {
+		backend: "clef",
+		model: "cloudflare/clef",
+		hardDeny: 0.7,
+		softDeny: 0.4,
+		readOnlyIntent: 0.8,
+		scopeEscape: 0.6,
+		provider: { slug: "deepinfra", name: "deepinfra", contextTokens: 65_536 },
+	});
+	const jev = decisionProfile({ ...config, classifierBackend: "clef" }, "jev");
+	assert.equal(jev.model, DEFAULT_JEV_MODEL);
+	assert.equal(jev.softDeny, 0.55);
+	assert.equal(jev.provider, undefined);
+});
+
+test("jevDecision gates on the profile it is given and names the backend", () => {
+	const config = baseConfig({
+		softDeny: ["SOFT_RULE"],
+		clefHardDenyThreshold: 0.9,
+		clefSoftDenyThreshold: 0.4,
+		clefReadOnlyIntentThreshold: 0.4,
+	});
+	const scores = { hard_deny: 0.01, soft_deny_1: 0.45, intent_mismatch: 0.01, scope_escape: 0.01 };
+	const clef = jevDecision(scores, decisionProfile(config, "clef"), config.softDeny, baseQuestions());
+	assert.equal(clef.decision, "block");
+	assert.match(clef.reason, /^Clef: soft-deny rule 1 scored 0\.45 \(threshold 0\.40\)/);
+	const jev = jevDecision(scores, decisionProfile(config, "jev"), config.softDeny, baseQuestions());
+	assert.equal(jev.decision, "allow");
+	assert.match(jev.reason, /^Jev: permitted/);
+	const missing = jevDecision({}, decisionProfile(config, "clef"), config.softDeny, baseQuestions());
+	assert.match(missing.reason, /^Clef: incomplete scores/);
+});
 
 // --- response parsing ------------------------------------------------------
 
@@ -185,7 +244,7 @@ test("missingJevAnswers reports every unanswered question", () => {
 test("jevDecision blocks at or above the hard threshold", () => {
 	const config = baseConfig();
 	assert.deepEqual(
-		jevDecision(
+		decideJev(
 			{
 				hard_deny: 0.5,
 				soft_deny_1: 0,
@@ -224,7 +283,7 @@ test("jevDecision blocks the soft band from the authorization-aware questions", 
 			},
 		]
 	) {
-		const decision = jevDecision(scores, config, baseQuestions());
+		const decision = decideJev(scores, config, baseQuestions());
 		assert.equal(decision.decision, "block", JSON.stringify(scores));
 		assert.equal(decision.tier, "soft_deny");
 	}
@@ -236,7 +295,7 @@ test("the default soft-deny threshold sits between the measured anchors", () => 
 	// feature branch (0.51-0.54); the lowest violation was chmod -R 777 (0.60-0.61).
 	// No labeled violation may be allowed, so the margin favors the violation side.
 	assert.equal(baseConfig().jevSoftDenyThreshold, 0.55);
-	const benign = jevDecision(
+	const benign = decideJev(
 		{
 			hard_deny: 0.05,
 			soft_deny_1: 0.54,
@@ -247,7 +306,7 @@ test("the default soft-deny threshold sits between the measured anchors", () => 
 		baseQuestions(),
 	);
 	assert.equal(benign.decision, "allow", benign.reason);
-	const violation = jevDecision(
+	const violation = decideJev(
 		{
 			hard_deny: 0.36,
 			soft_deny_1: 0.51,
@@ -264,7 +323,7 @@ test("the default soft-deny threshold sits between the measured anchors", () => 
 test("jevDecision gates on the highest-scoring soft-deny rule and names it", () => {
 	const config = baseConfig({ softDeny: ["RULE_ONE", "RULE_TWO", "RULE_THREE"] });
 	const questions = buildJevQuestions(config);
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.05,
 			soft_deny_1: 0.2,
@@ -284,7 +343,7 @@ test("jevDecision gates on the highest-scoring soft-deny rule and names it", () 
 		softDenyRule: "RULE_TWO",
 	});
 	// Every rule question is required; one missing answer fails closed.
-	const missing = jevDecision(
+	const missing = decideJev(
 		{ hard_deny: 0, soft_deny_1: 0, soft_deny_3: 0, intent_mismatch: 0, scope_escape: 0 },
 		baseConfig(),
 		questions,
@@ -296,10 +355,10 @@ test("jevDecision gates on the highest-scoring soft-deny rule and names it", () 
 test("jevDecision reports the text of the soft-deny rule that fired", () => {
 	const config = baseConfig({ softDeny: ["RULE_ONE", "RULE_TWO"] });
 	const questions = buildJevQuestions(config);
-	const fired = jevDecision({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.8, intent_mismatch: 0, scope_escape: 0 }, config, questions);
+	const fired = decideJev({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.8, intent_mismatch: 0, scope_escape: 0 }, config, questions);
 	assert.equal(fired.softDenyRule, "RULE_TWO");
 	// Intent alone blocks without naming a rule.
-	const intent = jevDecision({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.1, intent_mismatch: 0.9, scope_escape: 0 }, config, questions);
+	const intent = decideJev({ hard_deny: 0, soft_deny_1: 0.1, soft_deny_2: 0.1, intent_mismatch: 0.9, scope_escape: 0 }, config, questions);
 	assert.equal(intent.decision, "block");
 	assert.equal(intent.softDenyRule, undefined);
 });
@@ -307,7 +366,7 @@ test("jevDecision reports the text of the soft-deny rule that fired", () => {
 test("with no soft-deny rules the soft gate is intent_mismatch alone", () => {
 	const questions = buildJevQuestions(baseConfig({ softDeny: [] }));
 	assert.deepEqual(Object.keys(questions).sort(), ["hard_deny", "intent_mismatch", "scope_escape"]);
-	const decision = jevDecision(
+	const decision = decideJev(
 		{ hard_deny: 0, intent_mismatch: 0.55, scope_escape: 0 },
 		baseConfig(),
 		questions,
@@ -321,7 +380,7 @@ test("with no soft-deny rules the soft gate is intent_mismatch alone", () => {
 
 test("jevDecision names every gate that fired, with scope as advice only", () => {
 	const config = baseConfig({ softDeny: ["RULE_ONE"] });
-	const decision = jevDecision(
+	const decision = decideJev(
 		{ hard_deny: 0.1, soft_deny_1: 0.62, intent_mismatch: 0.58, scope_escape: 0.77 },
 		config,
 		buildJevQuestions(config),
@@ -340,7 +399,7 @@ test("jevDecision names every gate that fired, with scope as advice only", () =>
 test("jevDecision quotes a rule redacted and clipped", () => {
 	const longRule = `Token sk-or-v1-abcdefghijklmnop ${"x".repeat(300)}`;
 	const questions = buildJevQuestions(baseConfig({ softDeny: [longRule] }));
-	const decision = jevDecision(
+	const decision = decideJev(
 		{ hard_deny: 0, soft_deny_1: 0.9, intent_mismatch: 0, scope_escape: 0 },
 		baseConfig({ softDeny: [longRule] }),
 		questions,
@@ -384,7 +443,7 @@ test("jevDecision gates scope_escape at its own higher threshold", () => {
 		intent_mismatch: 0,
 		scope_escape: 0.36,
 	};
-	const decision = jevDecision(scores, config, baseQuestions());
+	const decision = decideJev(scores, config, baseQuestions());
 	assert.equal(decision.decision, "allow", decision.reason);
 	assert.equal(decision.tier, "none");
 });
@@ -393,7 +452,7 @@ test("scope_escape is advisory and never blocks on its own", () => {
 	// Caveat 20: across the calibration sweep scope_escape blocked no violation the
 	// soft band missed, and it blocked read-only remote reads, public GETs, and
 	// declared installs. It is reported, not gated.
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.0,
 			soft_deny_1: 0,
@@ -410,7 +469,7 @@ test("scope_escape is advisory and never blocks on its own", () => {
 
 test("a raised scope_escape threshold cannot suppress the other soft questions", () => {
 	const config = baseConfig({ jevScopeEscapeThreshold: 1 });
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.0,
 			soft_deny_1: config.jevSoftDenyThreshold,
@@ -428,7 +487,7 @@ test("an at-or-above scope_escape cannot downgrade a hard deny", () => {
 	const config = baseConfig();
 	// scope_escape is at or above its own threshold and hard_deny is at its own,
 	// so the tier must be hard_deny rather than soft_deny.
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: config.jevHardDenyThreshold,
 			soft_deny_1: 0,
@@ -447,7 +506,7 @@ test("a raised scope_escape threshold cannot suppress a hard deny", () => {
 		jevScopeEscapeThreshold: 1,
 		jevSoftDenyThreshold: 1,
 	});
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.9,
 			soft_deny_1: 0,
@@ -462,7 +521,7 @@ test("a raised scope_escape threshold cannot suppress a hard deny", () => {
 });
 
 test("jevDecision allows below both thresholds", () => {
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.49,
 			soft_deny_1: 0.34,
@@ -478,7 +537,7 @@ test("jevDecision allows below both thresholds", () => {
 
 test("jevDecision fails closed when a required score is missing", () => {
 	// Guards a future caller that skips the explicit missing-answer check.
-	const decision = jevDecision(
+	const decision = decideJev(
 		{ hard_deny: 0.0, intent_mismatch: 0.0 },
 		baseConfig(),
 		baseQuestions(),
@@ -494,7 +553,7 @@ test("jevDecision honors configured thresholds", () => {
 		jevSoftDenyThreshold: 0.8,
 	});
 	assert.equal(
-		jevDecision(
+		decideJev(
 			{
 				hard_deny: 0.7,
 				soft_deny_1: 0.1,
@@ -507,7 +566,7 @@ test("jevDecision honors configured thresholds", () => {
 		"allow",
 	);
 	assert.equal(
-		jevDecision(
+		decideJev(
 			{
 				hard_deny: 0.9,
 				soft_deny_1: 0,
@@ -522,7 +581,7 @@ test("jevDecision honors configured thresholds", () => {
 });
 
 test("jevDecision prefers the hard tier when both bands are cleared", () => {
-	const decision = jevDecision(
+	const decision = decideJev(
 		{
 			hard_deny: 0.9,
 			soft_deny_1: 0,
@@ -892,6 +951,7 @@ test("jevCredentialDiagnostics flags a custom base URL with the default key env"
 
 function jevTestConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveConfig {
 	return baseConfig({
+		classifierBackend: "jev",
 		jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY",
 		...overrides,
 	});
@@ -1423,6 +1483,18 @@ test("tool_call routes to the Jev action when classifierBackend is jev", async (
 	assert.equal(llmCalls, 0);
 });
 
+test("tool_call routes to the decisions action when classifierBackend is clef", async () => {
+	const { llmCalls, jevCalls } = await hookResult(
+		baseConfig({ classifierBackend: "clef" }),
+		{
+			classifyAction: async () => ({ decision: "allow", tier: "none", reason: "llm" }),
+			jevClassifyAction: async () => ({ decision: "allow", tier: "none", reason: "clef" }),
+		},
+	);
+	assert.equal(jevCalls, 1);
+	assert.equal(llmCalls, 0);
+});
+
 test("tool_call routes to the LLM action when classifierBackend is llm", async () => {
 	const { llmCalls, jevCalls } = await hookResult(
 		baseConfig({ classifierBackend: "llm" }),
@@ -1501,7 +1573,7 @@ test("/automode backend saves classifierBackend globally and reloads", async () 
 
 	await fake.commands.get("automode")?.handler("backend jev", ctx);
 	assert.deepEqual(saved, [["classifierBackend", "jev"]]);
-	assert.match(ctx.notifications.at(-1)?.message ?? "", /set to jev/);
+	assert.match(ctx.notifications.at(-1)?.message ?? "", /saved globally: jev/);
 
 	await fake.commands.get("automode")?.handler("backend nope", ctx);
 	assert.equal(ctx.notifications.at(-1)?.type, "error");
@@ -1537,6 +1609,7 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 			classifierBackend: "jev",
 			jevBaseUrl: "https://classifier.test/api/v1",
 		}),
+		"jev",
 		"none",
 		["autoMode.jevBaseUrl targets a custom endpoint"],
 	);
@@ -1559,7 +1632,7 @@ test("jevStatusText reports the endpoint, credential source, and warnings", () =
 	);
 
 	// The status reports the effective backend, not a hardcoded one.
-	const llm = jevStatusText(baseConfig(), "none");
+	const llm = jevStatusText(baseConfig(), "jev", "none");
 	assert.match(llm, /^backend: llm$/m);
 });
 
@@ -1657,6 +1730,7 @@ test("probeJevClassifier fails closed when the endpoint errors", async () => {
 		const result = await probeJevClassifier(
 			ctx,
 			baseConfig({ jevApiKeyEnv: "PI_AUTOMODE_TEST_JEV_KEY" }),
+			"jev",
 		);
 		assert.equal(result.ok, false);
 		if (result.ok) return;
@@ -1696,21 +1770,21 @@ test("a verified read-only action is blocked on intent only at the read-only thr
 		scope_escape: 0.7,
 	});
 	// The GitLab MR reads from session 01a0d6e5 scored intent 0.53-0.73.
-	assert.equal(jevDecision(scores(0.73), config, baseQuestions(), { readOnly: true }).decision, "allow");
-	assert.equal(jevDecision(scores(0.73), config, baseQuestions()).decision, "block");
-	const high = jevDecision(scores(0.75), config, baseQuestions(), { readOnly: true });
+	assert.equal(decideJev(scores(0.73), config, baseQuestions(), { readOnly: true }).decision, "allow");
+	assert.equal(decideJev(scores(0.73), config, baseQuestions()).decision, "block");
+	const high = decideJev(scores(0.75), config, baseQuestions(), { readOnly: true });
 	assert.equal(high.decision, "block");
 	assert.equal(high.tier, "soft_deny");
 	assert.match(high.reason, /intent_mismatch scored 0\.75 \(read-only threshold 0\.75\)/);
 	// Soft-deny rules and hard_deny keep their thresholds for read-only actions.
-	assert.equal(jevDecision(scores(0.1, 0.6), config, baseQuestions(), { readOnly: true }).decision, "block");
+	assert.equal(decideJev(scores(0.1, 0.6), config, baseQuestions(), { readOnly: true }).decision, "block");
 	assert.equal(
-		jevDecision({ ...scores(0.1), hard_deny: 0.6 }, config, baseQuestions(), { readOnly: true }).tier,
+		decideJev({ ...scores(0.1), hard_deny: 0.6 }, config, baseQuestions(), { readOnly: true }).tier,
 		"hard_deny",
 	);
 	// The read-only threshold never makes intent stricter than the soft threshold.
 	const strict = baseConfig({ jevReadOnlyIntentThreshold: 0.3 });
-	assert.equal(jevDecision(scores(0.5), strict, baseQuestions(), { readOnly: true }).decision, "allow");
+	assert.equal(decideJev(scores(0.5), strict, baseQuestions(), { readOnly: true }).decision, "allow");
 });
 
 test("defaultJevClassifyAction applies the read-only threshold only when the parser verifies read_only", async () => {
@@ -1788,4 +1862,384 @@ test("defaultJevClassifyAction sends extra facts before the read_only line", asy
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+// --- Clef --------------------------------------------------------------------
+
+function clefTestConfig(overrides: Partial<EffectiveConfig> = {}): EffectiveConfig {
+	return jevTestConfig({
+		classifierBackend: "clef",
+		clefHardDenyThreshold: 0.5,
+		clefSoftDenyThreshold: 0.55,
+		clefReadOnlyIntentThreshold: 0.75,
+		clefScopeEscapeThreshold: 0.5,
+		...overrides,
+	});
+}
+
+const clefResponse = (fields: Record<string, unknown> = {}) =>
+	new Response(
+		JSON.stringify({
+			model: "cloudflare/clef",
+			provider: "DeepInfra",
+			usage: { input_tokens: 6339 },
+			answers: jevAnswers(),
+			...fields,
+		}),
+		{ status: 200 },
+	);
+
+/** Classify `runs` times against a stubbed endpoint without clearing the cache between runs. */
+async function classifyWith(
+	respond: (call: number) => Response | Promise<Response>,
+	config: EffectiveConfig,
+	runs = 1,
+) {
+	const originalFetch = globalThis.fetch;
+	const calls: Array<{ url: string; init: RequestInit }> = [];
+	globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+		calls.push({ url: String(url), init: init ?? {} });
+		return respond(calls.length);
+	}) as typeof fetch;
+	clearJevCache();
+	try {
+		const results = [];
+		for (let run = 0; run < runs; run += 1) {
+			results.push(await defaultJevClassifyAction(
+				createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+				config,
+				'{"toolName":"bash","input":{"command":"ls"}}',
+				"",
+				JEV_KEY_DEPS,
+			));
+		}
+		return {
+			results,
+			result: results[0]!,
+			calls,
+			bodies: calls.map((c) => JSON.parse(String(c.init.body))),
+		};
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+}
+
+test("a Clef request pins DeepInfra with no fallbacks, on every base URL", async () => {
+	for (const jevBaseUrl of ["https://openrouter.ai/api/v1", "https://proxy.test/api/v1"]) {
+		const { result, bodies } = await classifyWith(() => clefResponse(), clefTestConfig({ jevBaseUrl }));
+		assert.equal(result.decision, "allow", result.reason);
+		assert.equal(bodies[0].model, "cloudflare/clef");
+		assert.deepEqual(bodies[0].provider, { only: ["deepinfra"], allow_fallbacks: false });
+	}
+});
+
+test("a Jev request has no provider field and needs no provider or usage in the response", async () => {
+	const { result, bodies } = await classifyWith(
+		() => new Response(JSON.stringify({ model: "typesafe/jev-1.13", answers: jevAnswers() }), { status: 200 }),
+		jevTestConfig(),
+	);
+	assert.equal(result.decision, "allow", result.reason);
+	assert.equal(bodies[0].provider, undefined);
+});
+
+test("a retried Clef request sends the same body", async () => {
+	const { result, calls, bodies } = await classifyWith(
+		(call) => call === 1 ? new Response("{}", { status: 503 }) : clefResponse(),
+		clefTestConfig(),
+	);
+	assert.equal(result.decision, "allow", result.reason);
+	assert.equal(calls.length, 2);
+	assert.deepEqual(bodies[0], bodies[1]);
+});
+
+test("a Clef response from another provider, without usage, or cut off blocks, unretried and uncached", async () => {
+	const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+		["missing provider", { provider: undefined }, /an unnamed provider, not deepinfra/],
+		["non-string provider", { provider: 7 }, /an unnamed provider, not deepinfra/],
+		["Cloudflare", { provider: "Cloudflare" }, /provider "Cloudflare", not deepinfra/],
+		["Prime Intellect", { provider: "PrimeIntellect" }, /provider "PrimeIntellect", not deepinfra/],
+		["look-alike", { provider: "DeepInfra2" }, /provider "DeepInfra2", not deepinfra/],
+		["missing usage", { usage: undefined }, /no usable usage\.input_tokens/],
+		["string tokens", { usage: { input_tokens: "6000" } }, /no usable usage\.input_tokens/],
+		["at the context", { usage: { input_tokens: 65_536 } }, /cut off at 65536 tokens/],
+		["at the bound", { usage: { input_tokens: 65_280 } }, /cut off at 65280 tokens/],
+	];
+	for (const [label, fields, reason] of cases) {
+		const { results, calls } = await classifyWith(() => clefResponse(fields), clefTestConfig(), 2);
+		for (const result of results) {
+			assert.equal(result.decision, "block", label);
+			assert.equal(result.tier, "none", label);
+			assert.match(result.reason, /^Clef classifier response rejected; auto mode fails closed: /, label);
+			assert.match(result.reason, reason, label);
+		}
+		// One request per classification: no retry, and the second run is not served from cache.
+		assert.equal(calls.length, 2, label);
+	}
+});
+
+test("DeepInfra passes under any spelling, just below the bound", async () => {
+	for (const provider of ["DeepInfra", "deepinfra", "Deep Infra"]) {
+		const { result } = await classifyWith(
+			() => clefResponse({ provider, usage: { input_tokens: 65_279 } }),
+			clefTestConfig(),
+		);
+		assert.equal(result.decision, "allow", `${provider}: ${result.reason}`);
+	}
+});
+
+test("a Clef classification is labelled and logs the served provider", async () => {
+	const { result } = await classifyWith(() => clefResponse(), clefTestConfig());
+	assert.deepEqual(result.reasoning, { mode: "backend", backend: "clef", model: "cloudflare/clef" });
+	assert.match(result.reason, /^Clef: permitted/);
+	assert.equal(result.io?.prompt.fastInstruction, "(not used by the Clef backend)");
+	assert.deepEqual(result.io?.attempts.at(-1)?.served, { provider: "DeepInfra", inputTokens: 6339 });
+	const missingKey = await defaultJevClassifyAction(
+		createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+		clefTestConfig(),
+		'{"toolName":"bash"}',
+		"",
+		{ env: {}, readStoredCredential: () => undefined },
+	);
+	assert.match(missingKey.reason, /^Clef classifier key missing/);
+});
+
+test("a cached Jev verdict is not reused after switching to Clef", async () => {
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = (async () => {
+		calls += 1;
+		return clefResponse();
+	}) as typeof fetch;
+	clearJevCache();
+	try {
+		const ctx = createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never;
+		const action = '{"toolName":"bash","input":{"command":"ls"}}';
+		await defaultJevClassifyAction(ctx, jevTestConfig(), action, "", JEV_KEY_DEPS);
+		const clef = await defaultJevClassifyAction(ctx, clefTestConfig(), action, "", JEV_KEY_DEPS);
+		assert.equal(calls, 2);
+		assert.doesNotMatch(clef.reason, /\(cached\)/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("the decisions classifier refuses the llm backend without a request", async () => {
+	const { result, calls } = await classifyWith(() => clefResponse(), jevTestConfig({ classifierBackend: "llm" }));
+	assert.equal(result.decision, "block");
+	assert.match(result.reason, /classifier backend llm does not use the decisions endpoint/);
+	assert.equal(calls.length, 0);
+});
+
+test("an OpenRouter error object is quoted in the block reason and not retried", async () => {
+	const { result, calls } = await classifyWith(
+		() => new Response(JSON.stringify({
+			error: {
+				code: 404,
+				message: "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy.",
+			},
+		}), { status: 404 }),
+		clefTestConfig(),
+	);
+	assert.equal(result.decision, "block");
+	assert.match(result.reason, /HTTP 404: 0 endpoints out of 1 requested are available/);
+	assert.equal(calls.length, 1);
+});
+
+test("buildDecisionRequest and checkDecisionResponse leave Jev untouched", () => {
+	const jev = decisionProfile(jevTestConfig(), "jev");
+	assert.deepEqual(buildDecisionRequest(jev, { action: "a" }, {}), {
+		model: DEFAULT_JEV_MODEL,
+		state: { action: "a" },
+		questions: {},
+	});
+	assert.equal(checkDecisionResponse(jev, {}), undefined);
+	assert.equal(
+		checkDecisionResponse(decisionProfile(clefTestConfig(), "clef"), { provider: "DeepInfra", inputTokens: 100 }),
+		undefined,
+	);
+});
+
+test("jevStatusText shows Clef's settings, provider policy, and Clef warnings", () => {
+	const text = jevStatusText(
+		baseConfig({ classifierBackend: "jev", clefSoftDenyThreshold: 0.4 }),
+		"clef",
+		"env",
+		[
+			"inline: autoMode.clefSoftDenyThreshold must be a number from 0 through 1",
+			"inline: autoMode.classifierModel must be a provider/model string",
+		],
+	);
+	assert.match(text, /^backend: jev$/m);
+	assert.match(text, /^showing: clef settings \(clef is not the active backend\)$/m);
+	assert.match(text, /^model: cloudflare\/clef$/m);
+	assert.match(text, /^provider: deepinfra only; responses from any other provider, or at or above 65280 input tokens, are rejected$/m);
+	assert.match(text, /^soft deny threshold: 0\.4$/m);
+	assert.match(text, /^warning: inline: autoMode\.clefSoftDenyThreshold/m);
+	assert.doesNotMatch(text, /classifierModel/);
+});
+
+// --- canary ------------------------------------------------------------------
+
+const canaryAnswers = (overrides: Record<string, number> = {}) => ({
+	head: { type: "noul", noul: overrides.head ?? 0.98 },
+	head_control: { type: "noul", noul: overrides.head_control ?? 0.02 },
+	tail: { type: "noul", noul: overrides.tail ?? 0.98 },
+	tail_control: { type: "noul", noul: overrides.tail_control ?? 0.03 },
+});
+
+async function canaryWith(respond: () => Response | Promise<Response>) {
+	const originalFetch = globalThis.fetch;
+	const bodies: any[] = [];
+	globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+		bodies.push(JSON.parse(String(init?.body)));
+		return respond();
+	}) as typeof fetch;
+	try {
+		const config = clefTestConfig();
+		const outcome = await runDecisionCanary(
+			createFakeCtx([], { modelRegistry: { getApiKeyForProvider: async () => undefined } }) as never,
+			config,
+			decisionProfile(config, "clef"),
+			8000,
+			JEV_KEY_DEPS,
+		);
+		return { outcome, bodies };
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+test("decisionCanaryState puts a fact at each end of hex filler sized to the target", () => {
+	const state = decisionCanaryState(1000);
+	assert.equal(state.first, "Deploy target: heron-7.");
+	assert.equal(state.last, "Release owner: Marisol.");
+	assert.equal(state.blob!.length, 1140);
+	assert.match(state.blob!, /^[0-9a-f]+$/);
+	assert.deepEqual(Object.keys(CANARY_QUESTIONS), ["head", "head_control", "tail", "tail_control"]);
+});
+
+test("the canary passes when both facts are read and both controls rejected", async () => {
+	const { outcome, bodies } = await canaryWith(() =>
+		clefResponse({ answers: canaryAnswers(), usage: { input_tokens: 8100 } })
+	);
+	assert.equal(outcome.status, "pass");
+	assert.deepEqual(bodies[0].provider, { only: ["deepinfra"], allow_fallbacks: false });
+	assert.deepEqual(Object.keys(bodies[0].questions), ["head", "head_control", "tail", "tail_control"]);
+});
+
+test("the canary fails on a missed fact, an accepted control, or a cut-off input", async () => {
+	for (const [label, response, detail] of [
+		["missed tail", () => clefResponse({ answers: canaryAnswers({ tail: 0.2 }) }), /tail fact scored 0\.20/],
+		["accepted control", () => clefResponse({ answers: canaryAnswers({ head_control: 0.4 }) }), /head_control scored 0\.40/],
+		["cut off", () => clefResponse({ answers: canaryAnswers(), usage: { input_tokens: 65_536 } }), /cut off at 65536/],
+	] as const) {
+		const { outcome } = await canaryWith(response);
+		assert.equal(outcome.status, "fail", label);
+		assert.match(outcome.status === "fail" ? outcome.detail : "", detail, label);
+	}
+});
+
+test("a canary that times out is inconclusive", async () => {
+	const { outcome } = await canaryWith(() => {
+		throw new Error("The operation was aborted due to timeout");
+	});
+	assert.equal(outcome.status, "inconclusive");
+});
+
+// --- Clef commands -------------------------------------------------------------
+
+test("/automode model saves clefModel while Clef is active", async () => {
+	const saved: Array<[string, string]> = [];
+	const fake = createFakePi();
+	createPiAutomode({
+		loadConfig: () => baseConfig({ classifierBackend: "clef" }),
+		saveAutoModeSetting: (key, value) => saved.push([key, value]),
+	})(fake.pi);
+	const ctx = createFakeCtx(fake.entries);
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+	await fake.commands.get("automode")?.handler("model cloudflare/clef-2", ctx);
+	assert.deepEqual(saved, [["clefModel", "cloudflare/clef-2"]]);
+	assert.match(
+		ctx.notifications.at(-1)?.message ?? "",
+		/Clef classifier saved globally: cloudflare\/clef-2; current config uses cloudflare\/clef/,
+	);
+});
+
+test("/automode clef and /automode jev each show their own settings", async () => {
+	const fake = createFakePi();
+	createPiAutomode({ loadConfig: () => baseConfig({ classifierBackend: "clef" }) })(fake.pi);
+	const ctx = createFakeCtx(fake.entries);
+	await fake.emit("session_start", { type: "session_start" }, ctx);
+	await fake.commands.get("automode")?.handler("clef", ctx);
+	assert.match(ctx.notifications.at(-1)?.message ?? "", /^model: cloudflare\/clef$/m);
+	await fake.commands.get("automode")?.handler("jev", ctx);
+	const jev = ctx.notifications.at(-1)?.message ?? "";
+	assert.match(jev, /^showing: jev settings \(jev is not the active backend\)$/m);
+	assert.match(jev, /^model: ~typesafe\/jev-latest$/m);
+	await fake.commands.get("automode")?.handler("clef nope", ctx);
+	assert.match(ctx.notifications.at(-1)?.message ?? "", /Usage: \/automode clef \[test\]/);
+});
+
+test("/automode clef test runs the direction probes and the canary", async () => {
+	const originalFetch = globalThis.fetch;
+	const run = async (canaryTail: number) => {
+		globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body));
+			if ("head" in body.questions) {
+				return clefResponse({ answers: canaryAnswers({ tail: canaryTail }), usage: { input_tokens: 8100 } });
+			}
+			const danger = /rm -rf/.test(body.state.action) ? 0.95 : 0.01;
+			return clefResponse({
+				answers: {
+					hard_deny: { type: "noul", noul: danger },
+					intent_mismatch: { type: "noul", noul: danger },
+					scope_escape: { type: "noul", noul: danger },
+				},
+			});
+		}) as typeof fetch;
+		const fake = createFakePi();
+		createPiAutomode({ loadConfig: () => clefTestConfig() })(fake.pi);
+		const ctx = createFakeCtx(fake.entries, { modelRegistry: { getApiKeyForProvider: async () => undefined } });
+		await fake.emit("session_start", { type: "session_start" }, ctx);
+		const previous = process.env.PI_AUTOMODE_TEST_JEV_KEY;
+		process.env.PI_AUTOMODE_TEST_JEV_KEY = "test-key";
+		try {
+			await fake.commands.get("automode")?.handler("clef test", ctx);
+		} finally {
+			if (previous === undefined) delete process.env.PI_AUTOMODE_TEST_JEV_KEY;
+			else process.env.PI_AUTOMODE_TEST_JEV_KEY = previous;
+		}
+		return ctx.notifications.at(-1)!;
+	};
+	try {
+		const good = await run(0.98);
+		assert.equal(good.type, "info", good.message);
+		assert.match(good.message, /^Clef probe/m);
+		assert.match(good.message, /^canary at 8000 tokens: pass/m);
+		assert.match(good.message, /^canary at 60000 tokens: pass/m);
+		const bad = await run(0.2);
+		assert.equal(bad.type, "warning");
+		assert.match(bad.message, /^canary at 60000 tokens: fail: tail fact scored 0\.20/m);
+	} finally {
+		globalThis.fetch = originalFetch;
+		clearJevCache();
+	}
+});
+
+test("a Clef model on the Jev backend still gets DeepInfra pinned and checked", async () => {
+	assert.deepEqual(decisionProfile(baseConfig({ jevModel: "cloudflare/clef" }), "jev").provider, {
+		slug: "deepinfra",
+		name: "deepinfra",
+		contextTokens: 65_536,
+	});
+	assert.equal(decisionProfile(baseConfig({ jevModel: "~typesafe/jev-latest" }), "jev").provider, undefined);
+	const { result, bodies } = await classifyWith(
+		() => clefResponse({ provider: "Cloudflare" }),
+		jevTestConfig({ jevModel: "cloudflare/clef" }),
+	);
+	assert.deepEqual(bodies[0].provider, { only: ["deepinfra"], allow_fallbacks: false });
+	assert.equal(result.decision, "block");
+	assert.match(result.reason, /^Jev classifier response rejected; auto mode fails closed: response came from provider "Cloudflare"/);
 });

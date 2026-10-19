@@ -219,6 +219,7 @@ async function setupLogTest(options: {
 	createPiAutomode({
 		loadConfig: () => options.config ?? baseConfig({ log: { enabled: true, classifierIo: false } }),
 		classifyAction: async () => classifier(),
+		jevClassifyAction: async () => classifier(),
 	})(fake.pi);
 	const ctx = createFakeCtx(fake.entries, { sessionFile });
 	await fake.emit("session_start", { type: "session_start" }, ctx);
@@ -732,6 +733,22 @@ test("/automode config names the current log file", async () => {
 		const parsed = JSON.parse(notify.message);
 		assert.equal(parsed.logFile, t.logPath);
 		assert.equal(parsed.config.log.enabled, true);
+	} finally {
+		rmSync(t.dir, { recursive: true, force: true });
+	}
+});
+
+test("a Clef decision entry records the Clef backend and model", async () => {
+	const t = await setupLogTest({
+		// No prompt: the fake context has no `select`, and the entry is what is under test.
+		config: baseConfig({ classifierBackend: "clef", jevConfirmSoftDeny: false, log: { enabled: true, classifierIo: false } }),
+	});
+	try {
+		await t.fake.emit("tool_call", { toolName: "bash", input: { command: "deploy" } }, t.ctx);
+		const lines = readFileSync(t.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const decision = lines.find((line) => line.type === "decision");
+		assert.equal(decision.classifierModel, "cloudflare/clef");
+		assert.deepEqual(decision.reasoning, { mode: "backend", backend: "clef", model: "cloudflare/clef" });
 	} finally {
 		rmSync(t.dir, { recursive: true, force: true });
 	}

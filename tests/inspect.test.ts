@@ -253,3 +253,17 @@ test("automode_inspect omits denial reasons and action payloads", async () => {
 	);
 	assert.doesNotMatch(JSON.stringify(statusOutput), /SECRET_REASON_MARKER/);
 });
+
+test("automode_inspect status reports the Clef backend", async () => {
+	const hook = await setupHookTest({ config: baseConfig({ classifierBackend: "clef" }) });
+	const output = await hook.tools.get("automode_inspect")?.execute(
+		"call-1",
+		{ action: "status" },
+		undefined,
+		undefined,
+		hook.ctx,
+	);
+	const parsed = JSON.parse(output.content[0].text);
+	assert.match(parsed.status, /classifier: clef \(cloudflare\/clef\)/);
+	assert.match(parsed.status, /classifier reasoning: not used by the Clef backend/);
+});
