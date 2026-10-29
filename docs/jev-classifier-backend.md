@@ -736,7 +736,11 @@ Update `/automode model` to write `jevModel` when
   inode, kind, birth time). A file must also have an unchanged change time and
   size, and every entry under a folder must be newer than the folder. Every
   removal operand and existing write target in the action must hold a claim, or
-  none is shown. See caveat 26.
+  none is shown. Pi's `write` tool creations, and the top-level entries a `bash`
+  call leaves in the session cwd, are
+  recorded too (see caveat 26). When claims come from only the guarded start of
+  an action, a `created_this_session_scope` line names the first command
+  pi-automode did not analyse.
 - `project_instructions` = `loadedContext` (AGENTS.md and loaded project
   instructions).
 - `action` = the full `{toolName, input}` JSON, **redacted**. Jev is a
@@ -1146,7 +1150,29 @@ npm run check
       pi-automode's contents walk keeps a claim off that removal, but Jev does
       not catch it from `recent_actions` alone.
     - **Limits:**
-      - Only `>`/`>>`, `mkdir`, and `git worktree add` are recorded.
+      - Recorded: `>`/`>>`, `mkdir`, `git worktree add`, Pi's `write` tool, and
+        new top-level entries a `bash` call leaves in the session cwd (a
+        before/after listing, capped at 5,000 entries; only the cwd, which has a
+        session-start baseline, is listed, so a leading `cd` folder elsewhere is
+        not snapshotted). The listing cannot tell who created an entry:
+        a user, a sync client, or a background job that adds a top-level entry
+        while the call runs is recorded as the agent's. A name that held a user's
+        object (present at `session_start`, or in any earlier listing) is never
+        recorded, so a `git stash -u` / `git stash pop` round trip cannot make the
+        user's files look agent-made. A same-name replacement (`sed -i`, atomic
+        saves) is recorded only for a path the same action's claim covered.
+        Creations need a fresh modification time as well as a fresh birth time, so
+        files copied from elsewhere with their old mtimes (`mv` across devices,
+        `cp -p`, `tar x`) get no claim. The record is evidence
+        for Jev, not proof.
+      - Relative operands resolve only after a leading `cd` to a plain
+        absolute folder joined by `&&` alone, with no other `cd`, `pushd`, or
+        `popd` in the action.
+      - Claims may come from the guarded start of an action whose later part is
+        unreadable (`rm -rf out && timeout 400 pwsh -File run.ps1 | tail`), only
+        when nothing in the rest visibly deletes, moves, or overwrites files. The
+        rest is never analysed, may change any file, and blocks parallel
+        file-changing calls for as long as it runs.
       - The record is lost on restart.
       - Platforms without real birth times record nothing.
 
