@@ -1178,6 +1178,11 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
           : [],
       });
       if (waitReason) return finalBlock(waitReason);
+      // A call that may restore data from outside the session (`git stash
+      // pop`, an extract) overlaps any snapshot open beside it.
+      if (event.toolName === "bash" && typeof input.command === "string" && restoresData(input.command)) {
+        createdPaths.markRestoring(id);
+      }
       if (event.toolName === "bash" && typeof input.command === "string") {
         // A bash call that may change files also gets a before/after listing
         // of the session cwd, the one folder with a session-start baseline.
