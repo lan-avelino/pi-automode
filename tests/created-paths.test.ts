@@ -1724,12 +1724,21 @@ test("restoresData names the commands that bring content back from outside the s
 		"cpio -i < a.cpio", "pax -r < a.pax", "jar xf a.jar", "unrar x a.rar", "zcat a.gz > x", "gzcat a.gz", "xzcat a.xz",
 		"zstdcat a.zst", "bzcat a.bz2", "scp host:f .", "sftp host", "curl -o f http://h/f", "wget http://h/f",
 		"echo tar",
+		// Reads that run a program or write a file.
+		"git -p log", "git --paginate diff", "git -p -C /w status", "git --paginate log -1",
+		"GIT_PAGER=less git log", "PAGER=x git diff", "GIT_EXTERNAL_DIFF=x git diff", "GIT_CONFIG_COUNT=1 git status",
+		"GIT_CONFIG_KEY_0=a GIT_CONFIG_VALUE_0=b git log", "FOO=1 git status", "env GIT_PAGER=x git log", "env FOO=1 git diff",
+		"sudo GIT_PAGER=x git log",
+		"git diff --output=f", "git diff --output f", "git log --output=f", "git show --output=f HEAD", "git diff --ext-diff",
+		"git log -p --textconv", "git show --textconv HEAD:a", "git diff --stat --output=/tmp/x",
+		"git grep -O x", "git grep -Oless x", "git grep -nOless x", "git grep --open-files-in-pager x", "git grep --open-files-in-pager=less x",
 	]) {
 		assert.equal(restoresData(command), true, command);
 	}
 	for (const command of [
 		// Plain reads still get a snapshot.
 		"git status", "git status && pwsh x", "git diff > /dev/null", "git diff --stat", "git log -1", "git log --merge",
+		"git log -1 --oneline", "git --no-pager log -1", "git diff --name-only", "git show --stat HEAD", "git grep -n x", "git grep -i foo -- src",
 		"git show HEAD:a", "git rev-parse HEAD", "git ls-files", "git ls-tree HEAD", "git blame f", "git grep x",
 		"git describe --tags", "git shortlog -s", "git cat-file -p HEAD", "git rev-list HEAD", "git merge-base a b",
 		"git for-each-ref", "git name-rev HEAD", "git -C /w status", "git --no-pager log -1", "git -P diff",
@@ -1880,4 +1889,52 @@ test("endTurn forgets restoring calls, like the running set", async () => {
 	env.paths.endTurn();
 	await snapshotX(env, restoredAndMade(env));
 	assert.deepEqual(env.paths.recordedPaths().sort(), [`${WORK}/notes.md`, `${WORK}/script-made.txt`]);
+});
+
+// Review round 6.
+
+test("a restoring call admitted while complete lists the folder still overlaps it", async () => {
+	for (const restoring of [true, false]) {
+		const base = await workEnv();
+		const fs = base.fs;
+		let armed = false;
+		let paths: CreatedPaths;
+		const watching = Object.assign(Object.create(fs), {
+			readdir: async (path: string) => {
+				const names = await fs.readdir(path);
+				if (armed && path === WORK) {
+					armed = false;
+					if (restoring) paths.markRestoring("y"); // admitted mid-completion, pending entry already gone
+				}
+				return names;
+			},
+		}) as FakeFs;
+		paths = new CreatedPaths({ fs: watching, now: () => new Date(fs.clock) });
+		paths.setUsable(true);
+		await paths.baseline(WORK);
+		const input = { command: "pwsh -File t.ps1" };
+		await paths.prepare("x", undefined, input, { claims: [], lines: [] }, [WORK]);
+		fs.tick(5);
+		fs.write(`${WORK}/notes.md`, 7).write(`${WORK}/script-made.txt`, 1);
+		fs.tick(5);
+		armed = true;
+		await paths.complete("x", input);
+		assert.deepEqual(
+			paths.recordedPaths(),
+			restoring ? [] : [`${WORK}/notes.md`, `${WORK}/script-made.txt`].sort(),
+			restoring ? "overlapped" : "control",
+		);
+	}
+});
+
+test("a restoring call running beside the completing call (not its codemode parent) overlaps it", async () => {
+	const env = await workEnv();
+	env.paths.markRestoring("parent"); // a codemode parent id is not beside "parent/1"
+	const input = { command: "pwsh x" };
+	await env.paths.prepare("parent/1", undefined, input, { claims: [], lines: [] }, [WORK]);
+	env.fs.tick(5);
+	env.fs.write(`${WORK}/made.txt`, 1);
+	env.fs.tick(5);
+	await env.paths.complete("parent/1", input);
+	assert.deepEqual(env.paths.recordedPaths(), [`${WORK}/made.txt`]);
 });

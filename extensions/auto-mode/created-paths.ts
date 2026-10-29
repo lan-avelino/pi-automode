@@ -534,10 +534,17 @@ const GIT_READ_ONLY = new Set([
   "status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree", "blame", "grep", "describe",
   "shortlog", "cat-file", "rev-list", "merge-base", "for-each-ref", "name-rev",
 ]);
-/** Global options that take no value and cannot rename a subcommand. */
+/**
+ * Global options that take no value and cannot run a program. `-p` and
+ * `--paginate` are left out: they start a pager.
+ */
 const GIT_PLAIN_GLOBALS = new Set([
-  "--no-pager", "-P", "--paginate", "-p", "--no-optional-locks", "--no-replace-objects", "--literal-pathspecs",
+  "--no-pager", "-P", "--no-optional-locks", "--no-replace-objects", "--literal-pathspecs",
 ]);
+/** `diff`, `log`, `show` options that write a file or run a program. */
+const GIT_DIFF_RUNNERS = /^(--output(=.*)?|--ext-diff|--textconv)$/;
+/** `git grep -O[CMD]` and `--open-files-in-pager[=CMD]` run a program. */
+const GIT_GREP_RUNNERS = /^(-[a-zA-Z]*O|--open-files-in-pager)/;
 const GIT_BRANCH_LISTING = new Set([
   "-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "-l", "--show-current", "--no-color",
   "--color", "--merged", "--no-merged", "--contains", "--no-contains",
@@ -546,6 +553,10 @@ const GIT_CONFIG_READING = new Set(["--get", "--get-all", "--get-regexp", "--lis
 
 /** True when a `git` subcommand and its arguments only list or read. */
 function gitReadsOnly(subcommand: string, rest: string[]): boolean {
+  if (subcommand === "diff" || subcommand === "log" || subcommand === "show") {
+    return !rest.some((word) => GIT_DIFF_RUNNERS.test(word));
+  }
+  if (subcommand === "grep") return !rest.some((word) => GIT_GREP_RUNNERS.test(word));
   if (GIT_READ_ONLY.has(subcommand)) return true;
   const options = rest.every((word) => word.startsWith("-"));
   switch (subcommand) {
@@ -631,9 +642,11 @@ export function restoresData(source: string): boolean {
     if (words.some((word) => RESTORING_COMMANDS.has(word))) return true;
     // Every `git` word starts an invocation, wrappers included (`sudo git ...`).
     for (const [index, word] of command.words.entries()) {
-      if (word.slice(word.lastIndexOf("/") + 1) === "git" && gitMayRestore(command.words.slice(index + 1))) {
-        return true;
-      }
+      if (word.slice(word.lastIndexOf("/") + 1) !== "git") continue;
+      // `GIT_PAGER=…`, `PAGER=…`, `GIT_EXTERNAL_DIFF=…`, `GIT_CONFIG_*=…`, any `VAR=…`
+      // before `git` (a prefix assignment, or after `env`) can make a read run a program.
+      if (command.words.slice(0, index).some((before) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(before))) return true;
+      if (gitMayRestore(command.words.slice(index + 1))) return true;
     }
     return words.some((word) => word === "gzip" || word === "xz" || word === "zstd" || word === "bzip2") &&
       command.words.some((word) => DECOMPRESS_FLAG.test(word));
@@ -1298,7 +1311,7 @@ export class CreatedPaths {
       folders,
       // A restoring call running now, or admitted while the listings ran
       // (even if it has finished since), overlaps this snapshot.
-      restoreOverlapped: this.restoreEpoch !== epoch || [...this.restoring].some((id) => id !== toolCallId),
+      restoreOverlapped: this.restoreEpoch !== epoch || this.restoringBeside(toolCallId),
     });
   }
 
@@ -1397,6 +1410,10 @@ export class CreatedPaths {
     const pending = this.pending.get(toolCallId);
     this.pending.delete(toolCallId);
     if (!pending || !this.usable) return;
+    // The pending entry is gone from here on, so `markRestoring` can no longer
+    // mark it: a restoring call admitted during the awaits below is seen by
+    // its epoch (and by the running set) after the after-listing.
+    const epoch = this.restoreEpoch;
     // Another extension may have changed the input after pi-automode saw it.
     if (JSON.stringify(input) !== pending.inputJson) {
       for (const claim of pending.claimed) this.records.delete(claim.canonical);
@@ -1452,7 +1469,10 @@ export class CreatedPaths {
     }
     const claimed = new Set(pending.claimed.map((claim) => claim.canonical));
     for (const folder of pending.folders) {
-      await this.completeFolder(folder, pending.startMs, at, settled, claimed, pending.restoreOverlapped === true);
+      await this.completeFolder(folder, pending.startMs, at, settled, claimed, pending.restoreOverlapped === true, {
+        toolCallId,
+        epoch,
+      });
     }
   }
 
@@ -1488,6 +1508,7 @@ export class CreatedPaths {
     settled: Set<string>,
     claimed: Set<string>,
     overlapped: boolean,
+    completing: { toolCallId: string; epoch: number },
   ): Promise<void> {
     const folderKey = pathKey(before.real);
     try {
@@ -1499,6 +1520,9 @@ export class CreatedPaths {
       if (await this.fs.realpath(before.real) !== before.real) return;
       const folder = await this.fs.lstat(before.real);
       if (folder.dev !== before.dev || folder.ino !== before.ino) return;
+      // Re-check after the after-listing: a restoring call admitted while it
+      // ran may have restored files before it was taken.
+      overlapped ||= this.restoreEpoch !== completing.epoch || this.restoringBeside(completing.toolCallId);
       const afterCount = new Map<string, number>();
       for (const name of listed.keys()) afterCount.set(pathKey(name), (afterCount.get(pathKey(name)) ?? 0) + 1);
       for (const [key, mark] of before.entries) {
@@ -1544,6 +1568,11 @@ export class CreatedPaths {
     this.pending.delete(toolCallId);
     this.running.delete(toolCallId);
     this.restoring.delete(toolCallId);
+  }
+
+  /** True when a restoring call other than this one (or its codemode parent) is running. */
+  private restoringBeside(toolCallId: string): boolean {
+    return [...this.restoring].some((id) => id !== toolCallId && !toolCallId.startsWith(`${id}/`));
   }
 
   /**
