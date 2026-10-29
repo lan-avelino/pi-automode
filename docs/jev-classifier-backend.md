@@ -1155,9 +1155,11 @@ npm run check
         before/after listing, capped at 5,000 entries; only the cwd, which has a
         session-start baseline, is listed, so a leading `cd` folder elsewhere is
         not snapshotted). An action that may restore data from outside the session
-        (`git stash`, `checkout`, `restore`, `reset`, `pull`, `merge`, `clone`, an
-        archive extract, `rsync`; matched by word) takes no snapshot, so a stash
-        made before the session and popped by the agent is not recorded. A script
+        (any `git` that is not a plain read such as `status`, `diff`, `log`; an
+        archive extract, `rsync`, a download; matched by word) takes no snapshot, so a stash
+        made before the session and popped by the agent is not recorded. A
+        snapshot that overlaps a running restoring call (parallel calls in one
+        batch) records nothing either. A script
         the guard cannot read can still restore data. The listing cannot tell who created an entry:
         a user, a sync client, or a background job that adds a top-level entry
         while the call runs is recorded as the agent's. A name that held a user's

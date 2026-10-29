@@ -524,31 +524,101 @@ export function planActionOrPrefix(source: string): PlannedAction | undefined {
   return whole ? { plan: whole } : planActionPrefix(source);
 }
 
-/** `git` subcommands that bring file content back from outside the session. */
-const GIT_RESTORING = new Set([
-  "stash", "checkout", "switch", "restore", "reset", "pull", "merge", "rebase", "cherry-pick", "apply", "am", "clone",
+/**
+ * `git` subcommands that only read. Any other `git` invocation counts as
+ * restoring (`stash pop`, `checkout`, `restore`, `reset`, `pull`, `merge`,
+ * `clone`, `add`, `commit`, an alias, an unknown form): a deny-list of git
+ * would miss aliases and new subcommands.
+ */
+const GIT_READ_ONLY = new Set([
+  "status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree", "blame", "grep", "describe",
+  "shortlog", "cat-file", "rev-list", "merge-base", "for-each-ref", "name-rev",
 ]);
-/** Archive and sync tools that write files with content from elsewhere. */
+/** Global options that take no value and cannot rename a subcommand. */
+const GIT_PLAIN_GLOBALS = new Set([
+  "--no-pager", "-P", "--paginate", "-p", "--no-optional-locks", "--no-replace-objects", "--literal-pathspecs",
+]);
+const GIT_BRANCH_LISTING = new Set([
+  "-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--list", "-l", "--show-current", "--no-color",
+  "--color", "--merged", "--no-merged", "--contains", "--no-contains",
+]);
+const GIT_CONFIG_READING = new Set(["--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch"]);
+
+/** True when a `git` subcommand and its arguments only list or read. */
+function gitReadsOnly(subcommand: string, rest: string[]): boolean {
+  if (GIT_READ_ONLY.has(subcommand)) return true;
+  const options = rest.every((word) => word.startsWith("-"));
+  switch (subcommand) {
+    case "branch":
+      // `git branch NAME` creates one; `--list PATTERN` lists.
+      return rest.every((word) => GIT_BRANCH_LISTING.has(word)) ||
+        (rest.some((word) => word === "--list" || word === "-l") &&
+          rest.every((word) => GIT_BRANCH_LISTING.has(word) || !word.startsWith("-")));
+    case "tag":
+      return rest.length === 0 || (rest.some((word) => word === "-l" || word === "--list") &&
+        rest.every((word) => ["-l", "--list", "-n", "--contains", "--merged"].includes(word) || !word.startsWith("-")));
+    case "remote":
+      return rest.length === 0 || (options && rest.every((word) => word === "-v" || word === "--verbose")) ||
+        rest[0] === "show" || rest[0] === "get-url";
+    case "config":
+      return rest.length > 0 && GIT_CONFIG_READING.has(rest[0]!);
+    case "stash":
+      return rest[0] === "list";
+    default:
+      return false;
+  }
+}
+
+/**
+ * True when a `git` invocation (the words from `git` on) is not a plain read.
+ * `-c` and `--config-env` count (an alias can rename a subcommand), and so
+ * does any global option or subcommand this cannot place.
+ */
+function gitMayRestore(words: string[]): boolean {
+  let index = 0;
+  while (index < words.length) {
+    const word = words[index]!;
+    if (word === "-C") {
+      index += 2;
+      continue;
+    }
+    if (/^-c/.test(word) || word.startsWith("--config-env")) return true;
+    if (GIT_PLAIN_GLOBALS.has(word)) {
+      index += 1;
+      continue;
+    }
+    if (word.startsWith("-")) return true;
+    return !gitReadsOnly(word, words.slice(index + 1));
+  }
+  return true; // `git` with no subcommand: cannot tell
+}
+
+/** Archive, sync, and download tools that write files with content from elsewhere. */
 const RESTORING_COMMANDS = new Set([
   "tar", "unzip", "bsdtar", "ditto", "rsync", "7z", "7za", "gunzip", "unxz", "unzstd", "bunzip2",
+  "cpio", "pax", "jar", "unrar", "zcat", "gzcat", "xzcat", "zstdcat", "bzcat", "scp", "sftp", "curl", "wget",
 ]);
 /** `-d`, `-dk`, `--decompress`, `--uncompress` for `gzip`, `xz`, `zstd`, and `bzip2`. */
 const DECOMPRESS_FLAG = /^(-[a-zA-Z]*d|--decompress|--uncompress)/;
 
 /**
  * True when a bash action may bring file content back from outside the
- * session: `git stash pop`, `checkout`, `restore`, `reset`, `pull`, a clone, an
- * archive extract, an `rsync`. The restored files are new objects with fresh
- * birth and modification times, and nothing in this session's listings
+ * session: any `git` that is not a plain read (`stash pop`, `checkout`,
+ * `restore`, `reset`, `pull`, a clone, `-c` with an alias), an archive
+ * extract, an `rsync`, a download. The restored files are new objects with
+ * fresh birth and modification times, and nothing in this session's listings
  * names them, so a directory snapshot would record the user's data as created
- * by the agent. Such an action gets no snapshot. Plan-recorded creations are
+ * by the agent. Such an action gets no snapshot, and a snapshot that overlaps
+ * a running one records nothing either. Plan-recorded creations are
  * unaffected.
  *
  * Words are matched by basename, nested commands included, so `sudo git stash
  * pop` and `timeout 5 tar x` count. An action that cannot be parsed, or that
  * runs a script the parser cannot read (`bash -c "$X"`), counts too: fail
- * closed. A script the guard cannot read (`pwsh -File restore.ps1`) can still
- * restore data; that is the same class as the unanalysed rest of an action.
+ * closed. This is a deny-list: a script the guard cannot read (`pwsh -File
+ * restore.ps1`) can still restore data, the same class as the unanalysed rest
+ * of an action. A full allow-list was rejected: it would disable C for
+ * `pwsh -File` and similar runners, the case C exists for.
  */
 export function restoresData(source: string): boolean {
   const analysis = analyzeBash(source);
@@ -559,7 +629,12 @@ export function restoresData(source: string): boolean {
       word.slice(word.lastIndexOf("/") + 1)
     );
     if (words.some((word) => RESTORING_COMMANDS.has(word))) return true;
-    if (words.includes("git") && words.some((word) => GIT_RESTORING.has(word))) return true;
+    // Every `git` word starts an invocation, wrappers included (`sudo git ...`).
+    for (const [index, word] of command.words.entries()) {
+      if (word.slice(word.lastIndexOf("/") + 1) === "git" && gitMayRestore(command.words.slice(index + 1))) {
+        return true;
+      }
+    }
     return words.some((word) => word === "gzip" || word === "xz" || word === "zstd" || word === "bzip2") &&
       command.words.some((word) => DECOMPRESS_FLAG.test(word));
   });
@@ -671,6 +746,12 @@ type Pending = {
   claimed: Claim[];
   /** Top-level listings taken at admission, compared at `tool_result`. */
   folders: FolderBefore[];
+  /**
+   * A call that may restore data from outside the session ran, or was admitted,
+   * while this snapshot was open: whatever it restored lands inside this
+   * window and cannot be told from the call's own output. Nothing is recorded.
+   */
+  restoreOverlapped?: boolean;
 };
 
 const DEFAULT_MAX_RECORDS = 500;
@@ -823,6 +904,9 @@ export class CreatedPaths {
   /** Folders whose session-start baseline succeeded: the only ones C records in. */
   private readonly baselined = new Set<string>();
   private readonly running = new Map<string, RunningCall>();
+  /** Admitted calls that may restore data (`restoresData`), until `release`. */
+  private readonly restoring = new Set<string>();
+  private restoreEpoch = 0;
   private usable = false;
 
   constructor(options: CreatedPathsOptions) {
@@ -852,6 +936,7 @@ export class CreatedPaths {
   endTurn(): void {
     this.pending.clear();
     this.running.clear();
+    this.restoring.clear();
   }
 
   /**
@@ -1160,6 +1245,7 @@ export class CreatedPaths {
   ): Promise<void> {
     this.pending.delete(toolCallId);
     if (!this.usable) return;
+    const epoch = this.restoreEpoch;
     const creations: PendingCreation[] = [];
     if (plan) {
       try {
@@ -1210,6 +1296,9 @@ export class CreatedPaths {
       creations,
       claimed: claims.claims,
       folders,
+      // A restoring call running now, or admitted while the listings ran
+      // (even if it has finished since), overlaps this snapshot.
+      restoreOverlapped: this.restoreEpoch !== epoch || [...this.restoring].some((id) => id !== toolCallId),
     });
   }
 
@@ -1363,7 +1452,7 @@ export class CreatedPaths {
     }
     const claimed = new Set(pending.claimed.map((claim) => claim.canonical));
     for (const folder of pending.folders) {
-      await this.completeFolder(folder, pending.startMs, at, settled, claimed);
+      await this.completeFolder(folder, pending.startMs, at, settled, claimed, pending.restoreOverlapped === true);
     }
   }
 
@@ -1384,6 +1473,10 @@ export class CreatedPaths {
    *   edit made in the same window, so even an agent-owned file rewritten
    *   atomically by a script loses its record (it fails safe).
    *
+   * If a call that may restore data overlapped this one (`markRestoring`),
+   * nothing is recorded, but stale records are still deleted and every new or
+   * changed name is tainted.
+   *
    * Any other process that adds an entry to the folder while the call runs is
    * recorded too: the record is evidence for Jev, not proof. Afterwards every
    * name without a valid record is tainted.
@@ -1394,6 +1487,7 @@ export class CreatedPaths {
     at: string,
     settled: Set<string>,
     claimed: Set<string>,
+    overlapped: boolean,
   ): Promise<void> {
     const folderKey = pathKey(before.real);
     try {
@@ -1422,6 +1516,9 @@ export class CreatedPaths {
         }
         // Absent before, or a different object under the same name.
         this.records.delete(canonical);
+        // A restoring call overlapped: record nothing; the taint below keeps
+        // the name from being recorded by a later call.
+        if (overlapped) continue;
         if (afterCount.get(key)! > 1 || before.collisions.has(key)) continue;
         const own = claimed.has(canonical);
         if (!own && (mark || this.isTainted(folderKey, name))) continue;
@@ -1446,6 +1543,21 @@ export class CreatedPaths {
   release(toolCallId: string): void {
     this.pending.delete(toolCallId);
     this.running.delete(toolCallId);
+    this.restoring.delete(toolCallId);
+  }
+
+  /**
+   * Register an admitted call that may restore data from outside the session
+   * (`restoresData`), until `release`. Every open snapshot is marked: what the
+   * call restores would land inside its window. A snapshot prepared while the
+   * call runs is marked too. Call this synchronously at admission.
+   */
+  markRestoring(toolCallId: string): void {
+    this.restoring.add(toolCallId);
+    this.restoreEpoch += 1;
+    for (const pending of this.pending.values()) {
+      if (pending.folders.length > 0) pending.restoreOverlapped = true;
+    }
   }
 
   /** Canonical forms of every path a plan touches, for `admit`. */

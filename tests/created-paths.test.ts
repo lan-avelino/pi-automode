@@ -1712,19 +1712,35 @@ test("restoresData names the commands that bring content back from outside the s
 		"7z x a.7z", "7za x a.7z", "gunzip a.gz", "gzip -d a.gz", "gzip -dk a.gz", "xz -d a.xz", "xz --decompress a.xz",
 		"zstd -d a.zst", "echo hi && git stash pop && pwsh x", "pwsh x | tar x", "echo $(git stash pop)",
 		"pwsh x <<EOF\n$(tar x)\nEOF", "echo 'unterminated", 'bash -c "$X"', "env FOO=1 git stash pop",
+		// Any git that is not a plain read, including ones the old list missed.
+		"git add . && git commit -m x", "git commit -am x", "git fetch", "git submodule update", "git worktree add ../w",
+		"git checkout-index -a", "git read-tree HEAD", "git unpack-file x", "git lfs pull", "git bundle unbundle b",
+		"git branch topic", "git branch -D topic", "git tag v1", "git tag -d v1", "git remote add o u", "git remote set-url o u",
+		"git config user.name x", "git config --unset x", "git stash drop", "git stash push", "git",
+		// An alias can rename a subcommand; global options we cannot place.
+		"git -c alias.st=stash st pop", "git -ccore.x=1 status", "git --config-env=alias.st=X st", "git --git-dir=x status",
+		"git -C /w -c alias.l=stash l", "git --exec-path=x status", "git -C /w stash pop", "git -C /w -C x checkout main",
+		// More archive, sync, and download tools.
+		"cpio -i < a.cpio", "pax -r < a.pax", "jar xf a.jar", "unrar x a.rar", "zcat a.gz > x", "gzcat a.gz", "xzcat a.xz",
+		"zstdcat a.zst", "bzcat a.bz2", "scp host:f .", "sftp host", "curl -o f http://h/f", "wget http://h/f",
+		"echo tar",
 	]) {
 		assert.equal(restoresData(command), true, command);
 	}
 	for (const command of [
-		"git status", "git diff", "git log --merge", "git add . && git commit -m x",
+		// Plain reads still get a snapshot.
+		"git status", "git status && pwsh x", "git diff > /dev/null", "git diff --stat", "git log -1", "git log --merge",
+		"git show HEAD:a", "git rev-parse HEAD", "git ls-files", "git ls-tree HEAD", "git blame f", "git grep x",
+		"git describe --tags", "git shortlog -s", "git cat-file -p HEAD", "git rev-list HEAD", "git merge-base a b",
+		"git for-each-ref", "git name-rev HEAD", "git -C /w status", "git --no-pager log -1", "git -P diff",
+		"git branch", "git branch -a", "git branch --list 'feat/*'", "git branch --show-current", "git branch -vv",
+		"git tag", "git tag -l 'v*'", "git remote", "git remote -v", "git remote show origin", "git remote get-url origin",
+		"git config --get user.name", "git config --list", "git stash list", "git status | wc -l",
 		"pwsh -File run.ps1", "gzip a.txt", "xz a.txt", "zstd a.txt", "python3 -c 'print(1)'", "cd /w && rm -rf out && pwsh x",
 		"ls | wc -l",
 	]) {
 		assert.equal(restoresData(command), false, command);
 	}
-	// Matched by word, so a mere mention counts: conservative.
-	assert.equal(restoresData("echo tar"), true);
-	assert.equal(restoresData("git stash list"), true);
 });
 
 test("on the real filesystem, a stash made before the session is not recorded when the agent pops it", async (t) => {
@@ -1768,4 +1784,100 @@ test("on the real filesystem, a stash made before the session is not recorded wh
 	} finally {
 		rmSync(base, { recursive: true, force: true });
 	}
+});
+
+// Review round 5: a restoring call running beside a snapshot.
+
+/** X's snapshot of the session folder, with `during` run while it is open. */
+async function snapshotX(env: Awaited<ReturnType<typeof workEnv>>, during: () => void, before: () => Promise<void> | void = () => {}) {
+	const input = { command: "pwsh -File t.ps1" };
+	await before();
+	await env.paths.prepare("x", undefined, input, { claims: [], lines: [] }, [WORK]);
+	env.fs.tick(5);
+	during();
+	env.fs.tick(5);
+	await env.paths.complete("x", input);
+	env.paths.release("x");
+}
+
+/** What Y's `git stash pop` and X's script leave behind. */
+const restoredAndMade = (env: Awaited<ReturnType<typeof workEnv>>) => () => {
+	env.fs.write(`${WORK}/notes.md`, 7).write(`${WORK}/script-made.txt`, 1);
+};
+
+test("a restoring call admitted before X's snapshot overlaps it: nothing is recorded, names are tainted", async () => {
+	const env = await workEnv();
+	env.paths.markRestoring("y");
+	await snapshotX(env, restoredAndMade(env));
+	assert.deepEqual(env.paths.recordedPaths(), []);
+	env.paths.release("y");
+	env.fs.tick();
+	// The names stay tainted, so a later call does not record them either.
+	env.fs.rm(`${WORK}/notes.md`).rm(`${WORK}/script-made.txt`);
+	assert.equal(await recordedAfter(env, "notes.md"), false);
+	assert.equal(await recordedAfter(env, "script-made.txt"), false);
+	assert.equal(await recordedAfter(env, "other.txt"), true);
+});
+
+test("a restoring call admitted while X's snapshot is open overlaps it", async () => {
+	const env = await workEnv();
+	await snapshotX(env, () => {
+		env.paths.markRestoring("y");
+		restoredAndMade(env)();
+	});
+	assert.deepEqual(env.paths.recordedPaths(), []);
+});
+
+test("a restoring call that ended before X's snapshot was prepared does not affect X", async () => {
+	const env = await workEnv();
+	env.paths.markRestoring("y");
+	env.fs.write(`${WORK}/notes.md`, 7); // Y's restore, finished
+	env.paths.release("y");
+	env.fs.tick();
+	await snapshotX(env, restoredAndMade(env));
+	// notes.md existed at X's first listing, so it is the user's; the script's file records.
+	assert.deepEqual(env.paths.recordedPaths(), [`${WORK}/script-made.txt`]);
+});
+
+test("a restoring call admitted and released while X's listings run still overlaps", async () => {
+	const base = await workEnv();
+	const fs = base.fs;
+	let once = true;
+	let paths: CreatedPaths;
+	const watching = Object.assign(Object.create(fs), {
+		readdir: async (path: string) => {
+			const names = await fs.readdir(path);
+			if (once && path === WORK) {
+				once = false;
+				paths.markRestoring("y");
+				paths.release("y");
+			}
+			return names;
+		},
+	}) as FakeFs;
+	paths = new CreatedPaths({ fs: watching, now: () => new Date(fs.clock) });
+	paths.setUsable(true);
+	await paths.baseline(WORK);
+	once = true;
+	const env = { fs, paths } as Awaited<ReturnType<typeof workEnv>>;
+	await snapshotX(env, restoredAndMade(env));
+	assert.deepEqual(paths.recordedPaths(), []);
+});
+
+test("an overlapped snapshot still deletes the stale records of what the call removed", async () => {
+	const env = await workEnv();
+	await runSnapshot(env, "pwsh x", [WORK], () => env.fs.write(`${WORK}/out.log`, 3));
+	assert.deepEqual(env.paths.recordedPaths(), [`${WORK}/out.log`]);
+	env.fs.tick();
+	env.paths.markRestoring("y");
+	await snapshotX(env, () => env.fs.rm(`${WORK}/out.log`));
+	assert.deepEqual(env.paths.recordedPaths(), []);
+});
+
+test("endTurn forgets restoring calls, like the running set", async () => {
+	const env = await workEnv();
+	env.paths.markRestoring("y");
+	env.paths.endTurn();
+	await snapshotX(env, restoredAndMade(env));
+	assert.deepEqual(env.paths.recordedPaths().sort(), [`${WORK}/notes.md`, `${WORK}/script-made.txt`]);
 });

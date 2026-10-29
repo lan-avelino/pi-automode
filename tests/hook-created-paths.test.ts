@@ -501,3 +501,77 @@ test("a pre-session stash popped by the agent is not recorded: no snapshot for r
 	await env.bash("rm -rf /work/proj/out /work/proj/log.txt", () => {});
 	assert.equal(lastFacts(env.seen).length, 2);
 });
+
+// Review round 5: a restoring call in the same batch as a snapshotting call.
+
+async function overlapEnv() {
+	const env = await otherFolderEnv();
+	env.fs.tick();
+	return env;
+}
+
+const restoreEffect = (env: Awaited<ReturnType<typeof overlapEnv>>) => () => {
+	env.fs.write("/work/proj/notes.md", 7); // Y's `git stash pop`
+	env.fs.write("/work/proj/script-made.txt", 1); // X's script
+};
+
+async function claimedAfterOverlap(env: Awaited<ReturnType<typeof overlapEnv>>) {
+	env.fs.tick();
+	await env.bash("rm /work/proj/notes.md /work/proj/script-made.txt", () => {});
+	return lastFacts(env.seen);
+}
+
+test("Y (git stash pop) admitted before X (pwsh) is prepared: X records nothing", async () => {
+	const env = await overlapEnv();
+	const y = await env.start("bash", { command: "git stash pop" });
+	const x = await env.start("bash", { command: "pwsh -File t.ps1" });
+	assert.equal(y.result?.block, undefined);
+	assert.equal(x.result?.block, undefined);
+	env.fs.tick(5);
+	restoreEffect(env)();
+	env.fs.tick(5);
+	await env.finish(x.id, "bash", { command: "pwsh -File t.ps1" });
+	await env.finish(y.id, "bash", { command: "git stash pop" });
+	assert.deepEqual(await claimedAfterOverlap(env), []);
+});
+
+test("Y admitted while X is pending: X records nothing", async () => {
+	const env = await overlapEnv();
+	const x = await env.start("bash", { command: "pwsh -File t.ps1" });
+	const y = await env.start("bash", { command: "git stash pop" });
+	env.fs.tick(5);
+	restoreEffect(env)();
+	env.fs.tick(5);
+	await env.finish(y.id, "bash", { command: "git stash pop" });
+	await env.finish(x.id, "bash", { command: "pwsh -File t.ps1" });
+	assert.deepEqual(await claimedAfterOverlap(env), []);
+});
+
+test("a restore that finished before X started does not affect X", async () => {
+	const env = await overlapEnv();
+	const y = await env.start("bash", { command: "git stash pop" });
+	env.fs.tick(5);
+	env.fs.write("/work/proj/notes.md", 7);
+	await env.finish(y.id, "bash", { command: "git stash pop" });
+	env.fs.tick(5);
+	await env.bash("pwsh -File t.ps1", () => env.fs.write("/work/proj/script-made.txt", 1));
+	env.fs.tick();
+	await env.bash("rm /work/proj/script-made.txt", () => {});
+	assert.equal(lastFacts(env.seen).length, 1);
+});
+
+test("a blocked-later restoring call is released by tool_execution_end and agent_end", async () => {
+	const env = await overlapEnv();
+	const y = await env.start("bash", { command: "git stash pop" });
+	await env.fake.emit("tool_execution_end", { type: "tool_execution_end", toolCallId: y.id }, env.ctx);
+	await env.bash("pwsh -File t.ps1", () => env.fs.write("/work/proj/script-made.txt", 1));
+	env.fs.tick();
+	await env.bash("rm /work/proj/script-made.txt", () => {});
+	assert.equal(lastFacts(env.seen).length, 1);
+	await env.start("bash", { command: "git stash pop" });
+	await env.fake.emit("agent_end", { type: "agent_end" }, env.ctx);
+	await env.bash("pwsh -File u.ps1", () => env.fs.write("/work/proj/second.txt", 1));
+	env.fs.tick();
+	await env.bash("rm /work/proj/second.txt", () => {});
+	assert.equal(lastFacts(env.seen).length, 1);
+});
