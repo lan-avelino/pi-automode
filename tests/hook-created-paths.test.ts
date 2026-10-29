@@ -401,7 +401,7 @@ test("session_start lists the session folder, so a user's entry moved away befor
 	// The user stashes outside any call; the first bash call restores them.
 	env.fs.mv("/work/proj/notes.md", "/home/notes.md");
 	env.fs.rm("/work/proj/scratch");
-	await env.bash("git stash pop", () => {
+	await env.bash("cp /home/notes.md /work/proj/notes.md && pwsh x", () => {
 		env.fs.write("/work/proj/notes.md", 7).mkdir("/work/proj/scratch").write("/work/proj/script-made.txt", 1);
 	});
 	env.fs.tick();
@@ -475,4 +475,29 @@ test("a non-cwd cd folder still gets prefix-plan claims for paths a plan recorde
 	// What the script made there was not snapshotted.
 	await env.bash('cd "/other" && rm script-made.txt && pwsh y', () => {});
 	assert.deepEqual(lastFacts(env.seen), []);
+});
+
+// Review round 4: no snapshot for an action that may restore data.
+
+test("a pre-session stash popped by the agent is not recorded: no snapshot for restoring actions", async () => {
+	const env = await otherFolderEnv();
+	env.fs.tick();
+	// notes.md was stashed before the session, so it is absent from the baseline.
+	await env.bash("git stash pop", () => env.fs.write("/work/proj/notes.md", 7));
+	await env.bash("tar xf a.tar --touch && pwsh x", () => env.fs.write("/work/proj/extracted.txt", 1));
+	env.fs.tick();
+	await env.bash("rm /work/proj/notes.md /work/proj/extracted.txt", () => {});
+	assert.deepEqual(lastFacts(env.seen), []);
+	// A read-only git call or a diff still snapshots what a script leaves behind.
+	await env.bash("git status && pwsh run.ps1", () => env.fs.write("/work/proj/made.txt", 1));
+	env.fs.tick();
+	await env.bash("rm /work/proj/made.txt", () => {});
+	assert.equal(lastFacts(env.seen).length, 1);
+	// Plan-recorded creations are unaffected by a restoring action.
+	await env.bash("mkdir /work/proj/out && echo x > /work/proj/log.txt && git stash pop", () => {
+		env.fs.mkdir("/work/proj/out").write("/work/proj/log.txt", 2);
+	});
+	env.fs.tick();
+	await env.bash("rm -rf /work/proj/out /work/proj/log.txt", () => {});
+	assert.equal(lastFacts(env.seen).length, 2);
 });

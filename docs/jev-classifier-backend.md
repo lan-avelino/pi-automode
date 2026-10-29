@@ -1154,7 +1154,11 @@ npm run check
         new top-level entries a `bash` call leaves in the session cwd (a
         before/after listing, capped at 5,000 entries; only the cwd, which has a
         session-start baseline, is listed, so a leading `cd` folder elsewhere is
-        not snapshotted). The listing cannot tell who created an entry:
+        not snapshotted). An action that may restore data from outside the session
+        (`git stash`, `checkout`, `restore`, `reset`, `pull`, `merge`, `clone`, an
+        archive extract, `rsync`; matched by word) takes no snapshot, so a stash
+        made before the session and popped by the agent is not recorded. A script
+        the guard cannot read can still restore data. The listing cannot tell who created an entry:
         a user, a sync client, or a background job that adds a top-level entry
         while the call runs is recorded as the agent's. A name that held a user's
         object (present at `session_start`, or in any earlier listing) is never

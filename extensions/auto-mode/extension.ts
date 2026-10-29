@@ -44,6 +44,7 @@ import {
   type ClaimSet,
   birthTimesUsable as probeBirthTimes,
   planActionOrPrefix,
+  restoresData,
 } from "./created-paths.ts";
 import { describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
@@ -1183,7 +1184,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         // That records what a script the guard cannot read leaves behind. A
         // leading `cd` folder elsewhere is not listed: its earlier history is
         // unseen, so a restored user file would look new.
-        const folders = readOnly || typeof ctx.cwd !== "string" ? [] : [ctx.cwd];
+        // An action that may restore data from outside the session (`git stash
+        // pop`, an archive extract) takes no snapshot at all.
+        const folders = readOnly || typeof ctx.cwd !== "string" || restoresData(input.command) ? [] : [ctx.cwd];
         if (plan || folders.length > 0) await createdPaths.prepare(id, plan, input, claims, folders);
       } else if (
         (event.toolName === "write" || event.toolName === "edit") && typeof ctx.cwd === "string"

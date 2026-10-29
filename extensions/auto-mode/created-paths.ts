@@ -524,6 +524,47 @@ export function planActionOrPrefix(source: string): PlannedAction | undefined {
   return whole ? { plan: whole } : planActionPrefix(source);
 }
 
+/** `git` subcommands that bring file content back from outside the session. */
+const GIT_RESTORING = new Set([
+  "stash", "checkout", "switch", "restore", "reset", "pull", "merge", "rebase", "cherry-pick", "apply", "am", "clone",
+]);
+/** Archive and sync tools that write files with content from elsewhere. */
+const RESTORING_COMMANDS = new Set([
+  "tar", "unzip", "bsdtar", "ditto", "rsync", "7z", "7za", "gunzip", "unxz", "unzstd", "bunzip2",
+]);
+/** `-d`, `-dk`, `--decompress`, `--uncompress` for `gzip`, `xz`, `zstd`, and `bzip2`. */
+const DECOMPRESS_FLAG = /^(-[a-zA-Z]*d|--decompress|--uncompress)/;
+
+/**
+ * True when a bash action may bring file content back from outside the
+ * session: `git stash pop`, `checkout`, `restore`, `reset`, `pull`, a clone, an
+ * archive extract, an `rsync`. The restored files are new objects with fresh
+ * birth and modification times, and nothing in this session's listings
+ * names them, so a directory snapshot would record the user's data as created
+ * by the agent. Such an action gets no snapshot. Plan-recorded creations are
+ * unaffected.
+ *
+ * Words are matched by basename, nested commands included, so `sudo git stash
+ * pop` and `timeout 5 tar x` count. An action that cannot be parsed, or that
+ * runs a script the parser cannot read (`bash -c "$X"`), counts too: fail
+ * closed. A script the guard cannot read (`pwsh -File restore.ps1`) can still
+ * restore data; that is the same class as the unanalysed rest of an action.
+ */
+export function restoresData(source: string): boolean {
+  const analysis = analyzeBash(source);
+  if (analysis.errors.length > 0) return true;
+  return analysis.commands.some((command) => {
+    if (command.dynamicShellScript) return true;
+    const words = [command.name ?? "", command.effectiveCommand.name ?? "", ...command.words].map((word) =>
+      word.slice(word.lastIndexOf("/") + 1)
+    );
+    if (words.some((word) => RESTORING_COMMANDS.has(word))) return true;
+    if (words.includes("git") && words.some((word) => GIT_RESTORING.has(word))) return true;
+    return words.some((word) => word === "gzip" || word === "xz" || word === "zstd" || word === "bzip2") &&
+      command.words.some((word) => DECOMPRESS_FLAG.test(word));
+  });
+}
+
 /** The parts of `fs.Stats` the record uses. */
 export type StatLike = {
   dev: number;

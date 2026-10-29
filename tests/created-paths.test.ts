@@ -8,6 +8,7 @@ import {
 	planAction,
 	planActionOrPrefix,
 	planActionPrefix,
+	restoresData,
 	scopeLine,
 	type ClaimSet,
 } from "../extensions/auto-mode/created-paths.ts";
@@ -1700,4 +1701,71 @@ test("C records only in folders with a session-start baseline", async () => {
 	denied = false;
 	await runSnapshot({ fs, paths } as ReturnType<typeof setup>, "pwsh x", ["/work/other"], () => fs.write("/work/other/new.txt"));
 	assert.deepEqual(paths.recordedPaths(), []);
+});
+
+test("restoresData names the commands that bring content back from outside the session", () => {
+	for (const command of [
+		"git stash pop", "git stash apply", "git -C /w stash pop", "sudo git stash pop", "timeout 5 git checkout main",
+		"git switch x", "git restore .", "git reset --hard HEAD", "git pull", "git merge x", "git rebase main",
+		"git cherry-pick abc", "git apply p.diff", "git am p.mbox", "git clone u d", "/usr/bin/git stash pop",
+		"tar xf a.tar --touch", "timeout 5 tar x", "unzip a.zip", "bsdtar -xf a", "ditto a b", "rsync -a a/ b/",
+		"7z x a.7z", "7za x a.7z", "gunzip a.gz", "gzip -d a.gz", "gzip -dk a.gz", "xz -d a.xz", "xz --decompress a.xz",
+		"zstd -d a.zst", "echo hi && git stash pop && pwsh x", "pwsh x | tar x", "echo $(git stash pop)",
+		"pwsh x <<EOF\n$(tar x)\nEOF", "echo 'unterminated", 'bash -c "$X"', "env FOO=1 git stash pop",
+	]) {
+		assert.equal(restoresData(command), true, command);
+	}
+	for (const command of [
+		"git status", "git diff", "git log --merge", "git add . && git commit -m x",
+		"pwsh -File run.ps1", "gzip a.txt", "xz a.txt", "zstd a.txt", "python3 -c 'print(1)'", "cd /w && rm -rf out && pwsh x",
+		"ls | wc -l",
+	]) {
+		assert.equal(restoresData(command), false, command);
+	}
+	// Matched by word, so a mere mention counts: conservative.
+	assert.equal(restoresData("echo tar"), true);
+	assert.equal(restoresData("git stash list"), true);
+});
+
+test("on the real filesystem, a stash made before the session is not recorded when the agent pops it", async (t) => {
+	const { execFileSync } = await import("node:child_process");
+	const { mkdtempSync, realpathSync, rmSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { NODE_CREATED_PATHS_FS } = await import("../extensions/auto-mode/created-paths.ts");
+	if (!await birthTimesUsable()) {
+		t.skip("this platform does not report real birth times");
+		return;
+	}
+	try {
+		execFileSync("git", ["--version"], { stdio: "pipe" });
+	} catch {
+		t.skip("git is not installed");
+		return;
+	}
+	const base = realpathSync(mkdtempSync(join(tmpdir(), "pi-automode-prestash-")));
+	const sh = (command: string) => execFileSync("sh", ["-c", command], { cwd: base, stdio: "pipe" }).toString();
+	try {
+		sh("git init -q && git config user.email a@b && git config user.name a && echo t > tracked.txt && git add . && git commit -qm init");
+		writeFileSync(join(base, "notes.md"), "user's only copy\n");
+		sh("git stash -u -q"); // before the session: notes.md is absent from the baseline
+		const run = async (command: string, snapshot: boolean) => {
+			const paths = new CreatedPaths({ fs: NODE_CREATED_PATHS_FS });
+			paths.setUsable(true);
+			await paths.baseline(base);
+			// The extension takes no snapshot when the action may restore data.
+			await paths.prepare("c", undefined, { command }, { claims: [], lines: [] }, snapshot ? [base] : []);
+			sh("git stash pop -q");
+			await paths.complete("c", { command });
+			return paths.recordedPaths();
+		};
+		const command = "git stash pop";
+		assert.equal(restoresData(command), true);
+		assert.deepEqual(await run(command, !restoresData(command)), []);
+		// Control: with a snapshot, the restored file would be recorded as created.
+		sh("git stash -u -q");
+		assert.deepEqual((await run(command, true)).map((path) => path.slice(path.lastIndexOf("/") + 1)), ["notes.md"]);
+	} finally {
+		rmSync(base, { recursive: true, force: true });
+	}
 });
