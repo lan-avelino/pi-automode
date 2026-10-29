@@ -7,6 +7,7 @@ type FakeNode = {
 	ino: number;
 	birthtimeMs: number;
 	ctimeMs: number;
+	mtimeMs: number;
 	size: number;
 	nlink: number;
 	target?: string;
@@ -37,6 +38,7 @@ export class FakeFs implements CreatedPathsFs {
 			ino: this.nextIno++,
 			birthtimeMs: this.clock,
 			ctimeMs: this.clock,
+			mtimeMs: this.clock,
 			size: 0,
 			nlink: 1,
 			...extra,
@@ -65,6 +67,7 @@ export class FakeFs implements CreatedPathsFs {
 		if (existing?.kind === "file") {
 			existing.size = size;
 			existing.ctimeMs = this.clock;
+			existing.mtimeMs = this.clock;
 			return this;
 		}
 		this.add(path, this.node("file", { size, ...extra }));
@@ -103,7 +106,7 @@ export class FakeFs implements CreatedPathsFs {
 		return this;
 	}
 
-	/** Rename, keeping birth times; change times move as on a real rename. */
+	/** Rename, keeping birth and modification times; change times move as on a real rename. */
 	mv(from: string, to: string): this {
 		const realFrom = join(this.realSync(dirname(from)), basename(from));
 		const realTo = join(this.realSync(dirname(to)), basename(to));
@@ -161,6 +164,7 @@ export class FakeFs implements CreatedPathsFs {
 			size: node.size,
 			birthtimeMs: node.birthtimeMs,
 			ctimeMs: node.ctimeMs,
+			mtimeMs: node.mtimeMs,
 			isFile: () => node.kind === "file",
 			isDirectory: () => node.kind === "folder",
 			isSymbolicLink: () => node.kind === "symlink",

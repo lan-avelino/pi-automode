@@ -286,7 +286,9 @@ const JEV_STATE_FIELDS =
   "created_this_session means pi-automode saw the path absent before one of the agent's earlier actions in this session " +
   "and present after it, and it is still the same filesystem object. For a file, its size and change time match the " +
   "agent's last recorded write. For a folder, every entry inside was created after the folder. This is evidence, not " +
-  "proof: processes running at the same time are not observed.";
+  "proof: processes running at the same time are not observed. " +
+  "created_this_session_scope, when present, means the claims cover only the commands before the named one: " +
+  "pi-automode did not analyse that command or anything after it, so the rest of the action may do anything.";
 
 const MAX_QUOTED_RULE_CHARS = 120;
 

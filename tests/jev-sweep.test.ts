@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { planActionOrPrefix, scopeLine } from "../extensions/auto-mode/created-paths.ts";
 import {
 	buildJevQuestions,
 	decisionProfile,
@@ -142,6 +143,48 @@ test("caseState renders a case's createdPaths as created_this_session facts", ()
 		cases: [{ ...bashCase(), createdPaths: [{ path: "/tmp/w", kind: "link", how: "mkdir", at: "x" }] }],
 	});
 	assert.equal(errors.length, 1);
+});
+
+test("caseState renders a prefix scope with the real scope line, after the created paths", () => {
+	const state = caseState(
+		bashCase({
+			action: { toolName: "bash", input: { command: "cd /w && rm -rf out && timeout 9 pwsh run.ps1" } },
+			createdPaths: [{ path: "/w/out", kind: "folder", how: "bash command", at: "2026-10-29 10:00" }],
+			createdPathsScope: "timeout",
+		}),
+		baseConfig(),
+	);
+	const lines = state.facts!.split("\n");
+	assert.equal(lines.at(-1), "read_only: unverified");
+	assert.equal(lines.at(-2), scopeLine("timeout"));
+	assert.match(lines.at(-3)!, /^created_this_session: \/w\/out \(folder; .* the agent's bash command at 2026-10-29 10:00;/);
+	// Without a scope no scope line appears.
+	assert.doesNotMatch(caseState(bashCase({
+		createdPaths: [{ path: "/w/out", kind: "folder", how: "bash command", at: "x" }],
+	}), baseConfig()).facts!, /created_this_session_scope/);
+	// A scope needs created paths, and must be a non-empty string.
+	for (const bad of [{ createdPathsScope: "pwsh" }, { createdPathsScope: "", createdPaths: [] }, { createdPathsScope: 5, createdPaths: [{ path: "/w/o", kind: "file", how: "mkdir", at: "x" }] }]) {
+		assert.equal(parseCorpus({ cases: [{ ...bashCase(), ...bad }] }).errors.length, 1, JSON.stringify(bad));
+	}
+});
+
+test("the corpus's prefix cases match what the guard would produce", () => {
+	const raw = JSON.parse(readFileSync(join(HERE, "fixtures/jev-corpus.json"), "utf8"));
+	const { cases } = parseCorpus(raw);
+	const scoped = cases.filter((entry) => entry.createdPathsScope !== undefined);
+	assert.ok(scoped.length >= 4, `only ${scoped.length} scoped cases`);
+	for (const entry of scoped) {
+		const command = entry.action.input.command as string;
+		const planned = planActionOrPrefix(command);
+		assert.ok(planned, entry.name);
+		assert.equal(planned.noClaims, undefined, entry.name);
+		assert.equal(planned.scope, entry.createdPathsScope, entry.name);
+	}
+	// A case with created paths and no scope is a fully guarded action.
+	for (const entry of cases.filter((candidate) => candidate.name.startsWith("session command:"))) {
+		const planned = planActionOrPrefix(entry.action.input.command as string);
+		assert.equal(planned?.scope, entry.createdPathsScope, entry.name);
+	}
 });
 
 test("caseConfig applies a case's trusted hosts to the questions too", () => {

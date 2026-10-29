@@ -14,10 +14,24 @@
 import { chmod, lstat, mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyzeBash, type BashCommandAnalysis } from "./bash.ts";
+import { parse } from "unbash";
+import { analyzeBash, type BashAnalysis, type BashCommandAnalysis } from "./bash.ts";
 import { commandIsReadOnly, isWriteRedirect } from "./facts.ts";
 
-export type CreationHow = "redirect" | "mkdir" | "git worktree add";
+/**
+ * How a path came to exist, worded for the fact line: "the agent's <how> at
+ * <time>". `write tool call` is Pi's `write` tool; `bash command` is a
+ * directory snapshot around a bash call, for outputs the guard cannot read
+ * (a script the command ran).
+ */
+export const CREATION_HOWS = [
+  "redirect",
+  "mkdir",
+  "git worktree add",
+  "write tool call",
+  "bash command",
+] as const;
+export type CreationHow = typeof CREATION_HOWS[number];
 
 /** What a guarded bash action creates, removes, writes, and links. */
 export type ActionPlan = {
@@ -88,11 +102,22 @@ function refusedStructure(token: string): boolean {
 type CommandEffect = Partial<ActionPlan> | undefined;
 
 /**
+ * An operand as an absolute path. With a verified leading `cd`, a relative
+ * operand is joined to its folder. Without one the operand is returned as it
+ * is, and the path rules refuse it. `~` is never joined: the shell would
+ * expand it to the home folder.
+ */
+function resolveOperand(base: string | undefined, operand: string): string {
+  if (base === undefined || operand.startsWith("/") || operand.startsWith("~")) return operand;
+  return `${base}/${operand}`;
+}
+
+/**
  * The effect of one command, or undefined when the guard refuses it. Only
  * the table commands create or remove paths; every other command must print
  * or only read.
  */
-function commandEffect(command: BashCommandAnalysis): CommandEffect {
+function commandEffect(command: BashCommandAnalysis, base: string | undefined): CommandEffect {
   const name = command.name;
   if (!name || command.dynamicName) return undefined;
   // `VAR=value cmd` or a bare assignment can change PATH for later commands.
@@ -112,8 +137,12 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
   }
   if (name === "rm" || name === "mkdir" || name === "ln") {
     if (command.dynamic) return undefined;
-    const operands = strictOperands(args, OPTIONS[name]);
-    if (!operands || operands.length === 0) return undefined;
+    const found = strictOperands(args, OPTIONS[name]);
+    if (!found || found.length === 0) return undefined;
+    // `ln -s TARGET LINK`: TARGET is stored as written, only LINK is a path.
+    const operands = name === "ln"
+      ? [found[0]!, ...found.slice(1).map((operand) => resolveOperand(base, operand))]
+      : found.map((operand) => resolveOperand(base, operand));
     if (name === "ln") {
       // Only options count: after `--`, `-n` is a file name.
       const end = args.indexOf("--");
@@ -134,6 +163,8 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
   }
   if (name === "git") {
     let rest = args;
+    // `git -C DIR` moves the base of its own relative paths.
+    const gitBase = rest[0] === "-C" ? undefined : base;
     if (rest[0] === "-C") rest = rest.slice(2);
     if (rest[0] !== "worktree") return commandIsReadOnly(command, false) ? {} : undefined;
     if (command.dynamic || args.length === 0) return undefined;
@@ -142,7 +173,8 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
       return strictOperands(worktreeArgs, OPTIONS.worktreeList)?.length === 0 ? {} : undefined;
     }
     if (subcommand === "remove") {
-      const operands = strictOperands(worktreeArgs, OPTIONS.worktreeRemove);
+      const operands = strictOperands(worktreeArgs, OPTIONS.worktreeRemove)
+        ?.map((operand) => resolveOperand(gitBase, operand));
       return operands?.length === 1 && isPlainAbsolutePath(operands[0]!)
         ? { removals: operands }
         : undefined;
@@ -150,8 +182,9 @@ function commandEffect(command: BashCommandAnalysis): CommandEffect {
     if (subcommand === "add") {
       const operands = strictOperands(worktreeArgs, OPTIONS.worktreeAdd);
       if (!operands || operands.length < 1 || operands.length > 2) return undefined;
-      if (!isPlainAbsolutePath(operands[0]!)) return undefined;
-      return { creations: [{ path: operands[0]!, how: "git worktree add" }] };
+      const path = resolveOperand(gitBase, operands[0]!);
+      if (!isPlainAbsolutePath(path)) return undefined;
+      return { creations: [{ path, how: "git worktree add" }] };
     }
     return undefined;
   }
@@ -187,6 +220,68 @@ export function rerouteFree(plan: ActionPlan): boolean {
   return !plan.links.some((link) => keys.has(pathKey(link)));
 }
 
+const DIRECTORY_CHANGERS = new Set(["cd", "pushd", "popd"]);
+
+/** The folder of a plain `cd` command (see `leadingCdDirectory`), or undefined. */
+function plainCdFolder(cd: BashCommandAnalysis | undefined): string | undefined {
+  if (!cd || cd.name !== "cd" || cd.words[0] !== "cd" || cd.dynamic || cd.dynamicName) return undefined;
+  if (cd.words.length !== cd.args.length + 1 || cd.args.length !== 1) return undefined;
+  const folder = cd.args[0]!;
+  if (folder.startsWith("-") || !isPlainAbsolutePath(folder)) return undefined;
+  if (cd.redirects.length > 0 || cd.effectiveCommand.name !== "cd") return undefined;
+  return folder;
+}
+
+/** True for `cd`, `pushd`, `popd`, also through `command`, `env`, or a path. */
+function changesDirectory(command: BashCommandAnalysis): boolean {
+  return DIRECTORY_CHANGERS.has(command.name ?? "") ||
+    DIRECTORY_CHANGERS.has(command.effectiveCommand.name ?? "") ||
+    command.effectiveCommand.unresolvedTransparentDispatch;
+}
+
+/**
+ * The folder of a leading `cd`, when it can be trusted as the folder every
+ * later command runs in. All of these must hold:
+ *
+ * - the action is one statement, a chain of commands joined only by `&&`, and
+ *   the first is a plain `cd` with no redirect, so a failed `cd` stops
+ *   everything after it;
+ * - the `cd` has exactly one literal operand, no option, and that operand is
+ *   a plain absolute path (so not `-`, `..`, `~`, or a glob);
+ * - no other command in the action is `cd`, `pushd`, or `popd`, even through
+ *   `command`, `env`, a pipe, or a substitution.
+ *
+ * A relative path does not pass: the folder Pi's bash tool starts in is not
+ * something this module has verified.
+ */
+export function leadingCdDirectory(
+  source: string,
+  analysis: BashAnalysis = analyzeBash(source),
+): string | undefined {
+  if (analysis.errors.length > 0) return undefined;
+  const [cd, ...rest] = analysis.commands;
+  const folder = plainCdFolder(cd);
+  if (folder === undefined || rest.some(changesDirectory)) return undefined;
+  // The structure: one statement, `&&` all the way, and the `cd` first.
+  try {
+    const script = parse(source);
+    if (script.commands.length !== 1) return undefined;
+    const statement = script.commands[0]!;
+    if (statement.type !== "Statement" || statement.background || statement.redirects.length > 0) {
+      return undefined;
+    }
+    const chain = statement.command;
+    if (chain.type !== "AndOr" || !chain.operators.every((operator) => operator === "&&")) {
+      return undefined;
+    }
+    const first = chain.commands[0];
+    if (first?.type !== "Command" || first.prefix.length > 0 || first.pos !== cd!.pos) return undefined;
+  } catch {
+    return undefined;
+  }
+  return folder;
+}
+
 /**
  * Parse a bash action and return what it creates, removes, writes, and
  * links, or undefined when any part of it is outside the guard. See the
@@ -196,10 +291,11 @@ export function planAction(source: string): ActionPlan | undefined {
   const analysis = analyzeBash(source);
   if (analysis.errors.length > 0 || analysis.commands.length === 0) return undefined;
   if (analysis.structure.some(refusedStructure)) return undefined;
+  const base = leadingCdDirectory(source, analysis);
 
   const plan: ActionPlan = { creations: [], removals: [], writes: [], links: [] };
   for (const command of analysis.commands) {
-    const effect = commandEffect(command);
+    const effect = commandEffect(command, base);
     if (!effect) return undefined;
     plan.creations.push(...effect.creations ?? []);
     plan.removals.push(...effect.removals ?? []);
@@ -207,15 +303,266 @@ export function planAction(source: string): ActionPlan | undefined {
   }
   for (const redirect of analysis.redirects) {
     if (!isWriteRedirect(redirect)) continue;
-    const target = redirect.target;
-    if (redirect.targetDynamic || target === undefined) return undefined;
-    if (target === "/dev/null") continue;
+    if (redirect.targetDynamic || redirect.target === undefined) return undefined;
+    if (redirect.target === "/dev/null") continue;
+    const target = resolveOperand(base, redirect.target);
     if (!isPlainAbsolutePath(target)) return undefined;
     if (plan.writes.includes(target)) continue;
     plan.writes.push(target);
     plan.creations.push({ path: target, how: "redirect" });
   }
   return rerouteFree(plan) ? plan : undefined;
+}
+
+/**
+ * What a guarded action's leading commands do, plus what could not be read.
+ * `scope` is set when the plan covers only a prefix: it names the first
+ * command pi-automode did not analyse. `noClaims` is set when something in
+ * the unanalysed rest could delete, move, or overwrite files in a way a claim
+ * would read as cover for; the plan is still used for recording.
+ */
+export type PlannedAction = { plan: ActionPlan; scope?: string; noClaims?: true };
+
+/** Commands the whole action may not contain: they run text or run later. */
+function refusedAnywhere(command: BashCommandAnalysis): boolean {
+  const names = [command.name, command.effectiveCommand.name, ...command.words];
+  return command.dynamicShellScript || names.some((name) => name === "eval" || name === "trap" || name === "exec");
+}
+
+/**
+ * Commands that delete, move, overwrite, truncate, copy over, or link files.
+ * A deny-list: it leaks by construction (interpreters, scripts, unlisted
+ * tools), so it only keeps a claim line off the visible cases.
+ */
+const DELETING_COMMANDS = new Set([
+  "rm", "rmdir", "unlink", "shred", "mv",
+  "grm", "grmdir", "gunlink", "gshred", "gmv",
+  "srm", "trash",
+  "tee", "truncate", "dd", "cp", "install", "rsync", "ln",
+]);
+const FIND_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir"]);
+/** `git` subcommands that discard or replace working-tree files or stash them away. */
+const GIT_DESTRUCTIVE = new Set(["clean", "rm", "checkout", "restore", "stash"]);
+/** `sed -i`, `sed -i.bak`, `sed -ni`, `perl -pi`, `--in-place`. */
+const IN_PLACE_FLAG = /^(-[a-zA-Z]*i|--in-place)/;
+
+/**
+ * True when an unanalysed command visibly deletes, moves, or overwrites
+ * files, or its name is not known: a claim line next to it would read as
+ * cover for it. Every word counts, so `xargs rm`, `sudo rm`, and
+ * `timeout 5 rm` are caught.
+ */
+function visiblyDeletes(command: BashCommandAnalysis): boolean {
+  if (command.dynamicName) return true;
+  const words = [command.name ?? "", command.effectiveCommand.name ?? "", ...command.words].map((word) =>
+    word.slice(word.lastIndexOf("/") + 1)
+  );
+  if (words.some((word) => DELETING_COMMANDS.has(word))) return true;
+  if (words.includes("find") && command.words.some((word) => FIND_ACTIONS.has(word))) return true;
+  if ((words.includes("sed") || words.includes("perl")) && command.words.some((word) => IN_PLACE_FLAG.test(word))) {
+    return true;
+  }
+  if (words.includes("git")) {
+    if (command.words.some((word) => GIT_DESTRUCTIVE.has(word))) return true;
+    if (command.words.includes("worktree") && command.words.includes("remove")) return true;
+    if (command.words.includes("reset") && command.words.includes("--hard")) return true;
+  }
+  return false;
+}
+
+/** The effects of one top-level simple command, with its write redirects. */
+function itemEffect(
+  analysis: BashAnalysis,
+  node: { pos: number; end: number },
+  base: string | undefined,
+): { plan: ActionPlan; redirects: BashCommandAnalysis["redirects"] } | undefined {
+  const commands = analysis.commands.filter((command) => command.pos >= node.pos && command.end <= node.end);
+  if (commands.length === 0) return undefined;
+  const plan: ActionPlan = { creations: [], removals: [], writes: [], links: [] };
+  for (const command of commands) {
+    const effect = commandEffect(command, base);
+    if (!effect) return undefined;
+    plan.creations.push(...effect.creations ?? []);
+    plan.removals.push(...effect.removals ?? []);
+    plan.links.push(...effect.links ?? []);
+    for (const redirect of command.redirects) {
+      if (!isWriteRedirect(redirect)) continue;
+      if (redirect.targetDynamic || redirect.target === undefined) return undefined;
+      const target = resolveOperand(base, redirect.target);
+      if (!isPlainAbsolutePath(target)) return undefined;
+      if (plan.writes.includes(target)) continue;
+      plan.writes.push(target);
+      plan.creations.push({ path: target, how: "redirect" });
+    }
+  }
+  return { plan, redirects: commands.flatMap((command) => command.redirects) };
+}
+
+const SCOPE_NAME = /^[A-Za-z0-9._+-]{1,40}$/;
+
+/**
+ * Plan the leading part of an action whose later part the guard cannot read,
+ * such as `cd D && rm -rf out && timeout 400 pwsh -File run.ps1 | tail`.
+ *
+ * The prefix is the leading run of top-level items that each pass the guard.
+ * Items are joined by `&&`, `||`, or `;`, and each is a simple command: a
+ * loop, `if`, `case`, group, subshell, function, or pipeline is never part of
+ * the prefix, because it can run again later or beside unanalysed code. The
+ * prefix runs before any unanalysed command, so removals in it act on what
+ * the claims describe. The whole action must still pass the structural
+ * refusals: no background, coprocess, function, nested shell, `eval`, `trap`,
+ * or `exec` anywhere, and no redirect on a compound statement.
+ *
+ * A relative operand resolves only against a leading `cd` that every item up
+ * to it follows through `&&` alone, when nothing later changes directory.
+ *
+ * With claims from a prefix, `scope` names the first unanalysed command.
+ * `noClaims` is set when the rest could delete, move, or overwrite files, or
+ * has a command of unknown name.
+ */
+export function planActionPrefix(source: string): PlannedAction | undefined {
+  const analysis = analyzeBash(source);
+  if (analysis.errors.length > 0 || analysis.commands.length === 0) return undefined;
+  if (analysis.structure.some(refusedStructure)) return undefined;
+  if (analysis.commands.some(refusedAnywhere)) return undefined;
+
+  let items: Array<{ node: { type: string; pos: number; end: number; commands?: unknown[] }; inCdRun: boolean }>;
+  try {
+    const script = parse(source);
+    items = [];
+    for (const [index, statement] of script.commands.entries()) {
+      if (statement.type !== "Statement" || statement.background || statement.redirects.length > 0) {
+        return undefined;
+      }
+      const chain = statement.command;
+      if (chain.type !== "AndOr") {
+        items.push({ node: chain, inCdRun: false });
+        continue;
+      }
+      // Items reached from the first one through `&&` alone run only if it succeeded.
+      let run = index === 0;
+      for (const [position, node] of chain.commands.entries()) {
+        if (position > 0 && chain.operators[position - 1] !== "&&") run = false;
+        items.push({ node, inCdRun: run });
+      }
+    }
+  } catch {
+    return undefined;
+  }
+
+  const [first, ...laterCommands] = analysis.commands;
+  const folder = items[0]?.node.type === "Command" && first?.pos === items[0].node.pos
+    ? plainCdFolder(first)
+    : undefined;
+  const base = folder !== undefined && !laterCommands.some(changesDirectory) ? folder : undefined;
+
+  const plan: ActionPlan = { creations: [], removals: [], writes: [], links: [] };
+  const prefixRedirects: BashCommandAnalysis["redirects"] = [];
+  let suffixAt = -1;
+  for (const [index, item] of items.entries()) {
+    const effect = item.node.type === "Command"
+      ? itemEffect(analysis, item.node, item.inCdRun && index > 0 ? base : undefined)
+      : undefined;
+    if (!effect) {
+      suffixAt = index;
+      break;
+    }
+    plan.creations.push(...effect.plan.creations);
+    plan.removals.push(...effect.plan.removals);
+    plan.writes.push(...effect.plan.writes);
+    plan.links.push(...effect.plan.links);
+    prefixRedirects.push(...effect.redirects);
+  }
+  // Everything passed (the whole-action plan refused it) or nothing did.
+  if (suffixAt <= 0) return undefined;
+  if (
+    plan.creations.length + plan.removals.length + plan.writes.length + plan.links.length === 0 ||
+    !rerouteFree(plan)
+  ) return undefined;
+
+  const suffixNode = items[suffixAt]!.node as { type: string; pos: number; commands?: unknown[] };
+  const head = suffixNode.type === "Pipeline"
+    ? analysis.commands.find((command) => command.pos >= suffixNode.pos)
+    : suffixNode.type === "Command"
+    ? analysis.commands.find((command) => command.pos === suffixNode.pos)
+    : undefined;
+  const scope = head?.name !== undefined && SCOPE_NAME.test(head.name) ? head.name : "a command";
+
+  const suffix = analysis.commands.filter((command) => command.pos >= suffixNode.pos);
+  // Fail closed: every command must sit inside a prefix item or at or after
+  // the start of the rest. The parser positions here-doc bodies after their
+  // owner's range, so their commands fall in neither and would escape both the
+  // prefix check and the scan of the rest. (A quoted here-doc body is literal
+  // text and yields no commands.)
+  const prefixNodes = items.slice(0, suffixAt).map((item) => item.node);
+  if (!analysis.commands.every((command) =>
+    command.pos >= suffixNode.pos ||
+    prefixNodes.some((node) => command.pos >= node.pos && command.end <= node.end)
+  )) return undefined;
+  // A write redirect outside the prefix, such as `pwsh > ~/notes.md` or one
+  // on a compound command, may overwrite a file.
+  const unaccounted = new Map<string, number>();
+  const key = (redirect: BashCommandAnalysis["redirects"][number]) =>
+    `${redirect.operator}|${redirect.fileDescriptor ?? ""}|${redirect.target ?? ""}|${redirect.targetDynamic}`;
+  for (const redirect of analysis.redirects.filter(isWriteRedirect)) {
+    unaccounted.set(key(redirect), (unaccounted.get(key(redirect)) ?? 0) + 1);
+  }
+  for (const redirect of prefixRedirects.filter(isWriteRedirect)) {
+    unaccounted.set(key(redirect), (unaccounted.get(key(redirect)) ?? 0) - 1);
+  }
+  const outsideRedirect = [...unaccounted.values()].some((count) => count > 0);
+  return {
+    plan,
+    scope,
+    ...(suffix.some(visiblyDeletes) || outsideRedirect ? { noClaims: true as const } : {}),
+  };
+}
+
+/** The plan of a whole guarded action, or of its guarded prefix. */
+export function planActionOrPrefix(source: string): PlannedAction | undefined {
+  const whole = planAction(source);
+  return whole ? { plan: whole } : planActionPrefix(source);
+}
+
+/** `git` subcommands that bring file content back from outside the session. */
+const GIT_RESTORING = new Set([
+  "stash", "checkout", "switch", "restore", "reset", "pull", "merge", "rebase", "cherry-pick", "apply", "am", "clone",
+]);
+/** Archive and sync tools that write files with content from elsewhere. */
+const RESTORING_COMMANDS = new Set([
+  "tar", "unzip", "bsdtar", "ditto", "rsync", "7z", "7za", "gunzip", "unxz", "unzstd", "bunzip2",
+]);
+/** `-d`, `-dk`, `--decompress`, `--uncompress` for `gzip`, `xz`, `zstd`, and `bzip2`. */
+const DECOMPRESS_FLAG = /^(-[a-zA-Z]*d|--decompress|--uncompress)/;
+
+/**
+ * True when a bash action may bring file content back from outside the
+ * session: `git stash pop`, `checkout`, `restore`, `reset`, `pull`, a clone, an
+ * archive extract, an `rsync`. The restored files are new objects with fresh
+ * birth and modification times, and nothing in this session's listings
+ * names them, so a directory snapshot would record the user's data as created
+ * by the agent. Such an action gets no snapshot. Plan-recorded creations are
+ * unaffected.
+ *
+ * Words are matched by basename, nested commands included, so `sudo git stash
+ * pop` and `timeout 5 tar x` count. An action that cannot be parsed, or that
+ * runs a script the parser cannot read (`bash -c "$X"`), counts too: fail
+ * closed. A script the guard cannot read (`pwsh -File restore.ps1`) can still
+ * restore data; that is the same class as the unanalysed rest of an action.
+ */
+export function restoresData(source: string): boolean {
+  const analysis = analyzeBash(source);
+  if (analysis.errors.length > 0) return true;
+  return analysis.commands.some((command) => {
+    if (command.dynamicShellScript) return true;
+    const words = [command.name ?? "", command.effectiveCommand.name ?? "", ...command.words].map((word) =>
+      word.slice(word.lastIndexOf("/") + 1)
+    );
+    if (words.some((word) => RESTORING_COMMANDS.has(word))) return true;
+    if (words.includes("git") && words.some((word) => GIT_RESTORING.has(word))) return true;
+    return words.some((word) => word === "gzip" || word === "xz" || word === "zstd" || word === "bzip2") &&
+      command.words.some((word) => DECOMPRESS_FLAG.test(word));
+  });
 }
 
 /** The parts of `fs.Stats` the record uses. */
@@ -226,6 +573,8 @@ export type StatLike = {
   size: number;
   birthtimeMs: number;
   ctimeMs: number;
+  /** Modification time: a cross-device `mv` copies it along, unlike the birth time. */
+  mtimeMs: number;
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
@@ -245,6 +594,8 @@ export type Identity = {
   kind: "file" | "folder";
   birthtimeMs: number;
   ctimeMs: number;
+  /** A cross-device `mv` copies it along; the birth time of the copy is fresh. */
+  mtimeMs: number;
   size: number;
   nlink: number;
 };
@@ -281,7 +632,36 @@ type PendingCreation = {
   parentIdentity: { dev: number; ino: number };
   /** `replace` holds the claim's record, which this action may recreate. */
   replace?: CreatedRecord;
+  /**
+   * With `replace`: the call writes in place (Pi's `write` and `edit` tools),
+   * so only the same object may keep the record. Another object means the
+   * path was replaced by something else, and the record goes.
+   */
+  inPlace?: boolean;
 };
+
+/** What the snapshot keeps of an entry: enough to tell a recreation. */
+type EntryMark = { name: string; dev: number; ino: number; birthtimeMs: number };
+
+/** A folder as it was listed before a bash call. */
+type FolderBefore = {
+  /** Real path: the key of every entry recorded from it. */
+  real: string;
+  dev: number;
+  ino: number;
+  /** Keyed by `pathKey(name)`: APFS treats `README.md` and `readme.md` as one name. */
+  entries: Map<string, EntryMark>;
+  /** Keys that two entries of this listing share (a case-sensitive filesystem). */
+  collisions: Set<string>;
+};
+
+/**
+ * Names in a baselined folder that held an object the agent did not
+ * demonstrably make, in any listing this session. C never records one: a user's file that was
+ * moved away or stashed and then restored comes back as a new object, and
+ * would look like a creation. Memory only, cleared with the record.
+ */
+type FolderTaint = { keys: Set<string>; full: boolean };
 
 type Pending = {
   inputJson: string;
@@ -289,11 +669,17 @@ type Pending = {
   creations: PendingCreation[];
   /** Claims that passed the final check: refreshed or expired at `tool_result`. */
   claimed: Claim[];
+  /** Top-level listings taken at admission, compared at `tool_result`. */
+  folders: FolderBefore[];
 };
 
 const DEFAULT_MAX_RECORDS = 500;
 const DEFAULT_MAX_PENDING = 1000;
 const DEFAULT_MAX_WALK_ENTRIES = 20_000;
+const DEFAULT_MAX_SNAPSHOT_ENTRIES = 5_000;
+const DEFAULT_MAX_TAINT_NAMES = 20_000;
+/** Entries examined at once while listing a folder. */
+const LIST_BATCH = 64;
 /** Birth-time slack for clock granularity. */
 const BIRTH_SLACK_MS = 1000;
 
@@ -312,6 +698,7 @@ function identityOf(stat: StatLike): Identity | undefined {
     kind,
     birthtimeMs: stat.birthtimeMs,
     ctimeMs: stat.ctimeMs,
+    mtimeMs: stat.mtimeMs,
     size: stat.size,
     nlink: stat.nlink,
   };
@@ -367,6 +754,14 @@ export function createdPathLine(
     : `created_this_session: ${path} (folder; absent before and present after the agent's ${how} at ${at}; every entry inside was created after the folder)`;
 }
 
+/**
+ * Said when claims come from a prefix of the action: the rest was not read,
+ * so it may do anything, including touching a claimed path.
+ */
+export function scopeLine(firstUnanalysed: string): string {
+  return `created_this_session_scope: claims cover only commands before \`${firstUnanalysed}\`; pi-automode did not analyse that command or anything after it`;
+}
+
 function claimLine(claim: Claim): string {
   const { record } = claim;
   return createdPathLine(claim.path, record.identity.kind, record.how, record.at);
@@ -404,6 +799,10 @@ export type CreatedPathsOptions = {
   maxRecords?: number;
   maxPending?: number;
   maxWalkEntries?: number;
+  /** A folder with more entries than this is not snapshotted. */
+  maxSnapshotEntries?: number;
+  /** A folder with more tainted names than this is fully tainted. */
+  maxTaintNames?: number;
 };
 
 /**
@@ -416,8 +815,13 @@ export class CreatedPaths {
   private readonly maxRecords: number;
   private readonly maxPending: number;
   private readonly maxWalkEntries: number;
+  private readonly maxSnapshotEntries: number;
+  private readonly maxTaintNames: number;
   private readonly records = new Map<string, CreatedRecord>();
   private readonly pending = new Map<string, Pending>();
+  private readonly taint = new Map<string, FolderTaint>();
+  /** Folders whose session-start baseline succeeded: the only ones C records in. */
+  private readonly baselined = new Set<string>();
   private readonly running = new Map<string, RunningCall>();
   private usable = false;
 
@@ -427,6 +831,8 @@ export class CreatedPaths {
     this.maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS;
     this.maxPending = options.maxPending ?? DEFAULT_MAX_PENDING;
     this.maxWalkEntries = options.maxWalkEntries ?? DEFAULT_MAX_WALK_ENTRIES;
+    this.maxSnapshotEntries = options.maxSnapshotEntries ?? DEFAULT_MAX_SNAPSHOT_ENTRIES;
+    this.maxTaintNames = options.maxTaintNames ?? DEFAULT_MAX_TAINT_NAMES;
   }
 
   /** Turn recording and claims on once birth times are known to be real. */
@@ -434,9 +840,11 @@ export class CreatedPaths {
     this.usable = usable;
   }
 
-  /** Forget everything: records, pending entries, and running calls. */
+  /** Forget everything: records, taint, baselines, pending entries, and running calls. */
   clear(): void {
     this.records.clear();
+    this.taint.clear();
+    this.baselined.clear();
     this.endTurn();
   }
 
@@ -514,8 +922,9 @@ export class CreatedPaths {
   }
 
   /**
-   * True when every entry below the folder was created after it, on the same
-   * device, and is a single-link file, a folder, or a symlink. Symlinks are
+   * True when every entry below the folder was created after it (birth time,
+   * and also modification time, which a cross-device `mv` preserves), on the
+   * same device, and is a single-link file, a folder, or a symlink. Symlinks are
    * not followed: `rm -rf` and `git worktree remove` do not follow them.
    */
   private async walkPasses(folder: string, identity: Identity, signal?: AbortSignal): Promise<boolean> {
@@ -529,6 +938,9 @@ export class CreatedPaths {
         const path = joinPath(current, name);
         const stat = await this.fs.lstat(path);
         if (stat.dev !== identity.dev || !(stat.birthtimeMs >= identity.birthtimeMs)) return false;
+        // GNU `mv` across devices copies and unlinks: the copy has a fresh
+        // birth time but keeps its modification time, folders included.
+        if (!(stat.mtimeMs >= identity.birthtimeMs - BIRTH_SLACK_MS)) return false;
         if (stat.isDirectory()) stack.push(path);
         else if (stat.isFile()) {
           if (stat.nlink !== 1) return false;
@@ -546,7 +958,7 @@ export class CreatedPaths {
    * removes under a claim, and must not be a folder (the link would go
    * inside it).
    */
-  async claimsFor(plan: ActionPlan, signal?: AbortSignal): Promise<ClaimSet> {
+  async claimsFor(plan: ActionPlan, signal?: AbortSignal, scope?: string): Promise<ClaimSet> {
     if (!this.usable || this.records.size === 0) return NO_CLAIMS;
     try {
       const canonical = await this.canonicalPlan(plan);
@@ -593,7 +1005,8 @@ export class CreatedPaths {
           return NO_CLAIMS;
         }
       }
-      return { claims, lines: claims.map(claimLine) };
+      if (claims.length === 0) return NO_CLAIMS;
+      return { claims, lines: [...claims.map(claimLine), ...scope === undefined ? [] : [scopeLine(scope)]] };
     } catch {
       return NO_CLAIMS;
     }
@@ -616,63 +1029,267 @@ export class CreatedPaths {
   }
 
   /**
-   * Store what to check at `tool_result`: each creation candidate whose
-   * parent exists, and which is either absent or held a claim that passed the
-   * final check. `claims` must be the set that passed it.
+   * The top-level names of a real folder, with their stats unless it has more
+   * entries than the snapshot cap. An entry that vanishes between the listing
+   * and its `lstat` is left out of `entries`.
+   */
+  private async listing(real: string): Promise<{ names: string[]; entries?: Map<string, StatLike> }> {
+    const names = await this.fs.readdir(real);
+    if (names.length > this.maxSnapshotEntries) return { names };
+    const entries = new Map<string, StatLike>();
+    for (let index = 0; index < names.length; index += LIST_BATCH) {
+      await Promise.all(names.slice(index, index + LIST_BATCH).map(async (name) => {
+        try {
+          entries.set(name, await this.fs.lstat(joinPath(real, name)));
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+      }));
+    }
+    return { names, entries };
+  }
+
+  /** Taint names (by `pathKey`) in a folder; past the cap the whole folder is tainted. */
+  private taintNames(folderKey: string, names: Iterable<string>): void {
+    let taint = this.taint.get(folderKey);
+    if (!taint) this.taint.set(folderKey, taint = { keys: new Set(), full: false });
+    if (taint.full) return;
+    for (const name of names) {
+      taint.keys.add(pathKey(name));
+      if (taint.keys.size > this.maxTaintNames) {
+        taint.full = true;
+        taint.keys.clear();
+        return;
+      }
+    }
+  }
+
+  private isTainted(folderKey: string, name: string): boolean {
+    const taint = this.taint.get(folderKey);
+    return taint !== undefined && (taint.full || taint.keys.has(pathKey(name)));
+  }
+
+  /**
+   * `session_start`: list the session folder once, so names that exist before
+   * the first bash call are covered even if the user moves them away before
+   * it. C records only in folders that had a successful baseline: a folder
+   * first listed later has history this module never saw (a user file moved
+   * out by an earlier call and restored by a later one would look new).
+   *
+   * A missing folder has no names, and counts as baselined. Any other error
+   * fails closed: the folder is fully tainted and not baselined, so nothing is
+   * recorded in it that session.
+   */
+  async baseline(folder: string): Promise<void> {
+    let key = pathKey(folder);
+    try {
+      const real = await this.fs.realpath(folder);
+      key = pathKey(real);
+      this.taintNames(key, await this.fs.readdir(real));
+      this.baselined.add(key);
+    } catch (error) {
+      if (isMissing(error)) {
+        this.baselined.add(key);
+        return;
+      }
+      this.taintNames(key, []);
+      this.taint.get(key)!.full = true;
+    }
+  }
+
+  /**
+   * The listings to compare at `tool_result`; a folder that cannot be listed
+   * is skipped. Every name that holds an object without a valid record is
+   * tainted (see `FolderTaint`).
+   */
+  private async snapshotFolders(folders: string[]): Promise<FolderBefore[]> {
+    const taken: FolderBefore[] = [];
+    const seen = new Set<string>();
+    for (const folder of folders) {
+      try {
+        const real = await this.fs.realpath(folder);
+        const folderKey = pathKey(real);
+        if (seen.has(folderKey)) continue;
+        seen.add(folderKey);
+        // No baseline, no recording: this folder's earlier history is unseen.
+        if (!this.baselined.has(folderKey)) continue;
+        const stat = await this.fs.lstat(real);
+        if (!stat.isDirectory()) continue;
+        const { names, entries: listed } = await this.listing(real);
+        if (!listed) {
+          this.taintNames(folderKey, names);
+          continue;
+        }
+        const entries = new Map<string, EntryMark>();
+        const collisions = new Set<string>();
+        for (const [name, entry] of listed) {
+          const key = pathKey(name);
+          if (entries.has(key)) collisions.add(key);
+          else entries.set(key, { name, dev: entry.dev, ino: entry.ino, birthtimeMs: entry.birthtimeMs });
+        }
+        this.taintNames(folderKey, [...listed].filter(([name, entry]) => {
+          const record = this.records.get(joinPath(real, name));
+          const identity = identityOf(entry);
+          return collisions.has(pathKey(name)) ||
+            !(record && identity && unchanged(record.identity, identity));
+        }).map(([name]) => name));
+        taken.push({ real, dev: stat.dev, ino: stat.ino, entries, collisions });
+      } catch {
+        // No snapshot of this folder.
+      }
+    }
+    return taken;
+  }
+
+  /**
+   * Store what to check at `tool_result`:
+   *
+   * - for a guarded plan, each creation candidate whose parent exists and
+   *   which is either absent or held a claim that passed the final check
+   *   (`claims` must be the set that passed it);
+   * - for each folder in `snapshotFolders`, its top-level listing, so the
+   *   entries the call added or recreated can be recorded even when the guard
+   *   cannot read what the call does (a script it runs).
    */
   async prepare(
     toolCallId: string,
-    plan: ActionPlan,
+    plan: ActionPlan | undefined,
     input: Record<string, unknown>,
     claims: ClaimSet,
+    snapshotFolders: string[] = [],
   ): Promise<void> {
     this.pending.delete(toolCallId);
     if (!this.usable) return;
-    const startMs = this.now().getTime();
     const creations: PendingCreation[] = [];
-    try {
-      const canonical = await this.canonicalPlan(plan);
-      if (!rerouteFree(canonical)) return;
-      const seen = new Set<string>();
-      for (const [index, entry] of plan.creations.entries()) {
-        const path = canonical.creations[index]!.path;
-        if (seen.has(path)) continue;
-        seen.add(path);
-        const parent = parentOf(path);
-        let parentStat: StatLike;
-        try {
-          parentStat = await this.fs.lstat(parent);
-        } catch {
-          continue;
+    if (plan) {
+      try {
+        const canonical = await this.canonicalPlan(plan);
+        if (!rerouteFree(canonical)) return;
+        const seen = new Set<string>();
+        for (const [index, entry] of plan.creations.entries()) {
+          const path = canonical.creations[index]!.path;
+          if (seen.has(path)) continue;
+          seen.add(path);
+          const parent = parentOf(path);
+          let parentStat: StatLike;
+          try {
+            parentStat = await this.fs.lstat(parent);
+          } catch {
+            continue;
+          }
+          if (!parentStat.isDirectory()) continue;
+          const claim = claims.claims.find((candidate) => candidate.canonical === path);
+          let exists = true;
+          try {
+            await this.fs.lstat(path);
+          } catch (error) {
+            if (!isMissing(error)) continue;
+            exists = false;
+          }
+          if (exists && !claim) continue;
+          creations.push({
+            path: entry.path,
+            canonical: path,
+            how: entry.how,
+            parent,
+            parentIdentity: { dev: parentStat.dev, ino: parentStat.ino },
+            ...(claim ? { replace: claim.record } : {}),
+          });
         }
-        if (!parentStat.isDirectory()) continue;
-        const claim = claims.claims.find((candidate) => candidate.canonical === path);
-        let exists = true;
-        try {
-          await this.fs.lstat(path);
-        } catch (error) {
-          if (!isMissing(error)) continue;
-          exists = false;
-        }
-        if (exists && !claim) continue;
-        creations.push({
-          path: entry.path,
-          canonical: path,
-          how: entry.how,
-          parent,
-          parentIdentity: { dev: parentStat.dev, ino: parentStat.ino },
-          ...(claim ? { replace: claim.record } : {}),
-        });
+      } catch {
+        return;
       }
-    } catch {
-      return;
     }
-    this.pending.set(toolCallId, {
+    const folders = await this.snapshotFolders(snapshotFolders);
+    if (!plan && folders.length === 0) return;
+    this.store(toolCallId, {
       inputJson: JSON.stringify(input),
-      startMs,
+      // After the listings, so an entry created while they ran is not
+      // mistaken for the call's own.
+      startMs: this.now().getTime(),
       creations,
       claimed: claims.claims,
+      folders,
     });
+  }
+
+  /**
+   * Store what to check when a `write` or `edit` call finishes. Pi writes
+   * both tools in place, with no temporary file, so the inode does not change.
+   *
+   * - `write` to an absent path in an existing folder: a creation, recorded
+   *   as `write tool call` if the result checks pass.
+   * - `write` or `edit` of a recorded file that is still unchanged: its size
+   *   and change time are refreshed when the call ends.
+   * - `write` or `edit` of a recorded path that is not unchanged any more
+   *   (the user may have changed it): the record is deleted now, for good.
+   *
+   * No claim or fact line comes from these calls; path policy decides them.
+   * `path` must already be resolved the way Pi resolves it.
+   */
+  async prepareFileTool(
+    toolCallId: string,
+    tool: "write" | "edit",
+    path: string,
+    input: Record<string, unknown>,
+  ): Promise<void> {
+    this.pending.delete(toolCallId);
+    if (!this.usable || !isPlainAbsolutePath(path)) return;
+    try {
+      const canonical = await this.canonical(path);
+      const record = this.records.get(canonical);
+      let now: Identity | undefined;
+      let exists = true;
+      try {
+        now = await this.identity(canonical);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        exists = false;
+      }
+      const parent = parentOf(canonical);
+      const parentStat = await this.fs.lstat(parent);
+      if (!parentStat.isDirectory()) return;
+      const parentIdentity = { dev: parentStat.dev, ino: parentStat.ino };
+      const startMs = this.now().getTime();
+      const inputJson = JSON.stringify(input);
+      if (record) {
+        if (!exists || !now || !unchanged(record.identity, now)) {
+          this.records.delete(canonical);
+          return;
+        }
+        if (record.identity.kind !== "file") return;
+        this.store(toolCallId, {
+          inputJson,
+          startMs,
+          creations: [{
+            path,
+            canonical,
+            how: record.how,
+            parent,
+            parentIdentity,
+            replace: record,
+            inPlace: true,
+          }],
+          claimed: [{ path, canonical, record, folderRemoval: false }],
+          folders: [],
+        });
+        return;
+      }
+      if (tool !== "write" || exists) return;
+      this.store(toolCallId, {
+        inputJson,
+        startMs,
+        creations: [{ path, canonical, how: "write tool call", parent, parentIdentity }],
+        claimed: [],
+        folders: [],
+      });
+    } catch {
+      // Nothing is recorded or refreshed.
+    }
+  }
+
+  private store(toolCallId: string, pending: Pending): void {
+    this.pending.set(toolCallId, pending);
     while (this.pending.size > this.maxPending) {
       this.pending.delete(this.pending.keys().next().value!);
     }
@@ -716,8 +1333,12 @@ export class CreatedPaths {
           }
           continue;
         }
+        // A tool that writes in place did not make a different object.
+        if (creation.inPlace) continue;
         if (now.kind === "file" && now.nlink !== 1) continue;
         if (now.birthtimeMs < pending.startMs - BIRTH_SLACK_MS) continue;
+        // A cross-device `mv` into the path keeps the old modification time.
+        if (now.mtimeMs < pending.startMs - BIRTH_SLACK_MS) continue;
         this.remember({
           path: creation.path,
           canonical: creation.canonical,
@@ -739,6 +1360,85 @@ export class CreatedPaths {
         // Missing or unreadable: expire.
       }
       if (this.records.get(claim.canonical) === claim.record) this.records.delete(claim.canonical);
+    }
+    const claimed = new Set(pending.claimed.map((claim) => claim.canonical));
+    for (const folder of pending.folders) {
+      await this.completeFolder(folder, pending.startMs, at, settled, claimed);
+    }
+  }
+
+  /**
+   * Record the top-level entries a bash call added in a folder. An entry
+   * counts only when all of these hold:
+   *
+   * - it is a single-link regular file or a folder, never a symlink;
+   * - its birth time and its modification time both fall inside the call (a
+   *   cross-device `mv` leaves a fresh birth time but the old mtime);
+   * - the folder is still the same real folder as at admission;
+   * - its name is not tainted, and does not collide with another spelling;
+   * - it is absent from the first listing, or it replaced an object that this
+   *   action's own claim covered (the action removed it, a later command in
+   *   it recreated it). Any other same-name replacement is refused: `sed -i`,
+   *   `perl -i`, and atomic saves rename a new file over the user's, and the
+   *   listing cannot tell a script's rewrite of the agent's file from a user
+   *   edit made in the same window, so even an agent-owned file rewritten
+   *   atomically by a script loses its record (it fails safe).
+   *
+   * Any other process that adds an entry to the folder while the call runs is
+   * recorded too: the record is evidence for Jev, not proof. Afterwards every
+   * name without a valid record is tainted.
+   */
+  private async completeFolder(
+    before: FolderBefore,
+    startMs: number,
+    at: string,
+    settled: Set<string>,
+    claimed: Set<string>,
+  ): Promise<void> {
+    const folderKey = pathKey(before.real);
+    try {
+      const { names, entries: listed } = await this.listing(before.real);
+      if (!listed) {
+        this.taintNames(folderKey, names);
+        return;
+      }
+      if (await this.fs.realpath(before.real) !== before.real) return;
+      const folder = await this.fs.lstat(before.real);
+      if (folder.dev !== before.dev || folder.ino !== before.ino) return;
+      const afterCount = new Map<string, number>();
+      for (const name of listed.keys()) afterCount.set(pathKey(name), (afterCount.get(pathKey(name)) ?? 0) + 1);
+      for (const [key, mark] of before.entries) {
+        // Removed during the call: its record, if any, is stale.
+        const path = joinPath(before.real, mark.name);
+        if (!afterCount.has(key) && !settled.has(path)) this.records.delete(path);
+      }
+      for (const [name, stat] of listed) {
+        const key = pathKey(name);
+        const canonical = joinPath(before.real, name);
+        if (settled.has(canonical)) continue;
+        const mark = before.entries.get(key);
+        if (mark && mark.dev === stat.dev && mark.ino === stat.ino && mark.birthtimeMs === stat.birthtimeMs) {
+          continue;
+        }
+        // Absent before, or a different object under the same name.
+        this.records.delete(canonical);
+        if (afterCount.get(key)! > 1 || before.collisions.has(key)) continue;
+        const own = claimed.has(canonical);
+        if (!own && (mark || this.isTainted(folderKey, name))) continue;
+        const identity = identityOf(stat);
+        if (!identity) continue;
+        if (identity.kind === "file" && identity.nlink !== 1) continue;
+        if (identity.birthtimeMs < startMs - BIRTH_SLACK_MS) continue;
+        if (identity.mtimeMs < startMs - BIRTH_SLACK_MS) continue;
+        this.remember({ path: canonical, canonical, identity, how: "bash command", at });
+      }
+      this.taintNames(folderKey, [...listed].filter(([name, stat]) => {
+        const record = this.records.get(joinPath(before.real, name));
+        const identity = identityOf(stat);
+        return afterCount.get(pathKey(name))! > 1 || !(record && identity && unchanged(record.identity, identity));
+      }).map(([name]) => name));
+    } catch {
+      // No records from this folder.
     }
   }
 

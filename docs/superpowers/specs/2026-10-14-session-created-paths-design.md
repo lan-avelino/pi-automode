@@ -259,7 +259,7 @@ Each threat has a test showing that no claim, record, or unsafe allow results.
 | T5 | `touch -d`, `cp -p` to fake times | not in the guard; identity uses `ctimeMs` |
 | T6 | `rm -rf /tmp/paa-r1/evil/../package.json` | path rules |
 | T7 | recorded folder deleted or recreated by the user | identity |
-| T8 | `cd /tmp/paa-r1 && rm -rf build` | relative operand fails the path rules |
+| T8 | `cd /tmp/paa-r1 && rm -rf build` | relative operand fails the path rules. Revision 2026-10-29: this exact form now resolves, because the leading `cd` is verified (see B); `cd X; …`, `cd X \|\| … && …`, a second `cd`, `cd -P`, and `cd X/../Y` still fail |
 | T9 | `mkdir /tmp/s`; `mv ~/thesis /tmp/s/`; `rm -rf /tmp/s` | walk (older entry) |
 | T10 | same, through `rm -rf /tmp/s && mkdir /tmp/s` or `git worktree remove --force` | walk |
 | T11 | T9's `mv` and `rm` as parallel siblings, `mv` checked first; also as concurrent codemode calls | running-calls check (both directions) |
@@ -368,3 +368,132 @@ These cases go into `tests/fixtures/jev-corpus.json`.
 - `docs/configuration.md`: a short note that this is automatic and memory-only.
 - `CHANGELOG.md`.
 - A separate GitHub issue for the `pi-automode-state` forgery exposure.
+
+## Revision: write tool, leading cd, directory snapshot, guarded prefix
+
+**Date:** 2026-10-29
+**Branch:** `feat/created-paths-write-cd-snapshot`
+
+### Why
+
+A real session prompted 24 times for rule 4 on deletions of the agent's own scratch files. No `created_this_session` line was ever produced:
+
+- `.selftest.ps1`, `.mock3.ps1`, `.r3-test.ps1` were made by Pi's `write` tool (some later changed by `edit`);
+- `.r3-out/`, `.r3-compat-out/`, `_native.log`, `.r3-token.txt`, `.r3-compat.ps1` were made by `pwsh` scripts run through `bash`;
+- the deleting commands used relative operands after `cd "<dir>" &&`, and many ended in `timeout 400 pwsh …` or `python3 -c … && pwsh …`, which the guard refuses.
+
+This revision adds four mechanisms. All four are evidence for Jev only. None is a deterministic allow, and none changes thresholds, permission rules, hard-deny checks, or protected-path logic. Every threat T1-T26 still holds.
+
+### Changes to Non-goals
+
+- "Not covered in v1: claims for `write` and `edit` tool calls, relative paths, and paths inside a recorded folder" now reads: not covered are claims for `write` and `edit` calls themselves (they are decided by path policy; this revision only records), relative paths other than after a verified leading `cd`, and paths inside a recorded folder.
+- "No claims for unparsed creations" changes in two ways. The `write` tool now records. A top-level entry a `bash` call leaves in the session cwd (the one folder with a session-start baseline) is recorded even when the guard cannot read the command.
+- "Chained commands with an unguarded command mean no claims" changes: claims may now come from a guarded prefix (D). The removal rule stays all-or-nothing.
+
+### A. The `write` tool
+
+Pi's `write` and `edit` tools write **in place**: `fs.writeFile` on the existing path (`write.js`, `edit.js`; `write` first runs `mkdir -p` on the parent). No temporary file and no rename, so the inode and birth time never change. Only the size and change time move. So this revision refreshes a record only when the same object is still there, and does not accept a replacement object (the brief's rename case is not needed).
+
+At `tool_call`, after the decision allows and the final checks pass, for `write` and `edit`:
+
+- the path is resolved the way Pi resolves it (`resolveToolInputPath`: `@` prefix, `~`, unicode spaces, relative to `ctx.cwd`) and must pass `isPlainAbsolutePath`;
+- `write` to an absent path whose parent exists: a pending creation, `how` = `write tool call`; recorded at `tool_result` under the existing rules (parent real path, dev and ino unchanged; regular file; `nlink === 1`; `birthtimeMs >= startMs - 1000`; input JSON unchanged);
+- `write` or `edit` of a recorded file that is still `unchanged`: the record is refreshed at `tool_result` (new `ctimeMs` and `size`), provided it is still the same object with `nlink === 1`; a different object means the record is deleted;
+- `write` or `edit` of a recorded path that is **not** unchanged (the user may have changed it, decision 2): the record is deleted at once;
+- no claim or fact line is made for these calls.
+
+Fact wording: "absent before and present after the agent's write tool call at …".
+
+### B. Relative operands after a leading `cd`
+
+T8 existed because a failed or misread `cd` would make `build` resolve elsewhere. A relative operand or redirect target now resolves against the leading `cd` folder only when all of these hold:
+
+- the action is one statement, a chain joined by `&&` alone, so a failed `cd` stops everything;
+- its first command is a plain `cd` with one literal operand that passes `isPlainAbsolutePath` (no option, not `-`, not bare, no prefix assignment, no redirect, no `~`, no glob);
+- no other command in the action is `cd`, `pushd`, or `popd`, including through `command`, `env`, a pipe, or `$(…)`;
+- the joined path passes `isPlainAbsolutePath` (so `..`, `.`, empty segments, and globs still fail); an operand starting with `~` is never joined;
+- `git -C DIR` commands keep their relative operands refused: `-C` moves their base.
+
+Without such a `cd`, relative operands fail as before. Resolved paths flow into the reroute rules, claims, and the walk unchanged.
+
+### C. Directory snapshot around `bash` calls
+
+For an allowed `bash` call that may change files (not one whose facts end in `read_only: true`), at the same point `prepare` runs, pi-automode lists the top level of `ctx.cwd` only (never recursive) with an `lstat` of each entry. C records only in folders that had a successful session-start baseline, and today that is `ctx.cwd`. **No snapshot is taken at all for an action that may restore data from outside the session**: any parsed command, nested ones included, with a word (matched by basename, so `sudo git stash pop` and `timeout 5 tar x` count) that is `git` together with `stash`, `checkout`, `switch`, `restore`, `reset`, `pull`, `merge`, `rebase`, `cherry-pick`, `apply`, `am`, or `clone`; `tar`, `unzip`, `bsdtar`, `ditto`, `rsync`, `7z`, `7za`, `gunzip`, `unxz`, `unzstd`, `bunzip2`; or `gzip`, `xz`, `zstd`, `bzip2` with `-d`/`--decompress`. A parse error or a dynamic shell script also counts (fail closed). Without this, a stash made before the session (its entries absent from the baseline) popped by the agent would come back as new, untainted entries with fresh birth and modification times, and a later claimed `rm` would delete the user's only copy. Names that existed before the call stay tainted as before, and plan-recorded creations (`mkdir`, redirects) are unaffected. A leading `cd` folder elsewhere is not listed: it still serves B's relative resolution and plan-recorded creations (`mkdir`, redirects, so a prefix plan can still claim them), but a user file moved out of it by an earlier unguarded call and restored by a later one would look new, because its earlier history was never seen. At `tool_result` it lists again. An entry is recorded (`how` = `bash command`) when:
+
+- it is absent from the first listing; or the same name now holds another object (device, inode, or birth time) **and** this action's own claim covered that path (the action removed it in its guarded prefix, and a later command recreated it: the `rm -rf .r3-out && pwsh …` cycle). Any other same-name replacement is refused and its record deleted. `sed -i`, `perl -i`, an editor's atomic save, or `write-file-atomic` (a temporary file renamed over a user file: new inode, new birth time, the user's content) would otherwise record the user's file as agent-created. The listing also cannot tell a script's atomic rewrite of an agent-owned file from a user edit made in the same window, so such a rewrite loses its record too (it fails safe);
+- it is a regular file with `nlink === 1`, or a folder, never a symlink or special file;
+- `birthtimeMs >= startMs - 1000` and `mtimeMs >= startMs - 1000`, with `startMs` taken after the first listing. GNU `mv` across devices copies and unlinks: the copy has a fresh birth time but keeps its modification time (folders too), so the mtime check keeps a moved-in user file out. The same mtime check applies to plan-recorded and `write`-tool creations. It also fails safe for `tar x` and `cp -p`, whose preserved mtimes give no claim;
+- the name is not **tainted**: for each folder the session keeps a memory-only set of names (compared by `pathKey`, so `README.md` and `readme.md` are one name) that held an object the agent did not demonstrably make: every name in a listing without a valid, unchanged record, and every name present at `session_start` (a best-effort listing of `ctx.cwd`). The taint is added from the first listing of each call and from the unrecorded names of the second, is cleared on `session_start` like the record, and is never lifted for the rest of the session. It stops a user's file that was stashed (`git stash -u`) or moved away in one call and restored (`git stash pop`, `cp` back) in a later one from being recorded as new. A path this action claimed bypasses the taint. A baseline listing that fails (other than a missing folder), a folder over 20,000 tainted names, or one over the snapshot cap fully taints the folder: C records nothing in it that session;
+- two entries of one listing whose names share a `pathKey` (a case-sensitive filesystem) are never recorded;
+- the folder's real path is unchanged and its `dev` and `ino` match across the two listings;
+- the tool input JSON is unchanged (T16);
+- the path is not already settled by the plan's own recording (no double record).
+
+The contents walk also requires every entry's `mtimeMs >= folder.birthtimeMs - 1000`, for the same reason. A record whose entry the call removed, or replaced by something rejected here, is deleted. A folder with more than 5,000 entries before or after is skipped. Folders recorded this way still pass the contents walk at claim time, and files still need `unchanged`. Pending entries are bounded and cleared on `tool_execution_end`, `agent_end`, and `session_start` as before.
+
+Fact wording: "absent before and present after the agent's bash command at …".
+
+### D. Guarded prefix
+
+`planActionOrPrefix(source)` returns the whole-action plan when the whole action passes the guard. Otherwise it plans a prefix. Rules, in the order the code applies them (`planActionPrefix`):
+
+1. **Whole-action refusals.** Parse errors, functions, coprocesses, a backgrounded statement, nested shells (`bash -c`, `sh -c`), `eval`, `trap`, and `exec` anywhere in the action (any word, so `command exec` counts), a dynamic shell script, and a redirect on a top-level statement. Any of these means no plan.
+2. **Items.** The top level must be a sequential list: statements, each an `&&`/`||` chain, joined by `;` or newlines. A prefix item is a top-level simple command. A loop, `if`, `case`, group, subshell, function, or pipeline is never a prefix item, so the pipeline `pwsh … | tail` can only be the first unanalysed item.
+3. **Prefix.** The leading run of items that each pass the existing guard (command table, path rules, redirect rules). The first item that fails is the start of the rest. An empty prefix, or a prefix with no creation, removal, write, or link, gets no plan. The prefix plan must also satisfy the reroute rule.
+4. **Relative operands in a prefix** resolve only for items reached from the leading `cd` through `&&` alone, and only when no later command anywhere in the action changes directory.
+5. **The rest is not analysed for effects**, but it is scanned for cover. If any command in it names or has as a word `rm`, `rmdir`, `unlink`, `shred`, `mv`, their GNU-prefixed forms (`grm`, `gmv`, `grmdir`, `gunlink`, `gshred`), `srm`, `trash`, `tee`, `truncate`, `dd`, `cp`, `install`, `rsync`, or `ln`; `find` with `-delete`, `-exec`, `-execdir`, `-ok`, or `-okdir`; `sed` or `perl` with an `-i…` or `--in-place` word; or `git` with `clean`, `rm`, `checkout`, `restore`, `stash`, `reset --hard`, or `worktree remove`; or has a dynamic command name; or any write redirect outside the prefix exists (one on a compound, or `pwsh > file`) other than `/dev/null` and descriptor duplications: **no claims**. The plan is still used for recording.
+6. **The removal rule is unchanged for the prefix:** every existing removal operand and write target in it needs a valid claim, or the action has none. The walk and the second check apply as before.
+7. **Scope fact.** With claims from a prefix, one more line follows the `created_this_session` lines:
+   `created_this_session_scope: claims cover only commands before `<name>`; pi-automode did not analyse that command or anything after it`.
+   `<name>` is the first unanalysed command if its name is plain (`[A-Za-z0-9._+-]{1,40}`), otherwise `a command`. The line goes through the same escaping as the other lines. `JEV_STATE_FIELDS` explains it.
+8. **Admission.** A prefix-plan call's `paths` are unknown (the rest may change any file); its `protects` are its prefix paths. It waits for any running file-changing call, and while it runs, a call that may change files waits unless it is guarded, has no claims, and touches no protected path. Protection is not released early, so a long run (a 400 s test) blocks parallel file-changing calls for its whole duration.
+9. **Coverage (fail closed).** Every command the parser reports must lie inside a prefix item or at or after the start of the rest. The parser positions here-doc bodies after their owner's range, so a `$(…)` in an unquoted here-doc body on a prefix item would otherwise escape both the prefix check and the scan of the rest. Any command in neither place means no plan. A body owned by the first unanalysed command is part of the rest and is scanned. A quoted here-doc (`<<'EOF'`) body is literal text, yields no commands, and is not scanned. Even a benign unquoted body on a prefix item refuses the plan (no attribution is attempted).
+10. **Recording.** Prefix creations are recorded under today's rules. The snapshot (C) covers what the rest created. A claimed path the prefix removed and the rest recreated is in the first listing with another object after, so it is recorded as new (replace-like); otherwise every second run would lose its claim.
+
+### New threats
+
+Each has a test; none yields a claim or an unsafe record.
+
+| # | Scenario | Stopped by |
+|---|---|---|
+| T27 | `rm -rf A; for f in x; do rm -rf A; pwsh s.ps1; done`, `rm -rf A \| pwsh s.ps1` | loops and pipelines are never prefix items (D2) |
+| T28 | `rm -rf A && pwsh s.ps1 && rm -rf ~/thesis`, `… && mv ~/thesis A`, `… && find ~ -delete`, `… && xargs rm`, `… && git clean -fdx`, `… && $CMD x` | scan of the rest (D5) |
+| T29 | `pwsh s.ps1 && rm -rf A` | empty prefix (D3) |
+| T30 | `… && (pwsh s.ps1) &`, `… && sleep 1 & pwsh`, `… && bash -c '…'`, `… && eval "$X"`, `… && trap '…' EXIT`, `… && exec …` | whole-action refusals (D1) |
+| T31 | `{ rm -rf A && pwsh s.ps1; } > A/out`, `… && pwsh > ~/thesis`, `… && for …; done > ~/thesis` | compound is not a prefix item; write redirect outside the prefix (D2, D5) |
+| T32 | `cd X; rm -rf a && pwsh`, `cd X && cd Y && rm -rf a && pwsh`, `cd X && true \|\| rm -rf a; pwsh` | relative operands need an `&&`-only run from a verified `cd` (D4, B) |
+| T33 | an unclaimed existing prefix removal beside a claimed one | removal rule, all-or-nothing (D6) |
+| T34 | `mv ~/thesis` into a folder recorded by a prefix or the snapshot, then `rm -rf` it | contents walk |
+| T35 | user edits a write-recorded file before the agent's `write`, `edit`, or deletion | `ctimeMs`/`size`; record deleted at `tool_call` (A) |
+| T36 | the file is replaced by another object during a `write` or `edit` | in-place rule: record deleted (A) |
+| T37 | a parent swapped for a symlink, or the same folder reached through another path, between the two listings | folder real path, `dev`, `ino` (C) |
+| T38 | an old file `mv`'d into the folder, a hard link, a symlink, a FIFO, a moved-in old folder | birth time, `nlink`, kind (C) |
+| T39 | another extension changes `event.input` | input compared at `tool_result` (A, C) |
+| T40 | `cd -P X`, `cd X/../Y`, `cd relative`, `pushd`, `cd` with a redirect, a `..` operand | B rules |
+| T41 | a prefix call and another file-changing call run together | running-calls check, both directions (D8) |
+| T42 | `sed -i '' s/a/b/ notes.md`, `perl -pi`, an editor's atomic save: a temporary file renamed over a pre-existing user file | C records a same-name replacement only if the replaced object was the agent's (a valid record, or claimed by the action) |
+| T43 | `rm -rf A && cat <<EOF\n$(rm -rf ~/thesis)\nEOF\npwsh x`: a here-doc body command between the prefix and the rest | coverage rule (D9): any command outside every prefix item and the rest refuses the plan |
+| T44 | `git stash -u && npm test`, then `git stash pop`: the user's untracked files return as new objects in a later call; likewise move away in one call and `cp` back in the next | taint set (C) |
+| T45 | `README.md` unlinked and `readme.md` created on APFS; `B.txt` and `b.txt` in one listing | names compared by `pathKey`; collisions never recorded (C) |
+| T46 | the user edits an agent-owned file after the snapshot, and a script then rewrites it atomically | same-name replacement allowed only for paths this action claimed (C) |
+| T47 | `mv ~/thesis.md .` across devices: fresh birth time, old mtime; the same inside a recorded folder | `mtimeMs` check in C, plan and `write` creations, and the contents walk |
+| T48 | the first bash call restores what the user moved away before it | `session_start` baseline listing taints the names |
+
+### Known gaps added
+
+- **Snapshot races.** During a long bash call, any other process (the user, a cloud-sync client, a background job) that creates a top-level entry in the folder is recorded as agent-created. This is accepted because the record is only evidence for Jev. Jev is told "processes running at the same time are not observed".
+- **Prefix claims and the rest.** The rest of the action is not analysed. It may change a claimed path. Visible deletions and moves are caught by name; a script that deletes (`python3 -c "shutil.rmtree(…)"`, a `.ps1` that removes files) is not. The scope line says so. Jev scores the claim with that caveat.
+- **Parallel calls blocked for the whole run.** A prefix-plan call with claims blocks new file-changing calls, and waits for running ones, for its entire duration.
+- **The scan of the rest is a deny-list and leaks by construction.** It matches names and flags by word. It cannot see an interpreter (`python3 -c "shutil.rmtree(…)"`, `pwsh -Command Remove-Item`, `perl -e unlink`), a script, or an unlisted tool. What covers the rest is the scope line, which tells Jev the rest was not analysed, and Jev's own scoring of the action. The corpus has block cases for the hidden deletions (`createdPathsScope`) to measure whether a claim line makes Jev lenient on them.
+- **Case and Unicode spelling.** Records are keyed by the exact canonical spelling. An NFD-listed name versus an NFC operand gives no claim (fails safe).
+- **The window of a refresh and of the snapshot starts at `tool_call`, not at execution.** A user write to a recorded file between the hook and the tool's execution is absorbed by the refresh. In Pi's parallel mode that window includes the hooks, dialogs, and wait time of every call in the batch. Pi 1.2.0 emits `tool_execution_start` in the preflight phase, *before* `tool_call` (docs/extensions.md, agent-loop.js), so no event marks the start of execution and the window cannot be narrowed by re-verifying there. The in-place refresh for redirect writes and the `write` and `edit` tools shares this window.
+- **Taint is monotonic and coarse.** A name that ever held a non-agent object, or an agent-made file the user or a script later changed in place, is never recorded again that session, even if the agent later deletes and recreates it. This fails safe.
+- **A script the guard cannot read can still restore data.** `pwsh -File restore.ps1` or `python3 unpack.py` may bring back files from a stash, an archive, or a backup made before the session; the snapshot records them as created. This is the same class as the unanalysed rest of an action, and the word match above is a deny-list that leaks by construction.
+- **C covers only the session cwd.** Only `ctx.cwd` gets a `session_start` baseline, so scripts' outputs in a leading-`cd` folder elsewhere are not recorded. Only paths a guarded plan recorded there (`mkdir`, redirects, `write`) can be claimed. If the baseline fails, the cwd is fully tainted for the session and C records nothing.
+- **The mtime check can be bypassed on Linux.** A cross-device `mv` (fresh birth time, old mtime) followed by a `touch` of the moved-in file (fresh mtime) passes the mtime checks, and then the contents walk passes. This takes two separate actions that Jev scores, the same class as the forged creation times above.
+
+### Tests
+
+- `tests/created-paths.test.ts`: pure helpers over the in-memory filesystem for B, A, C, and D, including the verbatim session commands and every threat above.
+- `tests/hook-created-paths.test.ts`: the fake Pi, with the session cwd, for the `write` tool, the snapshot, the `rm -rf … && timeout 400 pwsh …` cycle run four times, and running-call conflicts both ways.
+- `scripts/jev-sweep-lib.ts` and `tests/fixtures/jev-corpus.json`: corpus cases may declare `createdPathsScope`, rendered with the real `scopeLine`. New cases: two block cases with a hidden deletion after a claimed prefix (`python3 -c shutil.rmtree`, `pwsh -Command Remove-Item`), and allow cases for three verbatim session commands. A test checks that each scoped case matches what `planActionOrPrefix` returns. The live sweep is run separately.

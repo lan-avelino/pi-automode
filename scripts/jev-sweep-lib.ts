@@ -6,8 +6,10 @@
  * it can be tested.
  */
 import {
+  CREATION_HOWS,
   createdPathLine,
   type CreationHow,
+  scopeLine,
 } from "../extensions/auto-mode/created-paths.ts";
 import {
   buildJevState,
@@ -36,6 +38,12 @@ export type CorpusCase = {
   scratchRoots?: string[];
   /** Paths the session created earlier, rendered as created_this_session facts. */
   createdPaths?: CorpusCreatedPath[];
+  /**
+   * Set when the claims come from only the guarded start of the action: the
+   * first command pi-automode did not analyse. Rendered with the real
+   * `scopeLine`, after the created_this_session lines.
+   */
+  createdPathsScope?: string;
   /** Where a case came from, or why it has its label. */
   note?: string;
   /** For a case rebuilt from logs: the classifier backend that judged it. */
@@ -55,12 +63,12 @@ export type CorpusCreatedPath = {
 };
 
 const WANTS = new Set(["allow", "block", "unlabeled"]);
-const CREATION_HOWS = new Set(["redirect", "mkdir", "git worktree add"]);
+const CREATION_HOW_SET = new Set<string>(CREATION_HOWS);
 
 function isCreatedPath(value: unknown): value is CorpusCreatedPath {
   return isRecord(value) && typeof value.path === "string" &&
     (value.kind === "file" || value.kind === "folder") &&
-    typeof value.how === "string" && CREATION_HOWS.has(value.how) &&
+    typeof value.how === "string" && CREATION_HOW_SET.has(value.how) &&
     typeof value.at === "string";
 }
 
@@ -117,6 +125,14 @@ export function parseCorpus(raw: unknown): { cases: CorpusCase[]; errors: string
       return;
     }
     if (
+      entry.createdPathsScope !== undefined &&
+      !(typeof entry.createdPathsScope === "string" && entry.createdPathsScope !== "" &&
+        Array.isArray(entry.createdPaths) && entry.createdPaths.length > 0)
+    ) {
+      errors.push(`${label}: createdPathsScope must be a non-empty string and needs createdPaths`);
+      return;
+    }
+    if (
       entry.loggedBackend !== undefined &&
       !(typeof entry.loggedBackend === "string" && LOGGED_BACKENDS.has(entry.loggedBackend))
     ) {
@@ -168,9 +184,12 @@ export function caseState(
     facts: describeActionFacts(
       action,
       config.trustedHosts,
-      (testCase.createdPaths ?? []).map((entry) =>
-        createdPathLine(entry.path, entry.kind, entry.how, entry.at)
-      ),
+      [
+        ...(testCase.createdPaths ?? []).map((entry) =>
+          createdPathLine(entry.path, entry.kind, entry.how, entry.at)
+        ),
+        ...(testCase.createdPathsScope === undefined ? [] : [scopeLine(testCase.createdPathsScope)]),
+      ],
     ),
     loadedContext: "",
   });

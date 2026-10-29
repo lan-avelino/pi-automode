@@ -43,7 +43,8 @@ import {
   NODE_CREATED_PATHS_FS,
   type ClaimSet,
   birthTimesUsable as probeBirthTimes,
-  planAction,
+  planActionOrPrefix,
+  restoresData,
 } from "./created-paths.ts";
 import { describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
@@ -562,6 +563,11 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
     pi.on("session_start", (_event, ctx) => {
       createdPaths.clear();
       applyLoadResult(loadConfigWithDiagnostics(ctx.cwd, projectIsTrusted(ctx)));
+      // Names already in the session folder count as the user's, even if the
+      // user moves them away before the first bash call. Best effort.
+      if (effectiveConfig().enabled && isDecisionBackend(effectiveConfig().classifierBackend)) {
+        void createdPaths.baseline(ctx.cwd);
+      }
       state = restoreState(ctx);
       sessionApprovals.clear();
       sessionEditRoots.clear();
@@ -1122,11 +1128,16 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         return decideToolCall(event, ctx);
       }
       const input = event.input as Record<string, unknown>;
-      const plan = event.toolName === "bash" && typeof input.command === "string"
-        ? planAction(input.command)
+      // The plan covers the whole action, or only its guarded prefix (`scope`
+      // names the first command pi-automode did not analyse).
+      const planned = event.toolName === "bash" && typeof input.command === "string"
+        ? planActionOrPrefix(input.command)
         : undefined;
+      const plan = planned?.plan;
       const call = {
-        claims: plan ? await createdPaths.claimsFor(plan, ctx.signal) : { claims: [], lines: [] },
+        claims: plan && !planned.noClaims
+          ? await createdPaths.claimsFor(plan, ctx.signal, planned.scope)
+          : { claims: [], lines: [] },
         shownToJev: false,
       };
       callClaims.set(id, call);
@@ -1148,7 +1159,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         }, makeLogCtx(cfg, ctx));
       // The recheck is the last await before admit, so nothing changes the
       // running set between the final check and admission.
-      const paths = plan ? await createdPaths.runningPaths(plan) : undefined;
+      const planPaths = plan ? await createdPaths.runningPaths(plan) : undefined;
+      // After a prefix, the unanalysed rest may change any file.
+      const paths = planned?.scope === undefined ? planPaths : undefined;
       const claimsHold = await createdPaths.recheck(call.claims, ctx.signal);
       if (!claimsHold && call.shownToJev) {
         return finalBlock("A session-created path changed while this action was reviewed; run it again.");
@@ -1161,11 +1174,28 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         readOnly,
         ...(paths ? { paths } : {}),
         protects: call.shownToJev && claims.claims.length > 0
-          ? paths ?? claims.claims.map((claim) => claim.canonical)
+          ? planPaths ?? claims.claims.map((claim) => claim.canonical)
           : [],
       });
       if (waitReason) return finalBlock(waitReason);
-      if (plan) await createdPaths.prepare(id, plan, input, claims);
+      if (event.toolName === "bash" && typeof input.command === "string") {
+        // A bash call that may change files also gets a before/after listing
+        // of the session cwd, the one folder with a session-start baseline.
+        // That records what a script the guard cannot read leaves behind. A
+        // leading `cd` folder elsewhere is not listed: its earlier history is
+        // unseen, so a restored user file would look new.
+        // An action that may restore data from outside the session (`git stash
+        // pop`, an archive extract) takes no snapshot at all.
+        const folders = readOnly || typeof ctx.cwd !== "string" || restoresData(input.command) ? [] : [ctx.cwd];
+        if (plan || folders.length > 0) await createdPaths.prepare(id, plan, input, claims, folders);
+      } else if (
+        (event.toolName === "write" || event.toolName === "edit") && typeof ctx.cwd === "string"
+      ) {
+        // Pi's own file tools: record a created file and keep the record of a
+        // recorded one valid across the agent's own writes. No claims.
+        const path = resolveToolInputPath(event.toolName, ctx.cwd, input.path);
+        if (path) await createdPaths.prepareFileTool(id, event.toolName, path, input);
+      }
       return result;
     });
 
