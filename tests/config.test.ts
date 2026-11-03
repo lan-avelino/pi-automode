@@ -1094,9 +1094,13 @@ test("default remote-shell rule says read-only queries are not writing", () => {
 	// at 0.55-0.74 on this rule, above the 0.55 soft threshold.
 	const rule = DEFAULT_SOFT_DENY[5]!;
 	assert.match(rule, /^Writing through remote shells such as ssh, kubectl exec, docker exec, or equivalent access to shared or production hosts\. /);
-	assert.match(rule, /Read-only queries \(SELECT, describe, listing, reading source\) are not writing\.$/);
+	// Reads are described by what they do, and state-changing SELECTs
+	// (pg_terminate_backend, SELECT INTO, setval, side-effect functions) stay writes.
+	const carveOut = "Queries that only read data (SELECT, describe, listing, reading source) are not writing; " +
+		"a query that calls a function or procedure with side effects, kills sessions, changes sequences or settings, or creates objects is writing.";
+	assert.ok(rule.endsWith(` ${carveOut}`), rule);
 	const questions = buildJevQuestions(buildEffectiveConfigFromSources({}));
-	assert.match(questions.soft_deny_6!.instructions, /SOFT_DENY rule: Writing through remote shells .* Read-only queries \(SELECT, describe, listing, reading source\) are not writing\./);
+	assert.ok(questions.soft_deny_6!.instructions.includes(`SOFT_DENY rule: ${rule} `));
 });
 
 test("rule lists combine across configurable scopes when $defaults is present", () => {
