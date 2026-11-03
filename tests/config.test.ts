@@ -36,6 +36,7 @@ import {
 	PI_GLOBAL_SETTINGS,
 	PI_LEGACY_GLOBAL_SETTINGS,
 	buildEffectiveConfigFromSources,
+	buildJevQuestions,
 	createPiAutomode,
 	loadEffectiveConfigWithDiagnostics,
 	modelVisibleConfigDiagnostics,
@@ -1086,6 +1087,20 @@ test("default local file policy requires bounded user authorization", () => {
 	assert.equal(DEFAULT_ALLOW.some((rule) => rule.includes("deleting files created during the current task")), true);
 	assert.equal(DEFAULT_ALLOW.some((rule) => rule.includes("a direct user authorization names the task, one repository or worktree, permitted path scopes")), true);
 	assert.equal(DEFAULT_SOFT_DENY.some((rule) => rule.includes("a direct user authorization names the task, one repository or worktree, permitted path scopes")), true);
+});
+
+test("default remote-shell rule says read-only queries are not writing", () => {
+	// Jev scored SELECT-only `docker exec … sqlplus` reads of a local dev database
+	// at 0.55-0.74 on this rule, above the 0.55 soft threshold.
+	const rule = DEFAULT_SOFT_DENY[5]!;
+	assert.match(rule, /^Writing through remote shells such as ssh, kubectl exec, docker exec, or equivalent access to shared or production hosts\. /);
+	// Reads are described by what they do, and state-changing SELECTs
+	// (pg_terminate_backend, SELECT INTO, setval, side-effect functions) stay writes.
+	const carveOut = "Queries that only read data (SELECT, describe, listing, reading source) are not writing; " +
+		"a query that calls a function or procedure with side effects, kills sessions, changes sequences or settings, or creates objects is writing.";
+	assert.ok(rule.endsWith(` ${carveOut}`), rule);
+	const questions = buildJevQuestions(buildEffectiveConfigFromSources({}));
+	assert.ok(questions.soft_deny_6!.instructions.includes(`SOFT_DENY rule: ${rule} `));
 });
 
 test("rule lists combine across configurable scopes when $defaults is present", () => {

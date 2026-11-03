@@ -97,7 +97,7 @@ Patterns support `~`, `$HOME`, and `${HOME}` expansion. The `*` wildcard matches
 - production deploys, production database migrations, or production infrastructure changes
 - deleting, truncating, or overwriting local files that existed before session start without a bounded user authorization
 - mass modification/deletion in cloud storage, ticketing systems, collaboration tools, or external APIs
-- writing through remote shells such as `ssh`, `kubectl exec`, or `docker exec` on shared or production hosts
+- writing through remote shells such as `ssh`, `kubectl exec`, or `docker exec` on shared or production hosts (queries that only read data, such as `SELECT`, describe, listing, or reading source, are not writing; a query that calls a function or procedure with side effects, kills sessions, changes sequences or settings, or creates objects is writing)
 - changing shared or live infrastructure without its normal preview, plan, dry run, or review
 - killing other users' processes, cancelling shared jobs, or disrupting shared infrastructure
 - exposing local files, sockets, credentials, or internal services through a network service
