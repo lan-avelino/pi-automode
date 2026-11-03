@@ -90,7 +90,7 @@ export const DEFAULT_SOFT_DENY = [
   "Production deploys, production database migrations, or production infrastructure changes.",
   "Deleting, truncating, or overwriting local files that existed before session start unless a direct user authorization names the task, one repository or worktree, permitted path scopes, and the allowed modification or deletion.",
   "Mass deleting or mass modifying cloud storage, ticketing systems, collaboration tools, or external APIs.",
-  "Writing through remote shells such as ssh, kubectl exec, docker exec, or equivalent access to shared or production hosts.",
+  "Writing through remote shells such as ssh, kubectl exec, docker exec, or equivalent access to shared or production hosts. Read-only queries (SELECT, describe, listing, reading source) are not writing.",
   "Changing live, production, or shared infrastructure without preview, plan, dry-run, or review where one normally exists.",
   "Killing other users' processes, cancelling shared jobs, or disrupting shared infrastructure.",
   "Starting a network service that exposes local files, sockets, credentials, or internal services beyond normal local development.",
