@@ -242,6 +242,19 @@ const SQLPLUS_SET_VARIABLES: [string, string][] = [
   ["NULL", "NULL"], ["TIMING", "TIMI"], ["TERMOUT", "TERM"], ["UNDERLINE", "UND"], ["NEWPAGE", "NEWP"],
   ["EMBEDDED", "EMB"], ["DEFINE", "DEF"],
 ];
+/**
+ * True when psql would substitute a variable: a run of colons of odd length
+ * (`::` pairs are casts) followed by a name character, a quote, or `{`. Names
+ * may start with a digit, so `tags[1:2]` counts.
+ */
+function psqlInterpolates(text: string): boolean {
+  for (const match of text.matchAll(/:+/g)) {
+    const after = text[match.index! + match[0].length] ?? "";
+    if (match[0].length % 2 === 1 && /^[A-Za-z0-9_'"{\u0080-\uffff]$/.test(after)) return true;
+  }
+  return false;
+}
+
 /** mysql client commands, which the client runs when a line starts with one. */
 const MYSQL_CLIENT_COMMANDS = new Set([
   "clear", "connect", "delimiter", "edit", "ego", "exit", "go", "help", "nopager", "notee", "nowarning", "pager",
@@ -287,7 +300,7 @@ function stripSqlLiterals(script: string, client: string): string | undefined {
   while (index < script.length) {
     const char = script[index]!;
     const next = script[index + 1];
-    const lineComment = (char === "-" && next === "-" && (!mysql || /^\s?$/.test(script[index + 2] ?? ""))) ||
+    const lineComment = (char === "-" && next === "-" && (!mysql || /^[\x00-\x20\x7f]?$/.test(script[index + 2] ?? ""))) ||
       (mysql && char === "#");
     // SQL*Plus finds statement ends and commands on the raw line, comments and all.
     if (sqlplus && (lineComment || (char === "/" && next === "*"))) return undefined;
@@ -303,8 +316,9 @@ function stripSqlLiterals(script: string, client: string): string | undefined {
       const end = script.indexOf("*/", index + 2);
       if (end < 0) return undefined;
       const body = script.slice(index + 2, end);
-      // PostgreSQL and SQL Server nest block comments; the first `*/` may not end this one.
-      if (body.includes("/*")) return undefined;
+      // PostgreSQL and SQL Server nest block comments; the first `*/` may not end
+      // this one. Include the `*` of that `*/`, so an overlapping `/*/` counts.
+      if (script.slice(index + 2, end + 1).includes("/*")) return undefined;
       if (lineOriented && body.includes("\n")) return undefined;
       out += " ";
       index = end + 2;
@@ -464,7 +478,7 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
       SQL_WRITE_WORDS.test(text) ||
       (sqlcmd && TSQL_WRITE_WORDS.test(text)) ||
       // psql substitutes `:name`, `:'name'`, and `:"name"` variables, which `-v` can set to any SQL.
-      (client === "psql" && /(^|[^:]):([A-Za-z_]|''|"")/.test(text)) ||
+      (client === "psql" && psqlInterpolates(text)) ||
       /\bNEXT\s+VALUE\s+FOR\b/i.test(text) ||
       SQL_SIDE_EFFECT_FUNCTIONS.test(text) ||
       !sqlCallsOnlyBuiltins(text)
@@ -487,6 +501,13 @@ function sqlFromClientArgs(client: string, args: string[]): SqlText[] {
     const arg = args[index]!;
     if (client === "psql" && (arg === "-c" || arg === "--command" || arg.startsWith("--command="))) {
       texts.push({ text: valueOf(index, "--command") ?? "" });
+    } else if (
+      client === "psql" &&
+      (arg.startsWith("-v") || arg === "--set" || arg.startsWith("--set=") || arg === "--variable" ||
+        arg.startsWith("--variable="))
+    ) {
+      // psql substitutes variables set here into the SQL.
+      texts.push({ unknown: "(variables)" });
     } else if (client === "psql" && (arg === "-f" || arg === "--file" || arg.startsWith("--file="))) {
       texts.push({ unknown: "(file)" });
     } else if (

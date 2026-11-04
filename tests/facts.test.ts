@@ -231,6 +231,10 @@ test("describeActionFacts never marks writing or unknown SQL read-only", () => {
 	}
 	// SQL that cannot be read.
 	assert.match(sqlLine("psql -U app -f cleanup.sql") ?? "", /read_only=unverified$/);
+	// -v sets variables that psql substitutes into the SQL.
+	for (const option of ["-v x=1", "-vx=1", "--set x=1", "--set=x=1", "--variable x=1", "--variable=x=1"]) {
+		assert.match(sqlLine(`psql -U app ${option} -c 'select 1'`) ?? "", /read_only=unverified$/, option);
+	}
 	assert.match(sqlLine("psql -U app") ?? "", /read_only=unverified$/);
 	// An unquoted heredoc expands $(...) before psql sees it.
 	assert.match(
@@ -282,6 +286,8 @@ test("MySQL quoting and comment forms that hide SQL are not verified read-only",
 		"select 1 /*M! ; delete from t */;",
 		// `#` starts a comment in MySQL, so a quote after it is not a string.
 		"select 1 # '\n; delete from t; select 1 # '\n;",
+		// `--` followed by a control character is a comment in MySQL.
+		"select 1 --\x01 '\n; delete from t; select 1 --\x01 '\n;",
 		// Client commands at the start of a line run even inside a statement.
 		"select 1\nsystem rm -rf /tmp/x\n;",
 		"select 1\npager rm -rf /tmp/x\n;",
@@ -311,6 +317,13 @@ test("a SELECT that calls a non-built-in function is not verified read-only", ()
 		"SELECT :x;",
 		"SELECT * FROM t WHERE id = :'id';",
 		"SELECT :\"col\" FROM t;",
+		// Variable names may start with a digit, so an array slice can interpolate one.
+		"SELECT tags[1:2] FROM t;",
+		// `::` is a cast; a third colon starts a variable.
+		"SELECT 1:::x;",
+		"SELECT :{?x};",
+		// A `/*` that overlaps the first `*/` still opens a nested comment.
+		"SELECT 1 /* x /*/ ' */; DELETE FROM t; SELECT 1 --'",
 		// PostgreSQL nests block comments, so the comment ends later than the first `*/`.
 		"SELECT 1 /* /* */ ' */; DELETE FROM t; SELECT 1 --'",
 		// An unterminated string or comment cannot be read.
@@ -325,7 +338,7 @@ test("a SELECT that calls a non-built-in function is not verified read-only", ()
 	}
 	// Built-in functions, type modifiers, and keywords before a parenthesis stay verified.
 	assert.equal(
-		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name)), created_at::date, tags[1:2]\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
+		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name)), created_at::date, tags[1]\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
 		"client=psql statements=SELECT read_only=true",
 	);
 });
