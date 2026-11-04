@@ -221,6 +221,10 @@ test("describeActionFacts never marks writing or unknown SQL read-only", () => {
 		"\\copy sessions TO '/tmp/sessions.csv' CSV",
 		"\\! rm -rf /tmp/x",
 		"CALL cleanup();",
+		// psql runs backslash commands anywhere on a line, not only at its start.
+		"SELECT 1 \\g /tmp/out.txt",
+		"SELECT 1; \\o /tmp/out.txt",
+		"SELECT 1 \\gexec",
 	]) {
 		const line = sqlLine(`${VIA_DOCKER}\n${body}\nSQL`);
 		assert.match(line ?? "", /read_only=unverified$/, body);
@@ -266,6 +270,24 @@ test("a verified read-only SQL call through sudo and docker exec counts as read-
 	}
 });
 
+test("MySQL quoting and comment forms that hide SQL are not verified read-only", () => {
+	for (const body of [
+		// A backslash escapes the quote in MySQL, so the string ends earlier than '' pairing says.
+		"select 'x\\''; delete from t; select '';",
+		'select "x\\""; delete from t; select "";',
+		// `--` starts a comment only before whitespace.
+		"select 1 --1; delete from t;",
+		// MySQL runs the body of /*! ... */.
+		"select 1 /*! ; delete from t */;",
+	]) {
+		assert.match(sqlLine(`mysql -h db <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	assert.equal(
+		sqlLine("mysql -h db <<'SQL'\nselect count(*) from orders -- recent\nwhere id > 1;\nSQL"),
+		"client=mysql statements=SELECT read_only=true",
+	);
+});
+
 test("a SELECT that calls a non-built-in function is not verified read-only", () => {
 	// Any user-defined or package function can write; only known built-ins count.
 	for (const body of [
@@ -275,6 +297,9 @@ test("a SELECT that calls a non-built-in function is not verified read-only", ()
 		"WITH s(n) AS (SELECT 1) SELECT n FROM s;",
 		"SELECT * FROM dblink_exec('host=x', 'delete from t');",
 		// Quoted names hide the call from a bare-identifier match.
+		// An unterminated string or comment cannot be read.
+		"SELECT 'abc;",
+		"SELECT 1; /* DELETE FROM t;",
 		'SELECT "purge_inactive_users"(365);',
 		'SELECT "app"."purge_inactive_users"(365);',
 		"SELECT [dbo].[fn_purge](1);",
@@ -341,6 +366,26 @@ test("describeActionFacts never marks writing or unknown sqlplus scripts read-on
 		"select * from user_profile for update;",
 		"update user_profile set status = 'I';\ncommit;",
 		"select * from table(pck_x.rows());",
+		// Abbreviations of unsafe commands, and commands this check does not know.
+		"spoo /tmp/out.txt\nselect 1 from dual;",
+		"hos rm -rf /tmp/x",
+		"execu purge;",
+		"archive log list",
+		// CMDSEP lets one line run several commands.
+		"set cmdsep on\nprompt x; host rm -rf /tmp/x",
+		"set sqlterminator !\nselect 1 from dual!",
+		"set sqlblanklines on\nselect 1 from dual;",
+		// A blank line ends statement entry even inside an open string.
+		"select 'a\n\nhost rm -rf /tmp/x\n' from dual;",
+		// q-quoted literals.
+		"select q'[it's]' from dual;\nhost rm -rf /tmp/x\nselect '' from dual;",
+		"select nq'{x}' from dual;",
+		// Substitution inside a string literal reads the next line as input.
+		"select '&x' from dual;",
+		// EXPLAIN PLAN writes to PLAN_TABLE.
+		"explain plan for select 1 from dual;",
+		// A lone `.` ends entry without running; the next line is a command.
+		"select 1 from dual\n.\nho rm -rf /tmp/x",
 	]) {
 		assert.match(sqlLine(`${SQLPLUS}\n${body}\nSQL`) ?? "", /^client=sqlplus .*read_only=unverified$/, body);
 	}
@@ -368,6 +413,19 @@ test("describeActionFacts never marks writing or unknown sqlcmd queries read-onl
 		"waitfor delay '00:00:05'",
 		"select $(col) from USER_PROFILE",
 		"set role admin; select 1",
+		// T-SQL runs several statements without separators.
+		"select 1 restore database APP from disk = '/tmp/old.bak'",
+		"select 1 backup database APP to disk = '/tmp/x.bak'",
+		"select 1 dbcc checkident ('USER_PROFILE', reseed, 1)",
+		"select 1 begin tran update_user commit",
+		"select 1 deny select on USER_PROFILE to public",
+		"select 1 disable trigger all on USER_PROFILE",
+		"select 1 checkpoint",
+		"select 1 reconfigure",
+		"select * from openrowset('SQLNCLI', 'x', 'select 1')",
+		// A bracketed identifier holding a quote hides the next statement.
+		"select [x'] , 1; delete from t; select '",
+		"select [a]]'] from t; delete from t; select ']",
 	]) {
 		assert.match(sqlLine(`${SQLCMD} -Q "${query}"`) ?? "", /^client=sqlcmd .*read_only=unverified$/, query);
 	}

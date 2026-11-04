@@ -218,24 +218,107 @@ function sqlCallsOnlyBuiltins(text: string): boolean {
   return true;
 }
 
-/** SQL*Plus commands that only format output or describe objects. */
-const SQLPLUS_DISPLAY_COMMANDS = new Set([
-  "SET", "COL", "COLU", "COLUM", "COLUMN", "PRO", "PROM", "PROMP", "PROMPT", "TTI", "TTITLE", "BTI", "BTITLE",
-  "BRE", "BREAK", "COMP", "COMPUTE", "CL", "CLEAR", "REM", "REMARK", "WHENEVER", "EXIT", "QUIT", "SHO", "SHOW",
-  "DESC", "DESCR", "DESCRI", "DESCRIB", "DESCRIBE",
-]);
 /**
- * SQL*Plus commands that write files, run shell commands or scripts, run
- * PL/SQL, change the connection, or edit and rerun the buffer.
+ * SQL*Plus commands allowed at the start of a line, as [full name, shortest
+ * abbreviation]. They only format output or describe objects. Every other
+ * command, and any line that is neither one of these nor the start of a
+ * SELECT or WITH statement, leaves the script unverified.
  */
-const SQLPLUS_UNSAFE_COMMANDS = new Set([
-  "SPO", "SPOOL", "HO", "HOST", "STA", "START", "EXEC", "EXECUTE", "CONN", "CONNECT", "DISC", "DISCONNECT",
-  "PASSW", "PASSWORD", "COPY", "SAV", "SAVE", "GET", "ED", "EDIT", "STORE", "R", "RUN", "DEF", "DEFINE",
-  "UNDEF", "UNDEFINE", "VAR", "VARIABLE", "ACC", "ACCEPT", "XQUERY", "ARCHIVE", "RECOVER", "STARTUP",
-  "SHUTDOWN", "PAU", "PAUSE", "I", "INPUT", "A", "APPEND", "C", "CHANGE", "DEL", "L", "LIST", "ATTRIBUTE",
-]);
-/** `SET` forms that are SQL statements rather than SQL*Plus display settings. */
-const SQLPLUS_SQL_SET = /^SET\s+(ROLE|TRANSACTION|CONSTRAINTS?)\b/i;
+const SQLPLUS_DISPLAY_COMMANDS: [string, string][] = [
+  ["SET", "SET"], ["COLUMN", "COL"], ["PROMPT", "PRO"], ["TTITLE", "TTI"], ["BTITLE", "BTI"],
+  ["BREAK", "BRE"], ["COMPUTE", "COMP"], ["CLEAR", "CL"], ["REMARK", "REM"], ["WHENEVER", "WHENEVER"],
+  ["EXIT", "EXIT"], ["QUIT", "QUIT"], ["SHOW", "SHO"], ["DESCRIBE", "DESC"],
+];
+/**
+ * SQL*Plus system variables a `SET` line may change, as [full name, shortest
+ * abbreviation]. Variables that change how lines are split or run (CMDSEP,
+ * SQLTERMINATOR, SQLBLANKLINES, BLOCKTERMINATOR, SQLPREFIX, ESCAPE, MARKUP,
+ * ...) and SQL `SET ROLE`/`SET TRANSACTION` are not in the list.
+ */
+const SQLPLUS_SET_VARIABLES: [string, string][] = [
+  ["PAGESIZE", "PAGES"], ["LINESIZE", "LIN"], ["LONG", "LONG"], ["LONGCHUNKSIZE", "LONGC"],
+  ["TRIMSPOOL", "TRIMS"], ["TRIMOUT", "TRIM"], ["HEADING", "HEA"], ["FEEDBACK", "FEED"], ["ECHO", "ECHO"],
+  ["VERIFY", "VER"], ["TAB", "TAB"], ["WRAP", "WRA"], ["NUMWIDTH", "NUMW"], ["COLSEP", "COLSEP"],
+  ["NULL", "NULL"], ["TIMING", "TIMI"], ["TERMOUT", "TERM"], ["UNDERLINE", "UND"], ["NEWPAGE", "NEWP"],
+  ["EMBEDDED", "EMB"], ["DEFINE", "DEF"],
+];
+/** T-SQL keywords that write, run code, or change server state. T-SQL needs no `;` between statements. */
+const TSQL_WRITE_WORDS =
+  /\b(RESTORE|BACKUP|DENY|DISABLE|ENABLE|DBCC|RECONFIGURE|CHECKPOINT|BEGIN|COMMIT|ROLLBACK|SAVE|USE|BULK|RAISERROR|THROW|DECLARE|GOTO|WHILE|IF|RETURN|SETUSER|REVERT|OPENROWSET|OPENQUERY|OPENDATASOURCE|OPENXML|SEND|RECEIVE)\b/i;
+
+/** The full command name when `word` is it or an allowed abbreviation of it. */
+function sqlplusAbbreviation(word: string, table: [string, string][]): string | undefined {
+  const upper = word.toUpperCase();
+  return table.find(([full, shortest]) => upper.length >= shortest.length && full.startsWith(upper))?.[0];
+}
+
+/** True when a SQL*Plus `SET` line only changes allowed display variables. */
+function sqlplusSetIsSafe(line: string): boolean {
+  return line.trim().split(/\s+/).slice(1).every((token) =>
+    /^(ON|OFF|NONE|\d+|'')$/i.test(token) || sqlplusAbbreviation(token, SQLPLUS_SET_VARIABLES) !== undefined
+  );
+}
+
+/**
+ * Replace string literals, quoted identifiers, and comments with placeholders,
+ * scanning left to right as the client does. Returns undefined when the text
+ * cannot be read reliably: an unterminated literal or comment, a backslash in
+ * a quoted literal (MySQL and PostgreSQL E'' strings use it as an escape),
+ * MySQL's executable comments (slash, star, bang), Oracle `q'...'` literals, or, for
+ * the line-oriented sqlplus and sqlcmd, a literal or comment that spans a line
+ * (their line commands do not respect quotes).
+ */
+function stripSqlLiterals(script: string, client: string): string | undefined {
+  if (/\/\*!/.test(script)) return undefined;
+  if (client === "sqlplus" && /(^|[^\w$#])[nN]?[qQ]'/.test(script)) return undefined;
+  const lineOriented = client === "sqlplus" || client === "sqlcmd";
+  const mysql = client === "mysql" || client === "mariadb";
+  let out = "";
+  let index = 0;
+  while (index < script.length) {
+    const char = script[index]!;
+    const next = script[index + 1];
+    if (char === "-" && next === "-" && (!mysql || /^[\s]?$/.test(script[index + 2] ?? ""))) {
+      const end = script.indexOf("\n", index);
+      out += " ";
+      index = end < 0 ? script.length : end;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const end = script.indexOf("*/", index + 2);
+      if (end < 0) return undefined;
+      if (lineOriented && script.slice(index, end).includes("\n")) return undefined;
+      out += " ";
+      index = end + 2;
+      continue;
+    }
+    const close = char === "'" || char === '"' || char === "`"
+      ? char
+      : char === "[" && client === "sqlcmd" ? "]" : undefined;
+    if (close === undefined) {
+      out += char;
+      index += 1;
+      continue;
+    }
+    let search = index + 1;
+    for (;;) {
+      const end = script.indexOf(close, search);
+      if (end < 0) return undefined;
+      // A doubled closing character is an escaped one.
+      if (script[end + 1] === close) {
+        search = end + 2;
+        continue;
+      }
+      const body = script.slice(index + 1, end);
+      if ((char === "'" || char === '"') && body.includes("\\")) return undefined;
+      if (lineOriented && body.includes("\n")) return undefined;
+      out += char === "'" ? "''" : '""';
+      index = end + 1;
+      break;
+    }
+  }
+  return out;
+}
 /** psql meta-commands that only describe or format output. */
 const PSQL_READ_META = new Set([
   "\\d", "\\dt", "\\dt+", "\\d+", "\\di", "\\dv", "\\dn", "\\du", "\\df", "\\l", "\\l+",
@@ -248,8 +331,9 @@ type SqlText = { text?: string; unknown?: string };
 
 /**
  * The statement kinds in a SQL script and whether all of them only read.
- * String literals and comments are removed first, so a write word in data does
- * not count. Dollar-quoted bodies are not parsed and make the script unverified.
+ * String literals, quoted identifiers, and comments are removed first, so a
+ * write word in data does not count. Dollar-quoted bodies are not parsed and
+ * make the script unverified.
  */
 function classifySql(script: string, client = "psql"): { statements: string[]; readOnly: boolean } {
   const statements: string[] = [];
@@ -258,72 +342,82 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
     if (!statements.includes(kind)) statements.push(kind);
   };
   if (/\$[A-Za-z_]*\$/.test(script)) readOnly = false;
-  const cleaned = script
-    .replace(/'(?:[^']|'')*'/g, "''")
-    .replace(/"(?:[^"]|"")*"/g, '""')
-    .replace(/--[^\n]*/g, " ")
-    .replace(/\/\*[\s\S]*?\*\//g, " ");
   const sqlplus = client === "sqlplus";
   const sqlcmd = client === "sqlcmd";
-  // Substitution variables (`&name`, `$(name)`) change the SQL after this check.
-  if (sqlplus && /&&?[A-Za-z_]/.test(cleaned)) readOnly = false;
-  if (sqlcmd && /\$\(/.test(cleaned)) readOnly = false;
+  // Substitution variables (`&name`, `$(name)`) change the SQL after this
+  // check, inside string literals too.
+  if (sqlplus && /&/.test(script)) readOnly = false;
+  if (sqlcmd && /\$\(/.test(script)) readOnly = false;
+  const cleaned = stripSqlLiterals(script, client);
+  if (cleaned === undefined) return { statements: ["(unreadable)"], readOnly: false };
   const sqlLines: string[] = [];
-  for (const line of cleaned.split("\n")) {
-    const trimmed = line.trim();
-    if (sqlplus) {
-      // `/` runs the buffer, which holds the statement just checked.
-      if (trimmed === "/") {
-        sqlLines.push(";");
+  if (sqlplus) {
+    // SQL*Plus reads a script line by line. A line that starts a statement
+    // must be SELECT or WITH; the statement continues until a line ending in
+    // `;`, a `/` line, a lone `.`, or a blank line. Outside a statement only
+    // the display commands are allowed. `/` reruns the buffer, which holds a
+    // statement this check has already read.
+    let inStatement = false;
+    for (const line of cleaned.split("\n")) {
+      const trimmed = line.trim();
+      if (inStatement) {
+        if (trimmed === "" || trimmed === "." || trimmed === "/") {
+          sqlLines.push(";");
+          inStatement = false;
+          continue;
+        }
+        sqlLines.push(line);
+        if (trimmed.endsWith(";")) inStatement = false;
         continue;
       }
-      if (/^[!$@]/.test(trimmed)) {
-        kinds(trimmed[0]!);
+      if (trimmed === "" || trimmed === "/") continue;
+      const word = /^([A-Za-z]+)(?![\w$#.])/.exec(trimmed)?.[1];
+      const upper = word?.toUpperCase();
+      if (upper === "SELECT" || upper === "WITH") {
+        sqlLines.push(line);
+        inStatement = !trimmed.endsWith(";");
+        continue;
+      }
+      const command = word === undefined ? undefined : sqlplusAbbreviation(word, SQLPLUS_DISPLAY_COMMANDS);
+      kinds(upper ?? trimmed.split(/\s+/)[0]!);
+      if (command === undefined || (command === "SET" && !sqlplusSetIsSafe(trimmed))) readOnly = false;
+    }
+  } else {
+    for (const line of cleaned.split("\n")) {
+      const trimmed = line.trim();
+      if (sqlcmd) {
+        if (/^go(\s+\d+)?$/i.test(trimmed)) {
+          sqlLines.push(";");
+          continue;
+        }
+        // `:r`, `:out`, `:!!`, `!!` and other sqlcmd commands read files, write files, or run shell commands.
+        if (trimmed.startsWith(":") || trimmed.startsWith("!!")) {
+          kinds(trimmed.split(/\s+/)[0]!);
+          readOnly = false;
+          continue;
+        }
+        sqlLines.push(line);
+        continue;
+      }
+      if (trimmed.startsWith("\\")) {
+        const meta = trimmed.split(/\s+/)[0]!;
+        kinds(meta);
+        if (!PSQL_READ_META.has(meta)) readOnly = false;
+        continue;
+      }
+      if (trimmed.startsWith(".")) {
+        const dot = trimmed.split(/\s+/)[0]!;
+        kinds(dot);
+        if (!SQLITE_READ_DOT.has(dot)) readOnly = false;
+        continue;
+      }
+      // psql runs a backslash command anywhere outside literals (`SELECT 1 \g file`).
+      if (line.includes("\\")) {
+        kinds(line.slice(line.indexOf("\\")).split(/\s+/)[0]!);
         readOnly = false;
-        continue;
-      }
-      // A command word, not a column such as `c.name` or `start_dt`.
-      const word = /^([A-Za-z]+)(?![\w.$#])/.exec(trimmed)?.[1]?.toUpperCase();
-      if (word && SQLPLUS_UNSAFE_COMMANDS.has(word)) {
-        kinds(word);
-        readOnly = false;
-        continue;
-      }
-      if (word && SQLPLUS_DISPLAY_COMMANDS.has(word)) {
-        kinds(word);
-        if (SQLPLUS_SQL_SET.test(trimmed)) readOnly = false;
-        continue;
       }
       sqlLines.push(line);
-      continue;
     }
-    if (sqlcmd) {
-      if (/^go(\s+\d+)?$/i.test(trimmed)) {
-        sqlLines.push(";");
-        continue;
-      }
-      // `:r`, `:out`, `:!!`, `!!` and other sqlcmd commands read files, write files, or run shell commands.
-      if (trimmed.startsWith(":") || trimmed.startsWith("!!")) {
-        kinds(trimmed.split(/\s+/)[0]!);
-        readOnly = false;
-        continue;
-      }
-      sqlLines.push(line);
-      continue;
-    }
-    if (trimmed.startsWith("\\")) {
-      const meta = trimmed.split(/\s+/)[0]!;
-      kinds(meta);
-      if (!PSQL_READ_META.has(meta)) readOnly = false;
-      continue;
-    }
-    if (trimmed.startsWith(".")) {
-      const dot = trimmed.split(/\s+/)[0]!;
-      kinds(dot);
-      if (!SQLITE_READ_DOT.has(dot)) readOnly = false;
-      continue;
-    }
-    sqlLines.push(line);
   }
   for (const statement of sqlLines.join("\n").split(";")) {
     const text = statement.trim();
@@ -334,7 +428,10 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
     if (sqlcmd && /^SET\s+NOCOUNT\s+(ON|OFF)$/i.test(text)) continue;
     if (
       !SQL_READ_STARTS.has(first) ||
+      // Oracle has no read-only EXPLAIN, SHOW, TABLE, or VALUES statement; EXPLAIN PLAN writes PLAN_TABLE.
+      (sqlplus && first !== "SELECT" && first !== "WITH") ||
       SQL_WRITE_WORDS.test(text) ||
+      (sqlcmd && TSQL_WRITE_WORDS.test(text)) ||
       SQL_SIDE_EFFECT_FUNCTIONS.test(text) ||
       !sqlCallsOnlyBuiltins(text)
     ) {

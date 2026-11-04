@@ -719,15 +719,24 @@ Update `/automode model` to write `jevModel` when
   `sqlite3`, `sqlplus`, or `sqlcmd` call adds a `sql:` line with its statement kinds
   and whether they are verified read-only (SQL from `-c`/`-e`/`-Q`/`-q`, heredocs,
   including a heredoc fed into `ssh`, and here-strings; string literals and comments
-  stripped; any write word, side-effect function, call to a function that is not a
-  known built-in, schema- or package-qualified call, `nextval`, non-describe psql
-  meta-command, dollar-quoted body, `-f`/`-i`/`@` script file, substitution variable
-  (`&name`, `$(name)`), or expanded heredoc makes it `unverified`). SQL*Plus display
-  commands (`SET`, `COLUMN`, `PROMPT`, `DESCRIBE`, and similar) and a `/` line are
-  allowed; `SPOOL`, `HOST`, `!`, `$`, `@`, `START`, `EXECUTE`, `CONNECT`, `DEFINE`,
-  buffer edits, PL/SQL blocks, and `SET ROLE`/`SET TRANSACTION` are not. For `sqlcmd`,
-  `GO` and `SET NOCOUNT ON|OFF` are allowed and any `:` command or `!!` is not. A
-  client call behind exactly
+  stripped by a left-to-right scan, including `[...]` names for `sqlcmd`; any write word,
+  T-SQL write or control keyword for `sqlcmd` (T-SQL needs no `;` between statements),
+  side-effect function, call to a function that is not a known built-in, schema-,
+  package-qualified or quoted-name call, `nextval`, non-describe psql meta-command or
+  a backslash command anywhere on a psql line, dollar-quoted body,
+  `-f`/`-i`/`@` script file, substitution variable (`&`, `$(name)`), or expanded
+  heredoc makes it `unverified`, and so does text the scan cannot read reliably: an
+  unterminated literal or comment, a backslash inside a quoted literal (MySQL and
+  PostgreSQL `E''` escapes), MySQL's executable comments, Oracle `q'...'` literals, a
+  MySQL `--` not followed by whitespace, or, for `sqlplus` and `sqlcmd`, a literal or
+  comment that spans lines. SQL*Plus is checked line by line on an allowlist: outside
+  a statement only display commands (`SET`, `COLUMN`, `PROMPT`, `TTITLE`, `BREAK`,
+  `COMPUTE`, `CLEAR`, `REMARK`, `WHENEVER`, `EXIT`, `SHOW`, `DESCRIBE`, with their
+  abbreviations) and `/` are allowed, `SET` only for display variables (not `CMDSEP`,
+  `SQLTERMINATOR`, `SQLBLANKLINES`, or SQL `SET ROLE`), and a statement must start with
+  `SELECT` or `WITH` and ends at a `;` line end, `/`, a lone `.`, or a blank line. For
+  `sqlcmd`, `GO` and `SET NOCOUNT ON|OFF` are allowed and any `:` command or `!!` is
+  not. A client call behind exactly
   `sudo -n`/`-u`, `docker|podman exec`, or `kubectl exec`, with no file-writing
   client option (`-o`, `-L`, `--tee`, `-f`) and verified read-only SQL, counts as a
   read-only command. `sqlite3` never does, since opening a missing database creates
