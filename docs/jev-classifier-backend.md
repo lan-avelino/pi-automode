@@ -716,11 +716,18 @@ Update `/automode model` to write `jevModel` when
   Anything else is `unverified`. When a verified read-only `ssh` is followed by a
   local redirect, a `write_location` line says the local shell writes the file on
   this machine and the remote command writes nothing. A `psql`, `mysql`, `mariadb`,
-  or `sqlite3` call adds a `sql:` line with its statement kinds and whether they are
-  verified read-only (SQL from `-c`/`-e`, heredocs, including a heredoc fed into
-  `ssh`, and here-strings; string literals and comments stripped; any write word,
-  side-effect function, non-describe psql meta-command, dollar-quoted body, `-f`
-  file, or expanded heredoc makes it `unverified`). A client call behind exactly
+  `sqlite3`, `sqlplus`, or `sqlcmd` call adds a `sql:` line with its statement kinds
+  and whether they are verified read-only (SQL from `-c`/`-e`/`-Q`/`-q`, heredocs,
+  including a heredoc fed into `ssh`, and here-strings; string literals and comments
+  stripped; any write word, side-effect function, call to a function that is not a
+  known built-in, schema- or package-qualified call, `nextval`, non-describe psql
+  meta-command, dollar-quoted body, `-f`/`-i`/`@` script file, substitution variable
+  (`&name`, `$(name)`), or expanded heredoc makes it `unverified`). SQL*Plus display
+  commands (`SET`, `COLUMN`, `PROMPT`, `DESCRIBE`, and similar) and a `/` line are
+  allowed; `SPOOL`, `HOST`, `!`, `$`, `@`, `START`, `EXECUTE`, `CONNECT`, `DEFINE`,
+  buffer edits, PL/SQL blocks, and `SET ROLE`/`SET TRANSACTION` are not. For `sqlcmd`,
+  `GO` and `SET NOCOUNT ON|OFF` are allowed and any `:` command or `!!` is not. A
+  client call behind exactly
   `sudo -n`/`-u`, `docker|podman exec`, or `kubectl exec`, with no file-writing
   client option (`-o`, `-L`, `--tee`, `-f`) and verified read-only SQL, counts as a
   read-only command. `sqlite3` never does, since opening a missing database creates

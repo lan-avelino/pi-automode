@@ -266,6 +266,118 @@ test("a verified read-only SQL call through sudo and docker exec counts as read-
 	}
 });
 
+test("a SELECT that calls a non-built-in function is not verified read-only", () => {
+	// Any user-defined or package function can write; only known built-ins count.
+	for (const body of [
+		"SELECT purge_inactive_users(365);",
+		"SELECT public.purge_inactive_users(365);",
+		"SELECT count(*), app.refresh_cache() FROM sessions;",
+		"WITH s(n) AS (SELECT 1) SELECT n FROM s;",
+		"SELECT * FROM dblink_exec('host=x', 'delete from t');",
+		// Quoted names hide the call from a bare-identifier match.
+		'SELECT "purge_inactive_users"(365);',
+		'SELECT "app"."purge_inactive_users"(365);',
+		"SELECT [dbo].[fn_purge](1);",
+		"SELECT `purge_users`(1);",
+	]) {
+		assert.match(sqlLine(`${VIA_DOCKER}\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	// Built-in functions, type modifiers, and keywords before a parenthesis stay verified.
+	assert.equal(
+		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name))\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
+		"client=psql statements=SELECT read_only=true",
+	);
+});
+
+// --- sqlplus and sqlcmd -------------------------------------------------------
+
+const SQLPLUS = "docker exec -i app-dev-oracle-1 sqlplus -s APP/app_dev@//localhost/FREEPDB1 <<'SQL'";
+const SQLCMD = "docker exec -i app-dev-mssql-1 /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U app -P App_dev_1 -d APP";
+
+test("describeActionFacts verifies read-only sqlplus scripts", () => {
+	// The shape that prompted in session 01a1a047: display settings, then dictionary reads.
+	const script = [
+		SQLPLUS,
+		"set pagesize 300 linesize 200 long 100000",
+		"col constraint_name format a32",
+		"column column_name format a24",
+		"prompt === constraints",
+		"select c.table_name, c.constraint_name, cc.column_name",
+		"  from user_constraints c left join user_cons_columns cc on c.constraint_name = cc.constraint_name",
+		" where c.table_name in ('USER_PROFILE','ROLE') order by c.table_name, cc.position;",
+		"select count(*), max(user_id), to_char(sysdate, 'YYYY') from user_profile",
+		"/",
+		"desc user_profile",
+		"SQL",
+	].join("\n");
+	assert.equal(sqlLine(script), "client=sqlplus statements=SET, COL, COLUMN, PROMPT, DESC, SELECT read_only=true");
+	const facts = factMap(describeActionFacts(bash(script), []));
+	assert.equal(facts.read_only, "true");
+});
+
+test("describeActionFacts never marks writing or unknown sqlplus scripts read-only", () => {
+	for (const body of [
+		"spool /tmp/out.txt\nselect 1 from dual;",
+		"spo /tmp/out.txt\nselect 1 from dual;",
+		"host rm -rf /tmp/x",
+		"select 1 from dual\n\nhost rm -rf /tmp/x",
+		"!rm -rf /tmp/x",
+		"$del x",
+		"@cleanup.sql",
+		"@@cleanup.sql",
+		"start cleanup.sql",
+		"exec pck_user_admin.purge(1);",
+		"execute purge;",
+		"begin purge; end;\n/",
+		"declare n number; begin null; end;\n/",
+		"select pck_user_admin.purge_inactive_users(365) from dual;",
+		"select purge_inactive_users(365) from dual;",
+		"select seq_user.nextval from dual;",
+		"define t = user_profile\nselect * from &t;",
+		"select &&col from dual;",
+		"conn system/manager\nselect 1 from dual;",
+		"set role dba;\nselect 1 from dual;",
+		"set transaction read write;\nselect 1 from dual;",
+		"select * from user_profile for update;",
+		"update user_profile set status = 'I';\ncommit;",
+		"select * from table(pck_x.rows());",
+	]) {
+		assert.match(sqlLine(`${SQLPLUS}\n${body}\nSQL`) ?? "", /^client=sqlplus .*read_only=unverified$/, body);
+	}
+	// A script file, or no SQL at all.
+	assert.match(sqlLine("sqlplus -s app/app@//localhost/FREEPDB1 @cleanup.sql") ?? "", /read_only=unverified$/);
+	assert.match(sqlLine("sqlplus -s app/app@//localhost/FREEPDB1") ?? "", /read_only=unverified$/);
+});
+
+test("describeActionFacts verifies read-only sqlcmd queries", () => {
+	const query = `${SQLCMD} -Q "set nocount on; select count(*) as tbls from sys.tables; select count(*) from sys.columns where object_id = object_id('USER_PROFILE')" 2>&1`;
+	assert.equal(sqlLine(query), "client=sqlcmd statements=SET, SELECT read_only=true");
+	assert.equal(factMap(describeActionFacts(bash(query), [])).read_only, "true");
+	assert.equal(
+		sqlLine(`${SQLCMD} <<'SQL'\nselect name from sys.tables;\nGO\nselect top 5 * from USER_PROFILE\ngo\nSQL`),
+		"client=sqlcmd statements=SELECT read_only=true",
+	);
+});
+
+test("describeActionFacts never marks writing or unknown sqlcmd queries read-only", () => {
+	for (const query of [
+		"exec sp_purge_users",
+		"select * into user_copy from USER_PROFILE",
+		"set nocount on; delete from USER_PROFILE",
+		"select dbo.fn_purge(1)",
+		"waitfor delay '00:00:05'",
+		"select $(col) from USER_PROFILE",
+		"set role admin; select 1",
+	]) {
+		assert.match(sqlLine(`${SQLCMD} -Q "${query}"`) ?? "", /^client=sqlcmd .*read_only=unverified$/, query);
+	}
+	for (const body of [":!! rm -rf /tmp/x\nselect 1\nGO", ":r other.sql\nGO", ":out /tmp/x.txt\nselect 1\nGO"]) {
+		assert.match(sqlLine(`${SQLCMD} <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	assert.match(sqlLine(`${SQLCMD} -i cleanup.sql`) ?? "", /read_only=unverified$/);
+	// -o writes the output to a file.
+	assert.equal(factMap(describeActionFacts(bash(`${SQLCMD} -o /tmp/out.txt -Q "select 1"`), [])).read_only, "unverified");
+});
 
 // --- python HTTP reads -------------------------------------------------------
 
