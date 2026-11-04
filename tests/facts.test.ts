@@ -277,8 +277,18 @@ test("MySQL quoting and comment forms that hide SQL are not verified read-only",
 		'select "x\\""; delete from t; select "";',
 		// `--` starts a comment only before whitespace.
 		"select 1 --1; delete from t;",
-		// MySQL runs the body of /*! ... */.
+		// MySQL runs the body of /*! ... */, and MariaDB of /*M! ... */.
 		"select 1 /*! ; delete from t */;",
+		"select 1 /*M! ; delete from t */;",
+		// `#` starts a comment in MySQL, so a quote after it is not a string.
+		"select 1 # '\n; delete from t; select 1 # '\n;",
+		// Client commands at the start of a line run even inside a statement.
+		"select 1\nsystem rm -rf /tmp/x\n;",
+		"select 1\npager rm -rf /tmp/x\n;",
+		"select 1\nsource cleanup.sql\n;",
+		"tee /tmp/out.txt\nselect 1;",
+		// In mysql, `\\d` sets the delimiter; psql's describe commands do not apply.
+		"\\d //\nselect 1 //",
 	]) {
 		assert.match(sqlLine(`mysql -h db <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
 	}
@@ -297,6 +307,12 @@ test("a SELECT that calls a non-built-in function is not verified read-only", ()
 		"WITH s(n) AS (SELECT 1) SELECT n FROM s;",
 		"SELECT * FROM dblink_exec('host=x', 'delete from t');",
 		// Quoted names hide the call from a bare-identifier match.
+		// psql substitutes `:name` variables, which `-v` can set to any SQL.
+		"SELECT :x;",
+		"SELECT * FROM t WHERE id = :'id';",
+		"SELECT :\"col\" FROM t;",
+		// PostgreSQL nests block comments, so the comment ends later than the first `*/`.
+		"SELECT 1 /* /* */ ' */; DELETE FROM t; SELECT 1 --'",
 		// An unterminated string or comment cannot be read.
 		"SELECT 'abc;",
 		"SELECT 1; /* DELETE FROM t;",
@@ -309,7 +325,7 @@ test("a SELECT that calls a non-built-in function is not verified read-only", ()
 	}
 	// Built-in functions, type modifiers, and keywords before a parenthesis stay verified.
 	assert.equal(
-		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name))\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
+		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name)), created_at::date, tags[1:2]\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
 		"client=psql statements=SELECT read_only=true",
 	);
 });
@@ -386,6 +402,12 @@ test("describeActionFacts never marks writing or unknown sqlplus scripts read-on
 		"explain plan for select 1 from dual;",
 		// A lone `.` ends entry without running; the next line is a command.
 		"select 1 from dual\n.\nho rm -rf /tmp/x",
+		// SQLPREFIX (`#`) runs a SQL*Plus command in the middle of a statement.
+		"select 1\n#host rm -rf /tmp/x\nfrom dual;",
+		"#spool /tmp/x.txt",
+		// SQL*Plus sees a `;` at the end of a comment line as the terminator.
+		"select 1 from dual -- x;\nhost rm -rf /tmp/x",
+		"select 1 from dual /* x */\n;",
 	]) {
 		assert.match(sqlLine(`${SQLPLUS}\n${body}\nSQL`) ?? "", /^client=sqlplus .*read_only=unverified$/, body);
 	}
@@ -426,10 +448,22 @@ test("describeActionFacts never marks writing or unknown sqlcmd queries read-onl
 		// A bracketed identifier holding a quote hides the next statement.
 		"select [x'] , 1; delete from t; select '",
 		"select [a]]'] from t; delete from t; select ']",
+		// SQL Server nests block comments too.
+		"select 1 /* /* */ ' */ delete from t select 1 --'",
+		// NEXT VALUE FOR advances a sequence.
+		"select next value for dbo.user_seq",
 	]) {
 		assert.match(sqlLine(`${SQLCMD} -Q "${query}"`) ?? "", /^client=sqlcmd .*read_only=unverified$/, query);
 	}
-	for (const body of [":!! rm -rf /tmp/x\nselect 1\nGO", ":r other.sql\nGO", ":out /tmp/x.txt\nselect 1\nGO"]) {
+	for (const body of [
+		":!! rm -rf /tmp/x\nselect 1\nGO",
+		":r other.sql\nGO",
+		":out /tmp/x.txt\nselect 1\nGO",
+		// sqlcmd also takes these commands without a colon at the start of a line.
+		"select 1\nexit(select 1)",
+		"ed",
+		"select 1\nquit",
+	]) {
 		assert.match(sqlLine(`${SQLCMD} <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
 	}
 	assert.match(sqlLine(`${SQLCMD} -i cleanup.sql`) ?? "", /read_only=unverified$/);

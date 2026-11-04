@@ -242,6 +242,12 @@ const SQLPLUS_SET_VARIABLES: [string, string][] = [
   ["NULL", "NULL"], ["TIMING", "TIMI"], ["TERMOUT", "TERM"], ["UNDERLINE", "UND"], ["NEWPAGE", "NEWP"],
   ["EMBEDDED", "EMB"], ["DEFINE", "DEF"],
 ];
+/** mysql client commands, which the client runs when a line starts with one. */
+const MYSQL_CLIENT_COMMANDS = new Set([
+  "clear", "connect", "delimiter", "edit", "ego", "exit", "go", "help", "nopager", "notee", "nowarning", "pager",
+  "print", "prompt", "quit", "rehash", "source", "status", "system", "tee", "use", "charset", "warnings",
+  "resetconnection", "query_attributes", "ssl_session_data_print",
+]);
 /** T-SQL keywords that write, run code, or change server state. T-SQL needs no `;` between statements. */
 const TSQL_WRITE_WORDS =
   /\b(RESTORE|BACKUP|DENY|DISABLE|ENABLE|DBCC|RECONFIGURE|CHECKPOINT|BEGIN|COMMIT|ROLLBACK|SAVE|USE|BULK|RAISERROR|THROW|DECLARE|GOTO|WHILE|IF|RETURN|SETUSER|REVERT|OPENROWSET|OPENQUERY|OPENDATASOURCE|OPENXML|SEND|RECEIVE)\b/i;
@@ -263,31 +269,43 @@ function sqlplusSetIsSafe(line: string): boolean {
  * Replace string literals, quoted identifiers, and comments with placeholders,
  * scanning left to right as the client does. Returns undefined when the text
  * cannot be read reliably: an unterminated literal or comment, a backslash in
- * a quoted literal (MySQL and PostgreSQL E'' strings use it as an escape),
- * MySQL's executable comments (slash, star, bang), Oracle `q'...'` literals, or, for
- * the line-oriented sqlplus and sqlcmd, a literal or comment that spans a line
- * (their line commands do not respect quotes).
+ * a quoted literal (MySQL and PostgreSQL E'' strings use it as an escape), a
+ * nested block comment (PostgreSQL and SQL Server nest them), a MySQL block
+ * comment not followed by whitespace (versioned, MariaDB, and hint comments
+ * run), Oracle `q'...'` literals, any comment in sqlplus (it finds statement
+ * ends on the raw line), or, for the line-oriented sqlplus and sqlcmd, a
+ * literal or comment that spans a line. MySQL `#` comments are recognized.
  */
 function stripSqlLiterals(script: string, client: string): string | undefined {
   if (/\/\*!/.test(script)) return undefined;
   if (client === "sqlplus" && /(^|[^\w$#])[nN]?[qQ]'/.test(script)) return undefined;
-  const lineOriented = client === "sqlplus" || client === "sqlcmd";
+  const sqlplus = client === "sqlplus";
+  const lineOriented = sqlplus || client === "sqlcmd";
   const mysql = client === "mysql" || client === "mariadb";
   let out = "";
   let index = 0;
   while (index < script.length) {
     const char = script[index]!;
     const next = script[index + 1];
-    if (char === "-" && next === "-" && (!mysql || /^[\s]?$/.test(script[index + 2] ?? ""))) {
+    const lineComment = (char === "-" && next === "-" && (!mysql || /^\s?$/.test(script[index + 2] ?? ""))) ||
+      (mysql && char === "#");
+    // SQL*Plus finds statement ends and commands on the raw line, comments and all.
+    if (sqlplus && (lineComment || (char === "/" && next === "*"))) return undefined;
+    if (lineComment) {
       const end = script.indexOf("\n", index);
       out += " ";
       index = end < 0 ? script.length : end;
       continue;
     }
     if (char === "/" && next === "*") {
+      // MySQL and MariaDB run hint and versioned comments (`/*!`, `/*M!`, `/*+`).
+      if (mysql && !/^[\s*]$/.test(script[index + 2] ?? "")) return undefined;
       const end = script.indexOf("*/", index + 2);
       if (end < 0) return undefined;
-      if (lineOriented && script.slice(index, end).includes("\n")) return undefined;
+      const body = script.slice(index + 2, end);
+      // PostgreSQL and SQL Server nest block comments; the first `*/` may not end this one.
+      if (body.includes("/*")) return undefined;
+      if (lineOriented && body.includes("\n")) return undefined;
       out += " ";
       index = end + 2;
       continue;
@@ -360,6 +378,12 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
     let inStatement = false;
     for (const line of cleaned.split("\n")) {
       const trimmed = line.trim();
+      // SQLPREFIX (`#`) runs a SQL*Plus command even in the middle of a statement.
+      if (trimmed.startsWith("#")) {
+        kinds("#");
+        readOnly = false;
+        continue;
+      }
       if (inStatement) {
         if (trimmed === "" || trimmed === "." || trimmed === "/") {
           sqlLines.push(";");
@@ -391,27 +415,34 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
           continue;
         }
         // `:r`, `:out`, `:!!`, `!!` and other sqlcmd commands read files, write files, or run shell commands.
-        if (trimmed.startsWith(":") || trimmed.startsWith("!!")) {
-          kinds(trimmed.split(/\s+/)[0]!);
+        if (trimmed.startsWith(":") || trimmed.startsWith("!!") || /^(ED|EXIT|QUIT|RESET)(?![\w$#@])/i.test(trimmed)) {
+          kinds(trimmed.split(/[\s(]+/)[0]!);
           readOnly = false;
           continue;
         }
         sqlLines.push(line);
         continue;
       }
-      if (trimmed.startsWith("\\")) {
+      if (client === "psql" && trimmed.startsWith("\\")) {
         const meta = trimmed.split(/\s+/)[0]!;
         kinds(meta);
         if (!PSQL_READ_META.has(meta)) readOnly = false;
         continue;
       }
-      if (trimmed.startsWith(".")) {
+      // mysql client commands such as `system`, `pager`, `source`, and `tee` run at the start of any line.
+      const mysqlCommand = /^([A-Za-z_]+)/.exec(trimmed)?.[1]?.toLowerCase();
+      if ((client === "mysql" || client === "mariadb") && mysqlCommand && MYSQL_CLIENT_COMMANDS.has(mysqlCommand)) {
+        kinds(mysqlCommand.toUpperCase());
+        readOnly = false;
+        continue;
+      }
+      if (client === "sqlite3" && trimmed.startsWith(".")) {
         const dot = trimmed.split(/\s+/)[0]!;
         kinds(dot);
         if (!SQLITE_READ_DOT.has(dot)) readOnly = false;
         continue;
       }
-      // psql runs a backslash command anywhere outside literals (`SELECT 1 \g file`).
+      // psql and mysql run a backslash command anywhere outside literals (`SELECT 1 \g file`).
       if (line.includes("\\")) {
         kinds(line.slice(line.indexOf("\\")).split(/\s+/)[0]!);
         readOnly = false;
@@ -432,6 +463,9 @@ function classifySql(script: string, client = "psql"): { statements: string[]; r
       (sqlplus && first !== "SELECT" && first !== "WITH") ||
       SQL_WRITE_WORDS.test(text) ||
       (sqlcmd && TSQL_WRITE_WORDS.test(text)) ||
+      // psql substitutes `:name`, `:'name'`, and `:"name"` variables, which `-v` can set to any SQL.
+      (client === "psql" && /(^|[^:]):([A-Za-z_]|''|"")/.test(text)) ||
+      /\bNEXT\s+VALUE\s+FOR\b/i.test(text) ||
       SQL_SIDE_EFFECT_FUNCTIONS.test(text) ||
       !sqlCallsOnlyBuiltins(text)
     ) {

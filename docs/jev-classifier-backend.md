@@ -727,9 +727,14 @@ Update `/automode model` to write `jevModel` when
   `-f`/`-i`/`@` script file, substitution variable (`&`, `$(name)`), or expanded
   heredoc makes it `unverified`, and so does text the scan cannot read reliably: an
   unterminated literal or comment, a backslash inside a quoted literal (MySQL and
-  PostgreSQL `E''` escapes), MySQL's executable comments, Oracle `q'...'` literals, a
-  MySQL `--` not followed by whitespace, or, for `sqlplus` and `sqlcmd`, a literal or
-  comment that spans lines. SQL*Plus is checked line by line on an allowlist: outside
+  PostgreSQL `E''` escapes), a nested block comment, a MySQL block comment not
+  followed by whitespace (`/*!`, `/*M!`, `/*+`), Oracle `q'...'` literals, a MySQL
+  `--` not followed by whitespace (`#` is a MySQL comment), any comment in `sqlplus`,
+  or, for `sqlplus` and `sqlcmd`, a literal or comment that spans lines. A psql
+  `:name` variable, `NEXT VALUE FOR`, a mysql client command (`system`, `pager`,
+  `source`, `tee`, ...) or backslash command on any line, a `sqlcmd` `ED`, `EXIT`,
+  `QUIT`, or `RESET` line, and a SQL*Plus `#` line (SQLPREFIX runs it mid-statement)
+  are unverified too. SQL*Plus is checked line by line on an allowlist: outside
   a statement only display commands (`SET`, `COLUMN`, `PROMPT`, `TTITLE`, `BREAK`,
   `COMPUTE`, `CLEAR`, `REMARK`, `WHENEVER`, `EXIT`, `SHOW`, `DESCRIBE`, with their
   abbreviations) and `/` are allowed, `SET` only for display variables (not `CMDSEP`,
