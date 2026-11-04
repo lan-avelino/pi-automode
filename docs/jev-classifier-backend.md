@@ -729,7 +729,7 @@ Update `/automode model` to write `jevModel` when
   unterminated literal or comment, a backslash inside a quoted literal (MySQL and
   PostgreSQL `E''` escapes), a nested block comment, a MySQL block comment not
   followed by whitespace (`/*!`, `/*M!`, `/*+`), Oracle `q'...'` literals, a MySQL
-  `--` followed by anything but whitespace or a control character (`#` is a MySQL comment), any comment in `sqlplus`,
+  `--` followed by a control character other than whitespace (the server reads it as a comment, the client does not; `--` before anything else but ASCII whitespace is not a comment, and `#` is), any comment in `sqlplus`,
   or, for `sqlplus` and `sqlcmd`, a literal or comment that spans lines. A psql
   variable (`:name`, `:'name'`, `:{?name}`, names may start with a digit, so `a[1:2]`
   counts) or `-v`/`--set`/`--variable` option, `NEXT VALUE FOR`, a mysql client command (`system`, `pager`,

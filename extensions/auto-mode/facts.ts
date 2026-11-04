@@ -300,7 +300,12 @@ function stripSqlLiterals(script: string, client: string): string | undefined {
   while (index < script.length) {
     const char = script[index]!;
     const next = script[index + 1];
-    const lineComment = (char === "-" && next === "-" && (!mysql || /^[\x00-\x20\x7f]?$/.test(script[index + 2] ?? ""))) ||
+    // The mysql server reads `--` plus whitespace or a control character as a
+    // comment, but the client, which splits statements and runs backslash
+    // commands, only `--` plus whitespace. Where they disagree, fail closed.
+    const third = script[index + 2] ?? "";
+    if (mysql && char === "-" && next === "-" && /^[\x00-\x08\x0e-\x1f\x7f]$/.test(third)) return undefined;
+    const lineComment = (char === "-" && next === "-" && (!mysql || /^[ \t\n\v\f\r]?$/.test(third))) ||
       (mysql && char === "#");
     // SQL*Plus finds statement ends and commands on the raw line, comments and all.
     if (sqlplus && (lineComment || (char === "/" && next === "*"))) return undefined;

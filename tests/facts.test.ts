@@ -286,8 +286,12 @@ test("MySQL quoting and comment forms that hide SQL are not verified read-only",
 		"select 1 /*M! ; delete from t */;",
 		// `#` starts a comment in MySQL, so a quote after it is not a string.
 		"select 1 # '\n; delete from t; select 1 # '\n;",
-		// `--` followed by a control character is a comment in MySQL.
+		// `--` followed by a control character is a comment to the server but not
+		// to the mysql client, which then runs a backslash command after it.
 		"select 1 --\x01 '\n; delete from t; select 1 --\x01 '\n;",
+		"select 1 --\x01; \\! rm -rf /tmp/x",
+		// A non-ASCII space is not whitespace to the client either.
+		"select 1 --\u00a0; \\! rm -rf /tmp/x",
 		// Client commands at the start of a line run even inside a statement.
 		"select 1\nsystem rm -rf /tmp/x\n;",
 		"select 1\npager rm -rf /tmp/x\n;",
