@@ -221,12 +221,20 @@ test("describeActionFacts never marks writing or unknown SQL read-only", () => {
 		"\\copy sessions TO '/tmp/sessions.csv' CSV",
 		"\\! rm -rf /tmp/x",
 		"CALL cleanup();",
+		// psql runs backslash commands anywhere on a line, not only at its start.
+		"SELECT 1 \\g /tmp/out.txt",
+		"SELECT 1; \\o /tmp/out.txt",
+		"SELECT 1 \\gexec",
 	]) {
 		const line = sqlLine(`${VIA_DOCKER}\n${body}\nSQL`);
 		assert.match(line ?? "", /read_only=unverified$/, body);
 	}
 	// SQL that cannot be read.
 	assert.match(sqlLine("psql -U app -f cleanup.sql") ?? "", /read_only=unverified$/);
+	// -v sets variables that psql substitutes into the SQL.
+	for (const option of ["-v x=1", "-vx=1", "--set x=1", "--set=x=1", "--variable x=1", "--variable=x=1"]) {
+		assert.match(sqlLine(`psql -U app ${option} -c 'select 1'`) ?? "", /read_only=unverified$/, option);
+	}
 	assert.match(sqlLine("psql -U app") ?? "", /read_only=unverified$/);
 	// An unquoted heredoc expands $(...) before psql sees it.
 	assert.match(
@@ -266,6 +274,219 @@ test("a verified read-only SQL call through sudo and docker exec counts as read-
 	}
 });
 
+test("MySQL quoting and comment forms that hide SQL are not verified read-only", () => {
+	for (const body of [
+		// A backslash escapes the quote in MySQL, so the string ends earlier than '' pairing says.
+		"select 'x\\''; delete from t; select '';",
+		'select "x\\""; delete from t; select "";',
+		// `--` starts a comment only before whitespace.
+		"select 1 --1; delete from t;",
+		// MySQL runs the body of /*! ... */, and MariaDB of /*M! ... */.
+		"select 1 /*! ; delete from t */;",
+		"select 1 /*M! ; delete from t */;",
+		// `#` starts a comment in MySQL, so a quote after it is not a string.
+		"select 1 # '\n; delete from t; select 1 # '\n;",
+		// `--` followed by a control character is a comment to the server but not
+		// to the mysql client, which then runs a backslash command after it.
+		"select 1 --\x01 '\n; delete from t; select 1 --\x01 '\n;",
+		"select 1 --\x01; \\! rm -rf /tmp/x",
+		// A non-ASCII space is not whitespace to the client either.
+		"select 1 --\u00a0; \\! rm -rf /tmp/x",
+		// Client commands at the start of a line run even inside a statement.
+		"select 1\nsystem rm -rf /tmp/x\n;",
+		"select 1\npager rm -rf /tmp/x\n;",
+		"select 1\nsource cleanup.sql\n;",
+		"tee /tmp/out.txt\nselect 1;",
+		// In mysql, `\\d` sets the delimiter; psql's describe commands do not apply.
+		"\\d //\nselect 1 //",
+	]) {
+		assert.match(sqlLine(`mysql -h db <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	assert.equal(
+		sqlLine("mysql -h db <<'SQL'\nselect count(*) from orders -- recent\nwhere id > 1;\nSQL"),
+		"client=mysql statements=SELECT read_only=true",
+	);
+});
+
+test("a SELECT that calls a non-built-in function is not verified read-only", () => {
+	// Any user-defined or package function can write; only known built-ins count.
+	for (const body of [
+		"SELECT purge_inactive_users(365);",
+		"SELECT public.purge_inactive_users(365);",
+		"SELECT count(*), app.refresh_cache() FROM sessions;",
+		"WITH s(n) AS (SELECT 1) SELECT n FROM s;",
+		"SELECT * FROM dblink_exec('host=x', 'delete from t');",
+		// Quoted names hide the call from a bare-identifier match.
+		// psql substitutes `:name` variables, which `-v` can set to any SQL.
+		"SELECT :x;",
+		"SELECT * FROM t WHERE id = :'id';",
+		"SELECT :\"col\" FROM t;",
+		// Variable names may start with a digit, so an array slice can interpolate one.
+		"SELECT tags[1:2] FROM t;",
+		// `::` is a cast; a third colon starts a variable.
+		"SELECT 1:::x;",
+		"SELECT :{?x};",
+		// A `/*` that overlaps the first `*/` still opens a nested comment.
+		"SELECT 1 /* x /*/ ' */; DELETE FROM t; SELECT 1 --'",
+		// PostgreSQL nests block comments, so the comment ends later than the first `*/`.
+		"SELECT 1 /* /* */ ' */; DELETE FROM t; SELECT 1 --'",
+		// An unterminated string or comment cannot be read.
+		"SELECT 'abc;",
+		"SELECT 1; /* DELETE FROM t;",
+		'SELECT "purge_inactive_users"(365);',
+		'SELECT "app"."purge_inactive_users"(365);',
+		"SELECT [dbo].[fn_purge](1);",
+		"SELECT `purge_users`(1);",
+	]) {
+		assert.match(sqlLine(`${VIA_DOCKER}\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	// Built-in functions, type modifiers, and keywords before a parenthesis stay verified.
+	assert.equal(
+		sqlLine(`${VIA_DOCKER}\nSELECT generate_series(1, 3), coalesce(max(id), 0), cast(avg(n) AS numeric(10, 2)), upper(trim(name)), created_at::date, tags[1]\nFROM sessions WHERE id IN (SELECT id FROM users) AND EXISTS (SELECT 1) GROUP BY 1;\nSQL`),
+		"client=psql statements=SELECT read_only=true",
+	);
+});
+
+// --- sqlplus and sqlcmd -------------------------------------------------------
+
+const SQLPLUS = "docker exec -i app-dev-oracle-1 sqlplus -s APP/app_dev@//localhost/FREEPDB1 <<'SQL'";
+const SQLCMD = "docker exec -i app-dev-mssql-1 /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U app -P App_dev_1 -d APP";
+
+test("describeActionFacts verifies read-only sqlplus scripts", () => {
+	// The shape that prompted in session 01a1a047: display settings, then dictionary reads.
+	const script = [
+		SQLPLUS,
+		"set pagesize 300 linesize 200 long 100000",
+		"col constraint_name format a32",
+		"column column_name format a24",
+		"prompt === constraints",
+		"select c.table_name, c.constraint_name, cc.column_name",
+		"  from user_constraints c left join user_cons_columns cc on c.constraint_name = cc.constraint_name",
+		" where c.table_name in ('USER_PROFILE','ROLE') order by c.table_name, cc.position;",
+		"select count(*), max(user_id), to_char(sysdate, 'YYYY') from user_profile",
+		"/",
+		"desc user_profile",
+		"SQL",
+	].join("\n");
+	assert.equal(sqlLine(script), "client=sqlplus statements=SET, COL, COLUMN, PROMPT, DESC, SELECT read_only=true");
+	const facts = factMap(describeActionFacts(bash(script), []));
+	assert.equal(facts.read_only, "true");
+});
+
+test("describeActionFacts never marks writing or unknown sqlplus scripts read-only", () => {
+	for (const body of [
+		"spool /tmp/out.txt\nselect 1 from dual;",
+		"spo /tmp/out.txt\nselect 1 from dual;",
+		"host rm -rf /tmp/x",
+		"select 1 from dual\n\nhost rm -rf /tmp/x",
+		"!rm -rf /tmp/x",
+		"$del x",
+		"@cleanup.sql",
+		"@@cleanup.sql",
+		"start cleanup.sql",
+		"exec pck_user_admin.purge(1);",
+		"execute purge;",
+		"begin purge; end;\n/",
+		"declare n number; begin null; end;\n/",
+		"select pck_user_admin.purge_inactive_users(365) from dual;",
+		"select purge_inactive_users(365) from dual;",
+		"select seq_user.nextval from dual;",
+		"define t = user_profile\nselect * from &t;",
+		"select &&col from dual;",
+		"conn system/manager\nselect 1 from dual;",
+		"set role dba;\nselect 1 from dual;",
+		"set transaction read write;\nselect 1 from dual;",
+		"select * from user_profile for update;",
+		"update user_profile set status = 'I';\ncommit;",
+		"select * from table(pck_x.rows());",
+		// Abbreviations of unsafe commands, and commands this check does not know.
+		"spoo /tmp/out.txt\nselect 1 from dual;",
+		"hos rm -rf /tmp/x",
+		"execu purge;",
+		"archive log list",
+		// CMDSEP lets one line run several commands.
+		"set cmdsep on\nprompt x; host rm -rf /tmp/x",
+		"set sqlterminator !\nselect 1 from dual!",
+		"set sqlblanklines on\nselect 1 from dual;",
+		// A blank line ends statement entry even inside an open string.
+		"select 'a\n\nhost rm -rf /tmp/x\n' from dual;",
+		// q-quoted literals.
+		"select q'[it's]' from dual;\nhost rm -rf /tmp/x\nselect '' from dual;",
+		"select nq'{x}' from dual;",
+		// Substitution inside a string literal reads the next line as input.
+		"select '&x' from dual;",
+		// EXPLAIN PLAN writes to PLAN_TABLE.
+		"explain plan for select 1 from dual;",
+		// A lone `.` ends entry without running; the next line is a command.
+		"select 1 from dual\n.\nho rm -rf /tmp/x",
+		// SQLPREFIX (`#`) runs a SQL*Plus command in the middle of a statement.
+		"select 1\n#host rm -rf /tmp/x\nfrom dual;",
+		"#spool /tmp/x.txt",
+		// SQL*Plus sees a `;` at the end of a comment line as the terminator.
+		"select 1 from dual -- x;\nhost rm -rf /tmp/x",
+		"select 1 from dual /* x */\n;",
+	]) {
+		assert.match(sqlLine(`${SQLPLUS}\n${body}\nSQL`) ?? "", /^client=sqlplus .*read_only=unverified$/, body);
+	}
+	// A script file, or no SQL at all.
+	assert.match(sqlLine("sqlplus -s app/app@//localhost/FREEPDB1 @cleanup.sql") ?? "", /read_only=unverified$/);
+	assert.match(sqlLine("sqlplus -s app/app@//localhost/FREEPDB1") ?? "", /read_only=unverified$/);
+});
+
+test("describeActionFacts verifies read-only sqlcmd queries", () => {
+	const query = `${SQLCMD} -Q "set nocount on; select count(*) as tbls from sys.tables; select count(*) from sys.columns where object_id = object_id('USER_PROFILE')" 2>&1`;
+	assert.equal(sqlLine(query), "client=sqlcmd statements=SET, SELECT read_only=true");
+	assert.equal(factMap(describeActionFacts(bash(query), [])).read_only, "true");
+	assert.equal(
+		sqlLine(`${SQLCMD} <<'SQL'\nselect name from sys.tables;\nGO\nselect top 5 * from USER_PROFILE\ngo\nSQL`),
+		"client=sqlcmd statements=SELECT read_only=true",
+	);
+});
+
+test("describeActionFacts never marks writing or unknown sqlcmd queries read-only", () => {
+	for (const query of [
+		"exec sp_purge_users",
+		"select * into user_copy from USER_PROFILE",
+		"set nocount on; delete from USER_PROFILE",
+		"select dbo.fn_purge(1)",
+		"waitfor delay '00:00:05'",
+		"select $(col) from USER_PROFILE",
+		"set role admin; select 1",
+		// T-SQL runs several statements without separators.
+		"select 1 restore database APP from disk = '/tmp/old.bak'",
+		"select 1 backup database APP to disk = '/tmp/x.bak'",
+		"select 1 dbcc checkident ('USER_PROFILE', reseed, 1)",
+		"select 1 begin tran update_user commit",
+		"select 1 deny select on USER_PROFILE to public",
+		"select 1 disable trigger all on USER_PROFILE",
+		"select 1 checkpoint",
+		"select 1 reconfigure",
+		"select * from openrowset('SQLNCLI', 'x', 'select 1')",
+		// A bracketed identifier holding a quote hides the next statement.
+		"select [x'] , 1; delete from t; select '",
+		"select [a]]'] from t; delete from t; select ']",
+		// SQL Server nests block comments too.
+		"select 1 /* /* */ ' */ delete from t select 1 --'",
+		// NEXT VALUE FOR advances a sequence.
+		"select next value for dbo.user_seq",
+	]) {
+		assert.match(sqlLine(`${SQLCMD} -Q "${query}"`) ?? "", /^client=sqlcmd .*read_only=unverified$/, query);
+	}
+	for (const body of [
+		":!! rm -rf /tmp/x\nselect 1\nGO",
+		":r other.sql\nGO",
+		":out /tmp/x.txt\nselect 1\nGO",
+		// sqlcmd also takes these commands without a colon at the start of a line.
+		"select 1\nexit(select 1)",
+		"ed",
+		"select 1\nquit",
+	]) {
+		assert.match(sqlLine(`${SQLCMD} <<'SQL'\n${body}\nSQL`) ?? "", /read_only=unverified$/, body);
+	}
+	assert.match(sqlLine(`${SQLCMD} -i cleanup.sql`) ?? "", /read_only=unverified$/);
+	// -o writes the output to a file.
+	assert.equal(factMap(describeActionFacts(bash(`${SQLCMD} -o /tmp/out.txt -Q "select 1"`), [])).read_only, "unverified");
+});
 
 // --- python HTTP reads -------------------------------------------------------
 

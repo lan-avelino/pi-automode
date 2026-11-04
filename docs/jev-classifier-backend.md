@@ -716,11 +716,33 @@ Update `/automode model` to write `jevModel` when
   Anything else is `unverified`. When a verified read-only `ssh` is followed by a
   local redirect, a `write_location` line says the local shell writes the file on
   this machine and the remote command writes nothing. A `psql`, `mysql`, `mariadb`,
-  or `sqlite3` call adds a `sql:` line with its statement kinds and whether they are
-  verified read-only (SQL from `-c`/`-e`, heredocs, including a heredoc fed into
-  `ssh`, and here-strings; string literals and comments stripped; any write word,
-  side-effect function, non-describe psql meta-command, dollar-quoted body, `-f`
-  file, or expanded heredoc makes it `unverified`). A client call behind exactly
+  `sqlite3`, `sqlplus`, or `sqlcmd` call adds a `sql:` line with its statement kinds
+  and whether they are verified read-only (SQL from `-c`/`-e`/`-Q`/`-q`, heredocs,
+  including a heredoc fed into `ssh`, and here-strings; string literals and comments
+  stripped by a left-to-right scan, including `[...]` names for `sqlcmd`; any write word,
+  T-SQL write or control keyword for `sqlcmd` (T-SQL needs no `;` between statements),
+  side-effect function, call to a function that is not a known built-in, schema-,
+  package-qualified or quoted-name call, `nextval`, non-describe psql meta-command or
+  a backslash command anywhere on a psql line, dollar-quoted body,
+  `-f`/`-i`/`@` script file, substitution variable (`&`, `$(name)`), or expanded
+  heredoc makes it `unverified`, and so does text the scan cannot read reliably: an
+  unterminated literal or comment, a backslash inside a quoted literal (MySQL and
+  PostgreSQL `E''` escapes), a nested block comment, a MySQL block comment not
+  followed by whitespace (`/*!`, `/*M!`, `/*+`), Oracle `q'...'` literals, a MySQL
+  `--` followed by a control character other than whitespace (the server reads it as a comment, the client does not; `--` before anything else but ASCII whitespace is not a comment, and `#` is), any comment in `sqlplus`,
+  or, for `sqlplus` and `sqlcmd`, a literal or comment that spans lines. A psql
+  variable (`:name`, `:'name'`, `:{?name}`, names may start with a digit, so `a[1:2]`
+  counts) or `-v`/`--set`/`--variable` option, `NEXT VALUE FOR`, a mysql client command (`system`, `pager`,
+  `source`, `tee`, ...) or backslash command on any line, a `sqlcmd` `ED`, `EXIT`,
+  `QUIT`, or `RESET` line, and a SQL*Plus `#` line (SQLPREFIX runs it mid-statement)
+  are unverified too. SQL*Plus is checked line by line on an allowlist: outside
+  a statement only display commands (`SET`, `COLUMN`, `PROMPT`, `TTITLE`, `BREAK`,
+  `COMPUTE`, `CLEAR`, `REMARK`, `WHENEVER`, `EXIT`, `SHOW`, `DESCRIBE`, with their
+  abbreviations) and `/` are allowed, `SET` only for display variables (not `CMDSEP`,
+  `SQLTERMINATOR`, `SQLBLANKLINES`, or SQL `SET ROLE`), and a statement must start with
+  `SELECT` or `WITH` and ends at a `;` line end, `/`, a lone `.`, or a blank line. For
+  `sqlcmd`, `GO` and `SET NOCOUNT ON|OFF` are allowed and any `:` command or `!!` is
+  not. A client call behind exactly
   `sudo -n`/`-u`, `docker|podman exec`, or `kubectl exec`, with no file-writing
   client option (`-o`, `-L`, `--tee`, `-f`) and verified read-only SQL, counts as a
   read-only command. `sqlite3` never does, since opening a missing database creates
