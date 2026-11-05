@@ -1032,6 +1032,21 @@ export function commandIsReadOnly(
   return READ_ONLY_COMMANDS.has(name) && !hasUnsafeArgument(name, args);
 }
 
+/**
+ * True when a parsed bash command deletes files (`rm`, `rmdir`, `unlink`,
+ * `find … -delete`). The edit tools cannot delete files, so the edit-tool hint
+ * is not given for these. False when the command cannot be parsed.
+ */
+export function deletesFiles(command: string): boolean {
+  const analysis = analyzeBash(command);
+  if (analysis.errors.length > 0) return false;
+  return analysis.commands.some((c) => {
+    const { name, args } = unwrapTimeout(c.effectiveCommand.name, c.effectiveCommand.args);
+    return name === "rm" || name === "rmdir" || name === "unlink" ||
+      (name === "find" && args.includes("-delete"));
+  });
+}
+
 /** Words that name a secret, as a search term, key, or file. */
 const CREDENTIAL_TERMS =
   /master[_-]?key|api[_-]?key|secret|passw|passphrase|credential|private[_-]?key|\btoken\b|_token\b|\bauth\.json\b|\.env\b|id_rsa|id_ed25519|\.pem\b|\.netrc\b/i;
