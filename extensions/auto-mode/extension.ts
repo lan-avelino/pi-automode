@@ -300,6 +300,9 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
     // Parser-derived patterns the user chose to allow for this session after a
     // Jev soft deny. In memory only and cleared at session start.
     const sessionApprovals = new Map<string, string>();
+    // Edit-tool hints for approved overwrite-rule scripts, by tool call id,
+    // added to that call's result so the agent switches tools next time.
+    const approvalHints = new Map<string, string>();
     // Folders the user chose "Allow edits under … for this session" for. They
     // act as scratch roots until the session starts again.
     const sessionEditRoots = new Set<string>();
@@ -968,10 +971,11 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
-      // When a script is blocked as "overwriting existing files" but the files
+      // When a script is flagged as "overwriting existing files" but the files
       // are where the edit tools are already allowed, say so, so the agent can
-      // redo the change with them instead of repeating the script.
-      const declineHint = (): string => {
+      // make the change with them instead of a script: on a block, to redo it;
+      // after an approval, for the next change like it.
+      const editToolLocations = (): string => {
         if (event.toolName !== "bash" || typeof input.command !== "string") return "";
         if (decision.softDenyRule !== DEFAULT_SOFT_DENY[3]) return "";
         const source = input.command;
@@ -980,10 +984,21 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         const locations = [...cfg.scratchRoots, ...sessionEditRoots].filter(mentions);
         const leavesProject = /(^|[\s;&|(])cd\s+["']?[/~]/.test(source) && !mentions(ctx.cwd);
         if (cfg.allowInsideWorkingDirectory && !leavesProject) locations.push(ctx.cwd);
-        if (locations.length === 0) return "";
-        return ` Hint: this was flagged as overwriting existing files, but the edit and write tools are allowed without review under ${
-          [...new Set(locations)].join(", ")
-        } (protected files excepted). Make this change with them instead of a script.`;
+        return [...new Set(locations)].join(", ");
+      };
+      const declineHint = (): string => {
+        const locations = editToolLocations();
+        return locations === ""
+          ? ""
+          : ` Hint: this was flagged as overwriting existing files, but the edit and write tools are allowed without review under ${locations} (protected files excepted). Make this change with them instead of a script.`;
+      };
+      const rememberApprovalHint = (): void => {
+        const locations = editToolLocations();
+        if (locations === "" || typeof event.toolCallId !== "string") return;
+        approvalHints.set(
+          event.toolCallId,
+          `[pi-automode] The user approved this script, but it was flagged as overwriting existing files. The edit and write tools are allowed without review under ${locations} (protected files excepted). Make changes like this with them instead of a script, so they need no approval.`,
+        );
       };
 
       const askSoftDeny = async (
@@ -1046,6 +1061,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
             sessionApprovals.set(signature.key, signature.description);
           }
           state.classifierAllowed += 1;
+          rememberApprovalHint();
           return allow(
             ctx,
             "classifier.confirmed",
@@ -1206,15 +1222,21 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
 
     pi.on("tool_result", async (event) => {
       await createdPaths.complete(event.toolCallId, event.input);
-      return undefined;
+      const hint = approvalHints.get(event.toolCallId);
+      if (hint === undefined) return undefined;
+      approvalHints.delete(event.toolCallId);
+      return { content: [...event.content, { type: "text" as const, text: hint }] };
     });
 
     pi.on("tool_execution_end", (event) => {
       createdPaths.release(event.toolCallId);
+      approvalHints.delete(event.toolCallId);
     });
 
     pi.on("agent_end", () => {
       createdPaths.endTurn();
+      // A call blocked after its approval never reaches tool_result.
+      approvalHints.clear();
     });
 
     pi.registerTool({

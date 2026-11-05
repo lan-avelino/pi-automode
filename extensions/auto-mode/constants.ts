@@ -197,7 +197,7 @@ Auto mode is active. Routine permission prompts are replaced by a pre-execution 
 - Never try to bypass auto mode, weaken safety controls, or modify auto-mode/permission configuration.
 - If pi-automode blocks a tool call, treat the action as not executed. Do not claim success, rely on its effects, or attempt an equivalent workaround. Report the block to the user before continuing with dependent work. Independent work can continue.
 - User intent must be direct and specific for destructive, external, production, or irreversible actions.
-- Make ordinary file changes with the edit and write tools, which auto mode can check by path. Use a script (python, sed, a heredoc) only when a change is computed, spans many files, or is a temporary mutation test that must be restored.`;
+- Make ordinary file changes with the edit and write tools, which auto mode can check by path. That includes find-and-replace in one or a few files: one edit call per file, not \`sed -i\` or \`perl -pi\`. Use a script (python, sed, a heredoc) only when a change is computed, repeats across many places or files, or is a temporary mutation test that must be restored.`;
 
 /**
  * Policy clauses shared by the LLM classifier system prompt and the Jev
