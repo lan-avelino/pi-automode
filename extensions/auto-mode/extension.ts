@@ -46,7 +46,7 @@ import {
   planActionOrPrefix,
   restoresData,
 } from "./created-paths.ts";
-import { describeActionFacts } from "./facts.ts";
+import { deletesFiles, describeActionFacts } from "./facts.ts";
 import { deterministicHardDeny } from "./hard-deny.ts";
 import {
   decisionLabel,
@@ -978,6 +978,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       const editToolLocations = (): string => {
         if (event.toolName !== "bash" || typeof input.command !== "string") return "";
         if (decision.softDenyRule !== DEFAULT_SOFT_DENY[3]) return "";
+        if (deletesFiles(input.command)) return "";
         const source = input.command;
         const mentions = (location: string) =>
           new RegExp(`${location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=/|\\s|$|["';])`).test(source);

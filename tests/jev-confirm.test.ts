@@ -488,3 +488,16 @@ test("a pending approval hint is dropped when the call ends without a result", a
 	const { result } = await callWithResult(h, "perl -pi -e 's/a/b/' a.qry", { endFirst: true });
 	assert.equal(result, undefined);
 });
+
+test("a script that deletes files gets no edit-tool hint, approved or declined", async () => {
+	// The edit tools cannot delete files, so pointing the agent at them is wrong.
+	const cleanup = "rm -f .mock.ps1 .test.ps1 && rm -rf \"$(pwsh -NoProfile -Command '[IO.Path]::GetTempPath()')out\" && ls";
+	for (const command of [cleanup, "rm -f a.qry", "find . -name '*.tmp' -delete", "rmdir out && unlink b.txt"]) {
+		const approved = await harness({ decisions: [RULE4_BLOCK], answers: [ONCE], config: { allowInsideWorkingDirectory: true } });
+		const { call, result } = await callWithResult(approved, command);
+		assert.equal(call, undefined, command);
+		assert.equal(result, undefined, command);
+		const declined = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { allowInsideWorkingDirectory: true } });
+		assert.doesNotMatch((await declined.run(command))?.reason ?? "", /Hint:/, command);
+	}
+});

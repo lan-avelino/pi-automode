@@ -86,6 +86,9 @@ test("auto mode guidance steers routine file changes to the edit and write tools
 	assert.match(AUTO_MODE_GUIDANCE, /computed, repeats across many places or files, or is a temporary mutation test/);
 	// Find-and-replace in a few files is an edit, not a script.
 	assert.match(AUTO_MODE_GUIDANCE, /find-and-replace in one or a few files: one edit call per file, not `sed -i` or `perl -pi`/);
+	// Cleanups name what they delete, so pi-automode can match them to what the agent created.
+	assert.match(AUTO_MODE_GUIDANCE, /Delete files you created by their literal paths, in a command of their own/);
+	assert.match(AUTO_MODE_GUIDANCE, /not with paths computed when the command runs, such as `\$\(…\)`/);
 });
 
 test("statusText reports the Clef backend and its model", () => {
