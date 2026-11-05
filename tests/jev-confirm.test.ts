@@ -405,3 +405,86 @@ test("/automode backend reports the backend in effect when local config override
 	await automode(h, "backend nope");
 	assert.match(h.ctx.notifications.at(-1)?.message ?? "", /Usage: \/automode backend <llm\|jev\|clef>/);
 });
+
+// --- approval hint ---------------------------------------------------------------
+
+type ToolResultPatch = { content?: Array<{ type: string; text?: string }> } | undefined;
+
+/** A tool call with an id, then its result, as Pi sends them. */
+async function callWithResult(
+	h: Awaited<ReturnType<typeof harness>>,
+	command: string,
+	options: { id?: string; toolName?: string; endFirst?: boolean } = {},
+) {
+	const id = options.id ?? "call-1";
+	const toolName = options.toolName ?? "bash";
+	const input = toolName === "bash" ? { command } : { path: command, edits: [{ oldText: "a", newText: "b" }] };
+	const call = await h.fake.emit("tool_call", { toolName, toolCallId: id, input }, h.ctx) as
+		| { block?: boolean; reason?: string }
+		| undefined;
+	if (options.endFirst) await h.fake.emit("tool_execution_end", { toolName, toolCallId: id }, h.ctx);
+	const result = await h.fake.emit("tool_result", {
+		toolName,
+		toolCallId: id,
+		input,
+		content: [{ type: "text", text: "done" }],
+		isError: false,
+	}, h.ctx) as ToolResultPatch;
+	return { call, result };
+}
+
+const APPROVAL_HINT = /The user approved this script, but it was flagged as overwriting existing files\. The edit and write tools are allowed without review under \/tmp\/project/;
+
+test("an approved overwrite-rule script in the project tells the agent to use the edit tools next time", async () => {
+	const h = await harness({ decisions: [RULE4_BLOCK], answers: [ONCE], config: { allowInsideWorkingDirectory: true } });
+	const { call, result } = await callWithResult(h, "cd api && perl -pi -e 's/# /## /' a.qry");
+	assert.equal(call, undefined);
+	assert.equal(result?.content?.[0]?.text, "done");
+	assert.match(result?.content?.[1]?.text ?? "", APPROVAL_HINT);
+	// The hint goes with that call's result only.
+	const again = await h.fake.emit("tool_result", {
+		toolName: "bash",
+		toolCallId: "call-1",
+		input: {},
+		content: [{ type: "text", text: "done" }],
+		isError: false,
+	}, h.ctx);
+	assert.equal(again, undefined);
+});
+
+test("allow similar on an overwrite-rule script also gets the edit-tool hint", async () => {
+	const h = await harness({ decisions: [RULE4_BLOCK], answers: [similar], config: { allowInsideWorkingDirectory: true } });
+	const { call, result } = await callWithResult(h, "perl -pi -e 's/a/b/' a.qry");
+	assert.equal(call, undefined);
+	assert.equal(h.prompts[0]?.options.some((option) => option.startsWith("Allow similar")), true);
+	assert.match(result?.content?.at(-1)?.text ?? "", APPROVAL_HINT);
+});
+
+test("the approval hint appears only for that rule, that tool, and an allowed location", async () => {
+	const cases: Array<[string, Parameters<typeof harness>[0], string]> = [
+		["another rule", { decisions: [{ ...RULE4_BLOCK, softDenyRule: DEFAULT_SOFT_DENY[5]! }], config: { allowInsideWorkingDirectory: true } }, "perl -pi -e 's/a/b/' a.qry"],
+		["intent only", { decisions: [{ ...RULE4_BLOCK, softDenyRule: undefined }], config: { allowInsideWorkingDirectory: true } }, "perl -pi -e 's/a/b/' a.qry"],
+		["no allowed location", { decisions: [RULE4_BLOCK] }, "perl -pi -e 's/a/b/' a.qry"],
+		["cd out of the project", { decisions: [RULE4_BLOCK], config: { allowInsideWorkingDirectory: true } }, "cd /Volumes/work/repo && python3 fix.py"],
+	];
+	for (const [name, options, command] of cases) {
+		const h = await harness({ ...options, answers: [ONCE] });
+		const { call, result } = await callWithResult(h, command);
+		assert.equal(call, undefined, name);
+		assert.equal(result, undefined, name);
+	}
+	// An approved edit-tool call gets no hint; it is already the edit tool.
+	const edit = await harness({ decisions: [RULE4_BLOCK], answers: [ONCE], config: { scratchRoots: ["/tmp"] } });
+	assert.equal((await callWithResult(edit, "/tmp/a.js", { toolName: "edit" })).result, undefined);
+	// A declined script is blocked with the decline hint and gets no result hint.
+	const declined = await harness({ decisions: [RULE4_BLOCK], answers: [DENY], config: { allowInsideWorkingDirectory: true } });
+	const blocked = await callWithResult(declined, "perl -pi -e 's/a/b/' a.qry");
+	assert.match(blocked.call?.reason ?? "", /Hint: /);
+	assert.equal(blocked.result, undefined);
+});
+
+test("a pending approval hint is dropped when the call ends without a result", async () => {
+	const h = await harness({ decisions: [RULE4_BLOCK], answers: [ONCE], config: { allowInsideWorkingDirectory: true } });
+	const { result } = await callWithResult(h, "perl -pi -e 's/a/b/' a.qry", { endFirst: true });
+	assert.equal(result, undefined);
+});

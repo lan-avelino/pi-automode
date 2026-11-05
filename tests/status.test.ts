@@ -83,7 +83,9 @@ test("auto mode guidance steers routine file changes to the edit and write tools
 	const { AUTO_MODE_GUIDANCE } = await import("../extensions/auto-mode.ts");
 	assert.match(AUTO_MODE_GUIDANCE, /Make ordinary file changes with the edit and write tools/);
 	// Scripts stay available for the cases they are good at.
-	assert.match(AUTO_MODE_GUIDANCE, /computed, spans many files, or is a temporary mutation test/);
+	assert.match(AUTO_MODE_GUIDANCE, /computed, repeats across many places or files, or is a temporary mutation test/);
+	// Find-and-replace in a few files is an edit, not a script.
+	assert.match(AUTO_MODE_GUIDANCE, /find-and-replace in one or a few files: one edit call per file, not `sed -i` or `perl -pi`/);
 });
 
 test("statusText reports the Clef backend and its model", () => {
